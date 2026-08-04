@@ -937,3 +937,76 @@ describe('AgentsViewController — dispatch editor mount', () => {
     expect(b.view().dispatchFocused).toBe(false);
   });
 });
+
+// ── M4 Task 3: attach — component detach keeps the roster subscription alive ──
+
+describe('AgentsViewController — detach for attach', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    dir = undefined;
+  });
+
+  it('detachForAttach unmounts the component and restores the saved children', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.controller.detachForAttach();
+    expect(b.view().detached).toBe(true);
+    expect(b.ui.children).toEqual([SENTINEL_A, SENTINEL_B]);
+    expect(b.ui.setFocus).toHaveBeenLastCalledWith(b.host.state.editor);
+    // The state (roster + subscription) survives — only the component unmounted.
+    expect(b.controller.isOpen).toBe(true);
+  });
+
+  it('the roster subscription keeps reducing events while detached, without rendering', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.controller.detachForAttach();
+    b.ui.requestRender.mockClear();
+    b.fake.emit({
+      type: 'event.session.work_changed',
+      sessionId: 's1',
+      busy: true,
+      pending_interaction: 'none',
+    });
+    expect(b.view().roster.counts().working).toBe(1);
+    // Detached: no component to push props into — events must not re-show it.
+    expect(b.ui.requestRender).not.toHaveBeenCalled();
+    expect(b.ui.children).toEqual([SENTINEL_A, SENTINEL_B]);
+  });
+
+  it('close while detached is a no-op — the subscription survives the runtime reset', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.controller.detachForAttach();
+    b.controller.close();
+    expect(b.controller.isOpen).toBe(true);
+    b.fake.emit({
+      type: 'event.session.work_changed',
+      sessionId: 's1',
+      busy: true,
+      pending_interaction: 'none',
+    });
+    expect(b.view().roster.counts().working).toBe(1);
+  });
+
+  it('show while detached remounts the same component over the live roster', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.controller.detachForAttach();
+    b.fake.emit({
+      type: 'event.session.work_changed',
+      sessionId: 's1',
+      busy: true,
+      pending_interaction: 'none',
+    });
+    await b.controller.show();
+    expect(b.view().detached).toBe(false);
+    expect(b.ui.children).toEqual([b.component()]);
+    // No reload — the subscription kept the roster current.
+    expect(b.fake.listSessions).toHaveBeenCalledTimes(1);
+    const out = b.render();
+    expect(out).toContain('Working');
+    expect(out).toContain('s1 title');
+  });
+});

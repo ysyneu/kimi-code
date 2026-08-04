@@ -2,9 +2,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { log, type GoalSnapshot } from '@moonshot-ai/kimi-code-sdk';
+import { log, type Event, type GoalSnapshot } from '@moonshot-ai/kimi-code-sdk';
 import type { MigrationPlan } from '@moonshot-ai/migration-legacy';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { BannerProvider } from '#/tui/banner/banner-provider';
 import { readBannerDisplayState } from '#/tui/banner/state';
@@ -1876,6 +1876,180 @@ describe('KimiTUI startup', () => {
       replayTurnLimit: REPLAY_TURN_LIMIT,
     });
     expect(driver.state.appState.sessionId).toBe('ses-target');
+  });
+});
+
+// ── M4 Task 3: agents-view attach (Enter on a row → full chat UI) ──
+
+describe('KimiTUI agents-view attach', () => {
+  interface AttachDriver extends StartupDriver {
+    onOpenSession(id: string): void;
+    agentsViewController: { show(): Promise<void> };
+    resumeSession(id: string): Promise<boolean>;
+    session: { id: string } | undefined;
+    showStatus(msg: string, severity?: string): void;
+    showError(msg: string): void;
+  }
+
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  function makeAttachSession(id: string) {
+    return makeSession({
+      id,
+      listMcpServers: vi.fn(async () => []),
+      getSessionWarnings: vi.fn(async () => []),
+    });
+  }
+
+  const ATTACH_SUMMARY = {
+    id: 'ses-attached',
+    title: 'attached title',
+    workDir: '/tmp/proj-a',
+    sessionDir: '/tmp/ses-attached',
+    createdAt: 1,
+    updatedAt: 1_000,
+  };
+
+  function makeAgentsHarness(session: ReturnType<typeof makeAttachSession>) {
+    const listeners = new Set<(event: Event) => void>();
+    const homeDir = mkdtempSync(join(tmpdir(), 'kimi-agents-attach-'));
+    dirs.push(homeDir);
+    const harness = makeHarness(session, {
+      homeDir,
+      listSessions: vi.fn(async () => [ATTACH_SUMMARY]),
+      onEvent: (listener: (event: Event) => void) => {
+        listeners.add(listener);
+        return () => {
+          listeners.delete(listener);
+        };
+      },
+    });
+    return {
+      harness,
+      emit: (event: Event) => {
+        for (const listener of listeners) listener(event);
+      },
+    };
+  }
+
+  async function bootAgentsView(
+    harness: ReturnType<typeof makeAgentsHarness>['harness'],
+  ): Promise<AttachDriver> {
+    const driver = makeDriver(harness, {
+      ...makeStartupInput(),
+      startupAgentsView: true,
+    }) as unknown as AttachDriver;
+    await driver.init();
+    expect(driver.state.startupState).toBe('agents-view');
+    await driver.agentsViewController.show();
+    expect(driver.state.agentsView).toBeDefined();
+    return driver;
+  }
+
+  it('attach resumes the session, detaches the view and switches into its chat UI', async () => {
+    const session = makeAttachSession('ses-attached');
+    const { harness, emit } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    const showStatus = vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(harness.resumeSession).toHaveBeenCalledWith({
+      id: 'ses-attached',
+      replayTurnLimit: REPLAY_TURN_LIMIT,
+    });
+    expect(driver.session?.id).toBe('ses-attached');
+    expect(showStatus).toHaveBeenCalledWith('Attached to session (ses-attached).');
+    // The view unmounted (detached) but its roster subscription survived
+    // switchToSession's runtime reset — the footer badge needs live counts.
+    const view = driver.state.agentsView;
+    expect(view?.detached).toBe(true);
+    emit({
+      type: 'event.session.work_changed',
+      sessionId: 'ses-attached',
+      busy: true,
+      pending_interaction: 'none',
+    } as Event);
+    expect(view?.roster.counts().working).toBe(1);
+  });
+
+  it('a failed attach leaves the view mounted and shows the error', async () => {
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    const showError = vi.spyOn(driver, 'showError').mockImplementation(() => {});
+    harness.resumeSession.mockRejectedValueOnce(new Error('server exploded'));
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(showError).toHaveBeenCalled();
+    });
+    expect(showError).toHaveBeenCalledWith(expect.stringContaining('server exploded'));
+    expect(driver.state.agentsView?.detached).toBe(false);
+    expect(driver.session).toBeUndefined();
+    expect(driver.state.appState.sessionId).toBe('');
+  });
+
+  it('re-attaching the current session short-circuits without resuming again', async () => {
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    const showStatus = vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+    driver.onOpenSession('ses-attached');
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(showStatus).toHaveBeenCalledWith('Already on this session.');
+    });
+    expect(harness.resumeSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('agents mode relaxes the streaming switch guard (wire detach never kills a turn)', async () => {
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    driver.state.appState.streamingPhase = 'waiting';
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+
+    // The picker resume path is relaxed in agents mode too.
+    const other = makeAttachSession('ses-other');
+    harness.resumeSession.mockResolvedValueOnce(other);
+    driver.state.appState.streamingPhase = 'waiting';
+    await expect(driver.resumeSession('ses-other')).resolves.toBe(true);
+    expect(driver.state.appState.sessionId).toBe('ses-other');
+  });
+
+  it('normal mode keeps the streaming switch guard', async () => {
+    const session = makeSession();
+    const harness = makeHarness(session);
+    const driver = makeDriver(harness, makeStartupInput()) as unknown as AttachDriver;
+    await driver.init();
+    driver.state.appState.streamingPhase = 'waiting';
+    const showError = vi.spyOn(driver, 'showError').mockImplementation(() => {});
+
+    await expect(driver.resumeSession('ses-other')).resolves.toBe(false);
+
+    expect(showError).toHaveBeenCalledWith(
+      'Cannot switch sessions while streaming — press Esc or Ctrl-C first.',
+    );
+    expect(harness.resumeSession).not.toHaveBeenCalled();
+    expect(driver.state.appState.sessionId).toBe('ses-1');
   });
 });
 

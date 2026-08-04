@@ -1510,6 +1510,15 @@ export class KimiTUI {
     return this.state.appState.workDir;
   }
 
+  /**
+   * Agents-view attach seam (AgentsViewHost): Enter on a roster row resumes
+   * that session and switches the TUI into its full chat UI. The view only
+   * detaches — its roster subscription stays alive for the footer badge.
+   */
+  onOpenSession(targetSessionId: string): void {
+    void this.attachAgentsViewSession(targetSessionId);
+  }
+
   appendStartupNotice(extra: string): void {
     this.startupNotice = combineStartupNotice(this.startupNotice, extra);
   }
@@ -1782,11 +1791,15 @@ export class KimiTUI {
       this.showStatus('Already on this session.');
       return true;
     }
-    if (this.state.appState.streamingPhase !== 'idle') {
+    // Agents mode runs on the wire transport, where switching sessions is a
+    // local detach that never kills the server-side turn — the streaming and
+    // replay guards (which protect the in-process engine) do not apply there.
+    const agentsViewMode = this.state.startupState === 'agents-view';
+    if (!agentsViewMode && this.state.appState.streamingPhase !== 'idle') {
       this.showError('Cannot switch sessions while streaming — press Esc or Ctrl-C first.');
       return false;
     }
-    if (this.state.appState.isReplaying) {
+    if (!agentsViewMode && this.state.appState.isReplaying) {
       this.showError('Cannot switch sessions while history is replaying.');
       return false;
     }
@@ -1805,6 +1818,38 @@ export class KimiTUI {
 
     await this.switchToSession(session, `Resumed session (${session.id}).`);
     return true;
+  }
+
+  /**
+   * Agents-view attach: resume first — a failure leaves the view mounted with
+   * the error shown — then detach the view component and switch into the
+   * session's chat UI. The streaming/replay guards of {@link resumeSession}
+   * are intentionally absent: on the wire transport the switch is a local
+   * detach, so an in-flight turn on either session keeps running.
+   */
+  private async attachAgentsViewSession(targetSessionId: string): Promise<void> {
+    if (targetSessionId === this.state.appState.sessionId) {
+      this.showStatus('Already on this session.');
+      return;
+    }
+    let session: Session;
+    try {
+      session = await this.harness.resumeSession({
+        id: targetSessionId,
+        replayTurnLimit: REPLAY_TURN_LIMIT,
+      });
+    } catch (error) {
+      const msg = formatErrorMessage(error);
+      this.showError(`Failed to attach session ${targetSessionId}: ${msg}`);
+      return;
+    }
+    this.agentsViewController.detachForAttach();
+    try {
+      await this.switchToSession(session, `Attached to session (${session.id}).`);
+    } catch (error) {
+      const msg = formatErrorMessage(error);
+      this.showError(`Failed to attach session ${targetSessionId}: ${msg}`);
+    }
   }
 
   async switchToSession(session: Session, statusMessage: string): Promise<void> {

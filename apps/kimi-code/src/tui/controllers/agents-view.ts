@@ -32,7 +32,7 @@ export interface AgentsViewHost {
   agentsViewServerLabel(): string;
   /** Dispatch target: every session created from the view opens in this cwd. */
   agentsViewWorkDir(): string;
-  /** Attach seam — injected in M4; without it Enter shows a placeholder. */
+  /** Attach seam (M4): KimiTUI implements it; without it Enter shows a placeholder. */
   onOpenSession?(id: string): void;
 }
 
@@ -43,6 +43,13 @@ export interface AgentsViewState {
   /** The same Set the roster mutates in place; persisted after every setPinned. */
   pins: Set<string>;
   dispatch: AgentsViewDispatch;
+  /**
+   * True while the user is attached to a session: the component is unmounted
+   * but the roster and its event subscription stay alive — the attached-mode
+   * footer badge (Task 4) reads live counts, and show() remounts the same
+   * component without a reload.
+   */
+  detached: boolean;
   /** Focus split between the roster list and the dispatch editor. */
   dispatchFocused: boolean;
   selectedId: string | undefined;
@@ -143,7 +150,13 @@ export class AgentsViewController {
 
   async show(): Promise<void> {
     const { state } = this.host;
-    if (state.agentsView !== undefined) return;
+    const existing = state.agentsView;
+    if (existing !== undefined) {
+      // Return from attach: remount the same component over the live roster —
+      // the subscription kept it current, so there is nothing to reload.
+      if (existing.detached) this.remount(existing);
+      return;
+    }
 
     let pins: Set<string>;
     let summaries: Awaited<ReturnType<KimiHarness['listSessions']>>;
@@ -210,6 +223,7 @@ export class AgentsViewController {
       roster,
       pins,
       dispatch,
+      detached: false,
       dispatchFocused: false,
       selectedId: undefined,
       peek: undefined,
@@ -233,7 +247,12 @@ export class AgentsViewController {
   close(): void {
     const { state } = this.host;
     const view = state.agentsView;
-    if (view === undefined) return;
+    if (view === undefined || view.detached) {
+      // Detached (attached to a session): the roster subscription deliberately
+      // survives — switchToSession's runtime reset calls close() on the
+      // attach path, and tearing down here would kill the badge's data feed.
+      return;
+    }
     view.eventUnsubscribe();
     if (view.flashTimer !== undefined) clearTimeout(view.flashTimer);
 
@@ -243,6 +262,42 @@ export class AgentsViewController {
     }
     this.host.setAgentsView(undefined);
     state.ui.setFocus(state.editor);
+    state.ui.requestRender(true);
+  }
+
+  /**
+   * Attach detach: unmounts the component but keeps the roster and its global
+   * event subscription alive (see {@link AgentsViewState.detached}). The user
+   * returns via the Task-4 key, which re-runs show().
+   */
+  detachForAttach(): void {
+    const { state } = this.host;
+    const view = state.agentsView;
+    if (view === undefined || view.detached) return;
+    view.detached = true;
+    if (view.flashTimer !== undefined) {
+      clearTimeout(view.flashTimer);
+      view.flashTimer = undefined;
+      view.flashMessage = undefined;
+    }
+
+    state.ui.clear();
+    for (const child of view.savedChildren) {
+      state.ui.addChild(child);
+    }
+    state.ui.setFocus(state.editor);
+    state.ui.requestRender(true);
+  }
+
+  /** Return-from-attach remount: same component, same roster, no reload. */
+  private remount(view: AgentsViewState): void {
+    const { state } = this.host;
+    view.detached = false;
+    view.savedChildren = [...state.ui.children];
+    state.ui.clear();
+    state.ui.addChild(view.component);
+    state.ui.setFocus(view.component);
+    this.pushProps();
     state.ui.requestRender(true);
   }
 
@@ -385,7 +440,7 @@ export class AgentsViewController {
 
   private pushProps(): void {
     const view = this.host.state.agentsView;
-    if (view === undefined) return;
+    if (view === undefined || view.detached) return;
     view.component.setProps(this.buildProps(view));
     this.host.state.ui.requestRender();
   }
