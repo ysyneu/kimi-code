@@ -16,7 +16,8 @@ import {
 } from '@moonshot-ai/kap-server';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { WsConnection } from '#/wire/ws-connection';
+import { advanceCursor, CursorSupervisor } from '#/wire/cursor-supervisor';
+import { WsConnection, type WsIncomingFrame } from '#/wire/ws-connection';
 
 /** Neutral fixture identity, mirroring kap-server's own test helper. */
 const TEST_HOST_IDENTITY: ServerHostIdentity = {
@@ -127,5 +128,107 @@ describe('WsConnection', () => {
   it('rejects handshake with a bad token', async () => {
     const ws = new WsConnection({ url: wsUrl, token: 'wrong' });
     await expect(ws.connect()).rejects.toThrow();
+  });
+});
+
+/** Minimal profile update over plain HTTP — emits `session.meta.updated`. */
+async function updateSessionProfile(id: string, patch: { title: string }): Promise<void> {
+  const res = await fetch(`http://127.0.0.1:${server.port}/api/v1/sessions/${id}/profile`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${token}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(patch),
+  });
+  const env = (await res.json()) as { code: number };
+  expect(env.code).toBe(0);
+}
+
+describe('CursorSupervisor', () => {
+  it('delivers subscribed session events end to end', async () => {
+    const created = await createSession(home);
+    const supervisor = new CursorSupervisor({
+      makeConnection: () => new WsConnection({ url: wsUrl, token }),
+      onResync: () => {},
+    });
+    await supervisor.start();
+    await supervisor.subscribe(created.id);
+
+    const metaSeen = new Promise<WsIncomingFrame>((resolve) => {
+      const off = supervisor.onEventFrame((frame) => {
+        if (frame.type === 'session.meta.updated') {
+          off();
+          resolve(frame);
+        }
+      });
+    });
+    await updateSessionProfile(created.id, { title: 'cursor-test' });
+    const frame = await metaSeen;
+    expect(frame.session_id).toBe(created.id);
+    await supervisor.close();
+  });
+
+  it('skips volatile and stale frames when advancing the cursor', () => {
+    expect(advanceCursor({ seq: 5 }, { seq: 6 })).toEqual({ seq: 6 });
+    expect(advanceCursor({ seq: 5 }, { seq: 6, volatile: true })).toEqual({ seq: 5 });
+    expect(advanceCursor({ seq: 5, epoch: 'e1' }, { seq: 4 })).toEqual({ seq: 5, epoch: 'e1' });
+    expect(advanceCursor({ seq: 5 }, { seq: 6, epoch: 'e2' })).toEqual({ seq: 6, epoch: 'e2' });
+  });
+
+  it('re-subscribes with recorded cursors after a reconnect', async () => {
+    type SubscribeCall = {
+      session_ids: string[];
+      cursors?: Record<string, { seq: number; epoch?: string }>;
+    };
+    const subscribes: SubscribeCall[] = [];
+    let frameHandler: ((frame: WsIncomingFrame) => void) | undefined;
+    let closeHandler: ((info: { code: number; reason: string }) => void) | undefined;
+    let connects = 0;
+
+    class FakeWsConnection {
+      async connect() {
+        connects++;
+        return { ws_connection_id: 'c', protocol_version: 2, max_event_buffer_size: 100 };
+      }
+      async sendControl<T>(type: string, payload: unknown): Promise<T> {
+        if (type === 'subscribe') subscribes.push(payload as SubscribeCall);
+        return { accepted: (payload as SubscribeCall).session_ids, not_found: [] } as T;
+      }
+      onFrame(handler: (frame: WsIncomingFrame) => void) {
+        frameHandler = handler;
+        return () => {
+          frameHandler = undefined;
+        };
+      }
+      onClose(handler: (info: { code: number; reason: string }) => void) {
+        closeHandler = handler;
+        return () => {
+          closeHandler = undefined;
+        };
+      }
+      async close() {}
+    }
+
+    const supervisor = new CursorSupervisor({
+      makeConnection: () => new FakeWsConnection() as never,
+      onResync: () => {},
+    });
+    await supervisor.start();
+    await supervisor.subscribe('s1', { seq: 0 });
+    // a durable frame advances the recorded cursor:
+    frameHandler?.({
+      type: 'turn.ended',
+      seq: 7,
+      session_id: 's1',
+      timestamp: '2026-07-30T00:00:00.000Z',
+      payload: { type: 'turn.ended' },
+    });
+    // simulate a server-side drop; the supervisor must reconnect on its own:
+    closeHandler?.({ code: 1006, reason: 'abnormal' });
+    await new Promise((resolve) => setTimeout(resolve, 1600)); // first backoff ≈1s
+    expect(connects).toBe(2);
+    expect(subscribes.at(-1)).toEqual({ session_ids: ['s1'], cursors: { s1: { seq: 7 } } });
+    await supervisor.close();
   });
 });
