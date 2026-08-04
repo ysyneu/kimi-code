@@ -110,6 +110,13 @@ export class WireHttpClient {
     return this.request('POST', `/sessions/${id}:${action}`, {}, z.unknown());
   }
 
+  forkSession(
+    id: string,
+    body: { title?: string; metadata?: Record<string, unknown> },
+  ): Promise<WireSession> {
+    return this.request('POST', `/sessions/${id}:fork`, body, wireSessionSchema);
+  }
+
   submitPrompt(id: string, body: WirePromptSubmission): Promise<WirePromptSubmitResult> {
     return this.request('POST', `/sessions/${id}/prompts`, body, wirePromptSubmitResultSchema);
   }

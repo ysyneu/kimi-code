@@ -1,7 +1,18 @@
-import { describe, expect, it } from 'vitest';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
+import {
+  startServer,
+  type RunningServer,
+  type ServerHostIdentity,
+} from '@moonshot-ai/kap-server';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+
+import { WireHttpClient } from '#/wire/http-client';
 import type { WireApprovalRequest, WireQuestionRequest } from '#/wire/protocol';
 import { InteractionBridge } from '#/wire/reverse-rpc';
+import { SDKRpcClientWire } from '#/wire/sdk-rpc-client-wire';
 
 // ---------------------------------------------------------------------------
 // InteractionBridge — stub-based (no live server). The stub implements the
@@ -319,5 +330,113 @@ describe('InteractionBridge', () => {
     expect(approvalHandled.length).toBe(1);
     expect(questionHandled.length).toBe(1);
     expect(http.calls.map((c) => c.method)).toEqual(['resolveApproval', 'dismissQuestion']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDKRpcClientWire — live kap-server fixture (file scope; the stub-based
+// InteractionBridge describes above never touch these).
+// ---------------------------------------------------------------------------
+
+const TEST_HOST_IDENTITY: ServerHostIdentity = {
+  productName: 'test-host',
+  version: '0.0.0-test',
+  platform: 'test_platform',
+};
+
+let server: RunningServer;
+let home: string;
+let token: string;
+let base: string;
+// Real on-disk workspace root — session creation rejects a non-existent cwd
+// (server code 40409). The lifecycle tests below never start a turn, so no
+// stub-provider config.toml is needed.
+let cwd: string;
+
+beforeAll(async () => {
+  home = await mkdtemp(join(tmpdir(), 'kimi-wire-client-'));
+  cwd = join(home, 'workspace');
+  await mkdir(cwd);
+  server = await startServer({
+    hostIdentity: TEST_HOST_IDENTITY,
+    host: '127.0.0.1',
+    port: 0,
+    homeDir: home,
+    logLevel: 'silent',
+  });
+  token = server.authTokenService.getToken();
+  base = `http://127.0.0.1:${server.port}`;
+});
+
+afterAll(async () => {
+  await server.close();
+  await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+});
+
+/** Poll until `cond` holds (WS delivery is async; HTTP responses don't await it). */
+async function waitFor(cond: () => boolean, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error('waitFor timed out');
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+describe('SDKRpcClientWire lifecycle', () => {
+  it('lists/creates/renames/archives sessions and streams events', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const events: string[] = [];
+    rpc.onEvent((e) => events.push(`${e.sessionId}:${e.type}`));
+
+    const created = await rpc.createSession({ workDir: cwd });
+    expect(created.workDir).toBe(cwd);
+
+    const list = await rpc.listSessions({});
+    expect(list.some((s) => s.id === created.id)).toBe(true);
+
+    await rpc.renameSession({ id: created.id, title: 'wired' });
+    expect((await rpc.listSessions({})).find((s) => s.id === created.id)?.title).toBe('wired');
+
+    await rpc.deleteSession({ sessionId: created.id });
+    // The default list excludes archived sessions (server contract)…
+    const listed = await rpc.listSessions({});
+    expect(listed.some((s) => s.id === created.id)).toBe(false);
+    // …and the session itself reads back archived:
+    const http = new WireHttpClient({ baseUrl: base, token });
+    expect((await http.getSession(created.id)).archived).toBe(true);
+
+    // session.meta.updated (from the rename) flowed through supervisor + translator:
+    await waitFor(() => events.some((t) => t.endsWith(':session.meta.updated')));
+    await rpc.close();
+  });
+
+  it('resumeSession subscribes with the snapshot cursor and closeSession only detaches', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    const resumed = await rpc.resumeSession({ id: created.id });
+    expect(resumed.id).toBe(created.id);
+    expect(resumed.sessionMetadata.workDir).toBe(cwd);
+    await rpc.closeSession({ sessionId: created.id });
+    // the session must still exist and be resumable (detach, not close):
+    const again = await rpc.resumeSession({ id: created.id });
+    expect(again.id).toBe(created.id);
+    await rpc.close();
+  });
+
+  it('forks a session over :fork', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    const forked = await rpc.forkSession({ id: created.id, title: 'forked' });
+    expect(forked.id).not.toBe(created.id);
+    expect(forked.workDir).toBe(cwd);
+    expect(forked.title).toBe('forked');
+    await rpc.close();
+  });
+
+  it('rejects a non-loopback serverUrl', () => {
+    expect(() => new SDKRpcClientWire({ serverUrl: 'http://192.168.1.10:58627', token: 't' })).toThrow();
   });
 });
