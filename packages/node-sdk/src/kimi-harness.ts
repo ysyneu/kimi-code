@@ -20,6 +20,7 @@ import type {
   GetConfigOptions,
   KimiConfig,
   KimiConfigPatch,
+  KimiHarnessOptions,
   KimiHostIdentity,
   ListSessionsOptions,
   McpServerConfig,
@@ -34,6 +35,7 @@ import type {
   TelemetryProperties,
   TestMcpServerOptions,
 } from '#/types';
+import { SDKRpcClientWire } from '#/wire/sdk-rpc-client-wire';
 
 export interface KimiHarnessRuntimeOptions {
   readonly identity?: KimiHostIdentity;
@@ -372,4 +374,29 @@ function normalizeSessionId(value: string): string {
     throw new KimiError(ErrorCodes.SESSION_ID_EMPTY, 'Session id cannot be empty.');
   }
   return normalized;
+}
+
+/**
+ * The wire-transport harness factory: the SDK drives a running kap-server over
+ * the `/api/v1` REST + WS surface instead of hosting an engine in-process.
+ * Async because the supervisor must connect (`rpc.start()`) before the harness
+ * is handed out; option plumbing mirrors `createKimiHarnessV2`.
+ */
+export async function createKimiHarnessWire(
+  options: KimiHarnessOptions & { readonly serverUrl: string; readonly token?: string },
+): Promise<KimiHarness> {
+  const rpc = new SDKRpcClientWire(options);
+  await rpc.start();
+  return new KimiHarness(rpc, {
+    identity: rpc.identity,
+    uiMode: options.uiMode,
+    homeDir: rpc.homeDir,
+    configPath: rpc.configPath,
+    auth: rpc.auth,
+    telemetry: rpc.telemetry,
+    ensureConfigFile: () => rpc.ensureConfigFile(),
+    onClose: () => rpc.close(),
+    imageLimits: undefined,
+    sessionStartedProperties: options.sessionStartedProperties,
+  });
 }

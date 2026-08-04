@@ -10,10 +10,13 @@ import {
 } from '@moonshot-ai/kap-server';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
+import { createKimiHarnessWire } from '#/index';
 import { WireHttpClient } from '#/wire/http-client';
 import type { WireApprovalRequest, WireQuestionRequest } from '#/wire/protocol';
 import { InteractionBridge } from '#/wire/reverse-rpc';
 import { SDKRpcClientWire, toWireContent } from '#/wire/sdk-rpc-client-wire';
+
+import { TEST_IDENTITY } from './test-identity';
 
 // ---------------------------------------------------------------------------
 // InteractionBridge — stub-based (no live server). The stub implements the
@@ -605,5 +608,38 @@ describe('toWireContent', () => {
       type: 'video',
       source: { kind: 'url', url: 'https://example.com/v.mp4', id: undefined },
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// createKimiHarnessWire — the factory wires SDKRpcClientWire into a
+// KimiHarness (awaiting the supervisor start before returning). Live server
+// fixture from the lifecycle describes above.
+// ---------------------------------------------------------------------------
+
+describe('createKimiHarnessWire', () => {
+  it('creates a harness that drives a full session lifecycle over the wire', async () => {
+    const harness = await createKimiHarnessWire({
+      serverUrl: base,
+      token,
+      homeDir: home,
+      identity: TEST_IDENTITY,
+    });
+    const session = await harness.createSession({ workDir: cwd });
+    expect(session.id).toBeTruthy();
+    const summaries = await harness.listSessions({});
+    expect(summaries.some((s) => s.id === session.id)).toBe(true);
+
+    const resumed = await harness.resumeSession({ id: session.id });
+    expect(resumed.id).toBe(session.id);
+
+    await harness.deleteSession(session.id);
+    // The default list excludes archived sessions (server contract)…
+    const after = await harness.listSessions({});
+    expect(after.some((s) => s.id === session.id)).toBe(false);
+    // …and the session itself reads back archived:
+    const http = new WireHttpClient({ baseUrl: base, token });
+    expect((await http.getSession(session.id)).archived).toBe(true);
+    await harness.close();
   });
 });

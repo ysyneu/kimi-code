@@ -8,6 +8,8 @@ export {
   SDKRpcClientV2,
   type SDKRpcClientV2Options,
 } from '#/sdk-rpc-client-v2';
+export { createKimiHarnessWire } from '#/kimi-harness';
+export { SDKRpcClientWire, type SDKRpcClientWireOptions } from '#/wire/sdk-rpc-client-wire';
 export {
   createKimiConfigRpc,
   KimiConfigRpcClient,
