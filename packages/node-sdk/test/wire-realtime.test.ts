@@ -345,4 +345,57 @@ describe('CursorSupervisor', () => {
     expect(subscribes.at(-1)).toEqual({ session_ids: ['s1'], cursors: { s1: { seq: 0 } } });
     await supervisor.close();
   });
+
+  it('closes the fresh socket when close() lands during the resubscribe round-trip', async () => {
+    let resolveSubscribe: (() => void) | undefined;
+    let connects = 0;
+    let closes = 0;
+    const states: boolean[] = [];
+
+    class ControlledResubscribe {
+      async connect() {
+        connects++;
+        return { ws_connection_id: 'c', protocol_version: 2, max_event_buffer_size: 100 };
+      }
+      sendControl<T>(type: string, payload: unknown): Promise<T> {
+        if (type === 'subscribe') {
+          // Held open so the test can close() while the resubscribe is in flight.
+          return new Promise<T>((resolve) => {
+            resolveSubscribe = () =>
+              resolve({
+                accepted: (payload as { session_ids: string[] }).session_ids,
+                not_found: [],
+              } as T);
+          });
+        }
+        return Promise.resolve({ accepted: [], not_found: [] } as T);
+      }
+      onFrame() {
+        return () => {};
+      }
+      onClose() {
+        return () => {};
+      }
+      async close() {
+        closes++;
+      }
+    }
+
+    const supervisor = new CursorSupervisor({
+      makeConnection: () => new ControlledResubscribe() as never,
+      onResync: () => {},
+    });
+    supervisor.connectionState((connected) => states.push(connected));
+    await supervisor.subscribe('s1', { seq: 0 }); // recorded; sent on connect
+    const started = supervisor.start(); // resubscribe goes in flight
+    await new Promise((resolve) => setTimeout(resolve, 0)); // let start() reach the ack await
+    await supervisor.close(); // lands during the resubscribe round-trip
+    resolveSubscribe?.(); // the ack arrives only after close()
+    await started;
+    expect(connects).toBe(1);
+    // the fully-subscribed fresh socket was torn down, not installed:
+    expect(closes).toBe(1);
+    // ... and the supervisor never announced itself connected:
+    expect(states).not.toContain(true);
+  });
 });

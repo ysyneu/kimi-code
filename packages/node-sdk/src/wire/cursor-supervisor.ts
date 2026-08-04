@@ -146,7 +146,9 @@ export class CursorSupervisor {
    * is only installed (`this.connection` / `connected = true`) after BOTH the
    * handshake and the resubscribe succeed — a live but subscription-less
    * socket is silent event loss, so a failed resubscribe tears the socket
-   * down and counts as a failed attempt.
+   * down and counts as a failed attempt. The `closed` flag is re-checked
+   * after every network round-trip, so a `close()` landing mid-attempt also
+   * tears the socket down instead of installing it.
    */
   private async connectOnce(): Promise<void> {
     const connection = this.options.makeConnection();
@@ -165,6 +167,13 @@ export class CursorSupervisor {
       offClose();
       await connection.close().catch(() => {});
       throw err;
+    }
+    if (this.closed) {
+      // close() landed during the resubscribe round-trip: tear the fresh
+      // socket down instead of installing it on a closed supervisor.
+      offClose();
+      await connection.close().catch(() => {});
+      return;
     }
     this.connection = connection;
     this.connected = true;
