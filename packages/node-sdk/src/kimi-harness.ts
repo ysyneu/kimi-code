@@ -9,6 +9,7 @@ import {
 
 import { Session } from '#/session';
 import type { KimiAuthFacade } from '#/auth';
+import type { Event } from '#/events';
 import type { SDKRpcClientBase } from '#/rpc';
 import type {
   AuthenticateMcpServerOptions,
@@ -34,6 +35,7 @@ import type {
   TelemetryContextPatch,
   TelemetryProperties,
   TestMcpServerOptions,
+  Unsubscribe,
 } from '#/types';
 import { SDKRpcClientWire } from '#/wire/sdk-rpc-client-wire';
 
@@ -250,6 +252,16 @@ export class KimiHarness {
 
   async listSessions(options: ListSessionsOptions = {}): Promise<readonly SessionSummary[]> {
     return this.rpc.listSessions(options);
+  }
+
+  /**
+   * Subscribes to the full translated event stream — every session's events
+   * plus the subscription-free global events (`event.session.work_changed`,
+   * `session.meta.updated`, `event.session.created`). Listeners interested in
+   * one session should use `Session.onEvent`, which filters by session id.
+   */
+  onEvent(listener: (event: Event) => void): Unsubscribe {
+    return this.rpc.onEvent(listener);
   }
 
   /** Skills visible to a new session in `workDir`, without creating that session. */

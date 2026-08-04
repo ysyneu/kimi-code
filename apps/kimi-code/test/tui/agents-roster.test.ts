@@ -271,3 +271,26 @@ describe('roster pin persistence', () => {
     expect(await loadPins(dir)).toEqual(new Set(['a', 'b']));
   });
 });
+
+
+describe('roster row mutation (controller actions)', () => {
+  it('remove drops the row from groups and counts', () => {
+    const roster = new AgentsRoster(new Set());
+    roster.setAll([summary('a'), summary('b')]);
+    roster.remove('a');
+    expect(roster.get('a')).toBeUndefined();
+    expect(roster.counts()).toEqual({ awaiting: 0, working: 0, completed: 1 });
+    expect(roster.groups().flatMap((group) => group.rows).map((row) => row.id)).toEqual(['b']);
+  });
+
+  it('setTitle rewrites the row title without touching ordering fields', () => {
+    const roster = new AgentsRoster(new Set());
+    roster.setAll([summary('a', { title: 'old', updatedAt: 5_000 })]);
+    roster.setTitle('a', 'new');
+    const row = roster.get('a');
+    expect(row?.title).toBe('new');
+    expect(row?.updatedAt).toBe(5_000);
+    roster.setTitle('missing', 'noop');
+    expect(roster.get('missing')).toBeUndefined();
+  });
+});

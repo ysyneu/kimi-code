@@ -101,6 +101,7 @@ import {
 } from './constant/kimi-tui';
 import { CHROME_GUTTER } from './constant/rendering';
 import { MAX_TERMINAL_TITLE_LENGTH } from './constant/terminal';
+import { AgentsViewController } from './controllers/agents-view';
 import { AuthFlowController } from './controllers/auth-flow';
 import { BtwPanelController } from './controllers/btw-panel';
 import { ClipboardImageHintController } from './controllers/clipboard-image-hint';
@@ -342,6 +343,7 @@ export class KimiTUI {
   readonly sessionEventHandler: SessionEventHandler;
   readonly sessionReplay: SessionReplayRenderer;
   readonly tasksBrowserController: TasksBrowserController;
+  readonly agentsViewController: AgentsViewController;
   readonly editorKeyboard: EditorKeyboardController;
 
   /** Timer that auto-clears the one-shot "moved to background" footer hint. */
@@ -424,6 +426,7 @@ export class KimiTUI {
     this.sessionEventHandler = new SessionEventHandler(this);
     this.sessionReplay = new SessionReplayRenderer(this);
     this.tasksBrowserController = new TasksBrowserController(this);
+    this.agentsViewController = new AgentsViewController(this);
     this.editorKeyboard = new EditorKeyboardController(this, this.imageStore);
     this.editorKeyboard.install();
     this.buildLayout();
@@ -846,6 +849,7 @@ export class KimiTUI {
     // before tearing the UI down, so they can't keep firing requestRender after
     // stop() returns (or leak when stop() runs without process.exit).
     this.tasksBrowserController.close();
+    this.agentsViewController.close();
     this.btwPanelController.clear();
     this.stopActivitySpinner();
     this.streamingUI.disposeActiveCompactionBlock();
@@ -1466,6 +1470,15 @@ export class KimiTUI {
     this.state.tasksBrowser = value;
   }
 
+  setAgentsView(value: TUIState['agentsView']): void {
+    this.state.agentsView = value;
+  }
+
+  /** Agents-view header label: the in-process engine counts as embedded. */
+  agentsViewServerLabel(): string {
+    return 'embedded';
+  }
+
   appendStartupNotice(extra: string): void {
     this.startupNotice = combineStartupNotice(this.startupNotice, extra);
   }
@@ -1710,6 +1723,7 @@ export class KimiTUI {
     this.streamingUI.resetToolUi();
     this.sessionEventHandler.resetRuntimeState();
     this.tasksBrowserController.close();
+    this.agentsViewController.close();
     this.btwPanelController.clear();
     this.state.footer.setBackgroundCounts({ bashTasks: 0, agentTasks: 0 });
     this.streamingUI.setTodoList([]);

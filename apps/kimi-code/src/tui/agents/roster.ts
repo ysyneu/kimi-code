@@ -132,6 +132,18 @@ export class AgentsRoster {
     if (row !== undefined) row.pinned = pinned;
   }
 
+  /** Drops a row (e.g. after the controller archived the session). */
+  remove(id: string): void {
+    this.rows.delete(id);
+  }
+
+  /** Local title rewrite for the optimistic rename path; the server's
+   *  `session.meta.updated` echo confirms or the controller rolls back. */
+  setTitle(id: string, title: string): void {
+    const row = this.rows.get(id);
+    if (row !== undefined) row.title = title;
+  }
+
   setTrusted(id: string, trusted: boolean | undefined): void {
     const row = this.rows.get(id);
     if (row !== undefined) row.trusted = trusted;

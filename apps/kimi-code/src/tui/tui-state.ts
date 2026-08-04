@@ -12,6 +12,7 @@ import type { SessionRow } from './components/dialogs/session-picker';
 import { CustomEditor } from './components/editor/custom-editor';
 import { DEFAULT_TUI_CONFIG } from './config';
 import { CHROME_GUTTER } from './constant/rendering';
+import type { AgentsViewState } from './controllers/agents-view';
 import type { TasksBrowserState } from './controllers/tasks-browser';
 import { currentTheme, type Theme } from './theme';
 import { createTerminalState, type TerminalState } from './utils/terminal-state';
@@ -50,6 +51,7 @@ export interface TUIState {
   sessionsScope: 'cwd' | 'all';
   activeDialog: 'session-picker' | 'help' | null;
   tasksBrowser: TasksBrowserState | undefined;
+  agentsView: AgentsViewState | undefined;
   externalEditorRunning: boolean;
   queuedMessages: QueuedMessage[];
   /**
@@ -108,6 +110,7 @@ export function createTUIState(options: KimiTUIOptions): TUIState {
     sessionsScope: 'cwd',
     activeDialog: null,
     tasksBrowser: undefined,
+    agentsView: undefined,
     externalEditorRunning: false,
     queuedMessages: [],
     queuedMessageDispatchPending: false,
