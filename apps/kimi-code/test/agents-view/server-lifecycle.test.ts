@@ -4,7 +4,12 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { discoverRunningServer, resolveAgentsServer } from '#/agents-view/server-lifecycle';
+import {
+  countRunningSessions,
+  discoverRunningServer,
+  readServerToken,
+  resolveAgentsServer,
+} from '#/agents-view/server-lifecycle';
 
 /** Max signed-32 pid; the kernel never allocates it, so `kill(pid, 0)` → ESRCH. */
 const DEAD_PID = 0x7fffffff;
@@ -84,6 +89,17 @@ describe('discoverRunningServer', () => {
 
 const IDENTITY = { productName: 'test-cli', version: '0.0.0-test', platform: 'test' } as const;
 
+describe('readServerToken', () => {
+  it('throws a helpful error when the token file is missing', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'kimi-agents-token-'));
+    try {
+      expect(() => readServerToken(home)).toThrow(/kap-server token not found.*kimi web/);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('resolveAgentsServer', () => {
   let home: string;
 
@@ -143,5 +159,57 @@ describe('resolveAgentsServer', () => {
       resolveAgentsServer({ homeDir: home, identity: IDENTITY, cliVersion: '9.9.9-different' }),
     ).rejects.toThrow(/9\.9\.9-different/);
     await first.shutdown();
+  });
+
+  it('refuses a versionless (pre-version-gate) running server', async () => {
+    const instancesDir = join(home, 'server', 'instances');
+    await mkdir(instancesDir, { recursive: true });
+    await writeFile(
+      join(instancesDir, 'old.json'),
+      JSON.stringify({
+        server_id: 'old',
+        pid: process.pid,
+        host: '127.0.0.1',
+        port: 1,
+        started_at: Date.now(),
+        heartbeat_at: Date.now(),
+        // no host_version — written by a server older than the version gate
+      }),
+    );
+    await expect(
+      resolveAgentsServer({ homeDir: home, identity: IDENTITY, cliVersion: IDENTITY.version }),
+    ).rejects.toThrow(/older than the version gate/);
+  });
+});
+
+describe('countRunningSessions', () => {
+  let home: string;
+
+  beforeEach(async () => {
+    home = await mkdtemp(join(tmpdir(), 'kimi-agents-count-'));
+  });
+
+  afterEach(async () => {
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+
+  it('counts busy sessions over the wire', async () => {
+    const server = await resolveAgentsServer({
+      homeDir: home,
+      identity: IDENTITY,
+      cliVersion: IDENTITY.version,
+    });
+    // no sessions yet:
+    await expect(countRunningSessions(server)).resolves.toBe(0);
+    // create one (idle → not busy; a genuinely busy session needs a running
+    // turn, which needs a provider — the busy filter itself is kap-server's
+    // own tested behavior):
+    await fetch(`${server.baseUrl}/api/v1/sessions`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${server.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ metadata: { cwd: home } }),
+    });
+    await expect(countRunningSessions(server)).resolves.toBe(0);
+    await server.shutdown();
   });
 });

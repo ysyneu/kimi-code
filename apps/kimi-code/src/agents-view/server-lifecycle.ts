@@ -151,3 +151,21 @@ export async function resolveAgentsServer(
     shutdown: () => running.close(),
   };
 }
+
+/**
+ * Count the server's busy sessions — the data source for the agents view's
+ * exit confirmation ("N sessions still running"). Uses the session list
+ * endpoint's server-side `busy` filter over plain fetch (this module stays
+ * UI-free and SDK-free); the filter's correctness is kap-server's own tested
+ * behavior.
+ */
+export async function countRunningSessions(server: AgentsServer): Promise<number> {
+  const res = await fetch(`${server.baseUrl}/api/v1/sessions?busy=true`, {
+    headers: { authorization: `Bearer ${server.token}` },
+  });
+  if (!res.ok) {
+    throw new Error(`failed to count running sessions: HTTP ${res.status} from ${server.baseUrl}`);
+  }
+  const body = (await res.json()) as { data: { items: unknown[] } };
+  return body.data.items.length;
+}
