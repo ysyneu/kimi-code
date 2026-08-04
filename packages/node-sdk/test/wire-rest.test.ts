@@ -1,5 +1,16 @@
-import { describe, expect, it } from 'vitest';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
+import {
+  startServer,
+  type RunningServer,
+  type ServerHostIdentity,
+} from '@moonshot-ai/kap-server';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { z } from 'zod';
+
+import { WireHttpClient } from '#/wire/http-client';
 import {
   EnvelopeError,
   envelopeSchema,
@@ -7,7 +18,67 @@ import {
   wireSessionSchema,
   wsEventFrameSchema,
 } from '#/wire/protocol';
-import { z } from 'zod';
+
+// ---------------------------------------------------------------------------
+// Shared live-server fixture (file scope — later wire-transport describes
+// reuse `server` / `home` / `token` / `http`).
+// ---------------------------------------------------------------------------
+
+const TEST_HOST_IDENTITY: ServerHostIdentity = {
+  productName: 'test-host',
+  version: '0.0.0-test',
+  platform: 'test_platform',
+};
+
+// Minimal provider config so prompt submission is accepted. The stub endpoint
+// is unreachable — the turn fails asynchronously, which the REST contract
+// assertions do not depend on. Mirrors packages/kap-server/test/prompts.test.ts.
+const STUB_PROVIDER_TOML = [
+  'default_model = "stub"',
+  '',
+  '[providers.stub]',
+  'type = "openai"',
+  'base_url = "http://127.0.0.1:9999"',
+  'api_key = "stub"',
+  '',
+  '[models.stub]',
+  'provider = "stub"',
+  'model = "stub"',
+  'max_context_size = 1000',
+  '',
+].join('\n');
+
+let server: RunningServer;
+let home: string;
+let token: string;
+let http: WireHttpClient;
+// Real on-disk workspace root — session creation rejects a non-existent cwd
+// (server code 40409).
+let cwd: string;
+
+beforeAll(async () => {
+  home = await mkdtemp(join(tmpdir(), 'kimi-wire-test-'));
+  await writeFile(join(home, 'config.toml'), STUB_PROVIDER_TOML, 'utf-8');
+  cwd = join(home, 'workspace');
+  await mkdir(cwd);
+  server = await startServer({
+    hostIdentity: TEST_HOST_IDENTITY,
+    host: '127.0.0.1',
+    port: 0,
+    homeDir: home,
+    logLevel: 'silent',
+  });
+  token = server.authTokenService.getToken();
+  http = new WireHttpClient({
+    baseUrl: `http://127.0.0.1:${server.port}`,
+    token,
+  });
+});
+
+afterAll(async () => {
+  await server.close();
+  await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+});
 
 describe('wire protocol schemas', () => {
   it('unwraps a success envelope and preserves typed data', () => {
@@ -53,5 +124,43 @@ describe('wire protocol schemas', () => {
     };
     expect(wsEventFrameSchema.parse(frame).payload.type).toBe('turn.started');
     expect(wsEventFrameSchema.safeParse({ ...frame, seq: '42' }).success).toBe(false);
+  });
+});
+
+describe('WireHttpClient against a real kap-server', () => {
+  it('creates, lists, renames, and archives a session', async () => {
+    const created = await http.createSession({ metadata: { cwd } });
+    expect(created.id).toBeTruthy();
+    expect(created.metadata.cwd).toBe(cwd);
+
+    const page = await http.listSessions();
+    expect(page.items.some((s) => s.id === created.id)).toBe(true);
+
+    const renamed = await http.updateSessionProfile(created.id, { title: 'renamed' });
+    expect(renamed.title).toBe('renamed');
+
+    await http.sessionAction(created.id, 'archive');
+    const after = await http.getSession(created.id);
+    expect(after.archived).toBe(true);
+  });
+
+  it('rejects session creation without metadata.cwd (server contract)', async () => {
+    await expect(
+      http.createSessionRaw({ title: 'no-cwd' }),
+    ).rejects.toMatchObject({ code: 40001 });
+  });
+
+  it('submits a prompt and reads status + messages', async () => {
+    const created = await http.createSession({ metadata: { cwd } });
+    const submitted = await http.submitPrompt(created.id, {
+      content: [{ type: 'text', text: 'hello' }],
+    });
+    expect(submitted.prompt_id).toBeTruthy();
+
+    const status = await http.getSessionStatus(created.id);
+    expect(typeof status.busy).toBe('boolean');
+
+    const messages = await http.getMessages(created.id);
+    expect(messages.items.some((m) => m.role === 'user')).toBe(true);
   });
 });
