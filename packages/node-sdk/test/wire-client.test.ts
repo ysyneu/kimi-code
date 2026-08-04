@@ -642,6 +642,17 @@ describe('SDKRpcClientWire lifecycle', () => {
     await rpc.close();
   });
 
+  it('resolves workspace trust for a session; a missing session reads back undefined', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const created = await rpc.createSession({ workDir: cwd });
+    // The workspace auto-registered on session creation, so the trust read is a boolean.
+    await expect(rpc.getWorkspaceTrustForSession(created.id)).resolves.toEqual(
+      expect.any(Boolean),
+    );
+    await expect(rpc.getWorkspaceTrustForSession('no-such-session')).resolves.toBeUndefined();
+    await rpc.close();
+  });
+
   it('rejects a non-loopback serverUrl', () => {
     expect(() => new SDKRpcClientWire({ serverUrl: 'http://192.168.1.10:58627', token: 't' })).toThrow();
   });

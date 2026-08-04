@@ -1,4 +1,4 @@
-import type { Event, KimiHarness, Session, Unsubscribe } from '@moonshot-ai/kimi-code-sdk';
+import type { Event, KimiHarness, Session, SessionSummary, Unsubscribe } from '@moonshot-ai/kimi-code-sdk';
 import { SDKRpcClientWire } from '@moonshot-ai/kimi-code-sdk';
 import type { Component, ProcessTerminal, TUI } from '@moonshot-ai/pi-tui';
 
@@ -209,6 +209,10 @@ export class AgentsViewController {
         this.handleGlobalEvent(event);
       }),
     });
+
+    // Trust badges load after mount: the roster is already useful without
+    // them, and the per-row reads must never block or break show().
+    void this.loadTrust(summaries);
   }
 
   close(): void {
@@ -241,6 +245,37 @@ export class AgentsViewController {
   }
 
   // ---------------------------------------------------------------------------
+
+  /**
+   * One-shot trust read at roster load (no live refresh this milestone): the
+   * wire transport resolves each row's workspace trust and the badge rides
+   * `roster.setTrusted`. A per-row failure leaves `trusted` undefined — no
+   * badge, no error surface; non-wire transports have no trust route and are
+   * skipped by the narrowing.
+   */
+  private async loadTrust(summaries: readonly SessionSummary[]): Promise<void> {
+    const view = this.host.state.agentsView;
+    if (view === undefined) return;
+    const rpc = wireRpcOf(this.host.harness);
+    if (rpc === undefined) return;
+    let changed = false;
+    await Promise.all(
+      summaries.map(async (summary) => {
+        // Archived sessions never entered the roster; setTrusted would no-op.
+        if (view.roster.get(summary.id) === undefined) return;
+        let trusted: boolean | undefined;
+        try {
+          trusted = await rpc.getWorkspaceTrustForSession(summary.id);
+        } catch {
+          return;
+        }
+        if (this.host.state.agentsView !== view) return;
+        view.roster.setTrusted(summary.id, trusted);
+        changed = true;
+      }),
+    );
+    if (changed && this.host.state.agentsView === view) this.pushProps();
+  }
 
   /**
    * Dispatch flow (design §4.5): create the session in the view's workDir,

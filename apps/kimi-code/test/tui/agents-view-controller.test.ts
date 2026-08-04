@@ -84,13 +84,14 @@ interface FakeHarness {
   session: { getContext: ReturnType<typeof vi.fn>; steer: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> };
   createdSession: { id: string; prompt: ReturnType<typeof vi.fn> };
   wirePrompt: ReturnType<typeof vi.fn> | undefined;
+  wireTrust: ReturnType<typeof vi.fn> | undefined;
   emit(event: unknown): void;
 }
 
 function makeHarness(
   homeDir: string,
   summaries: readonly SessionSummary[],
-  opts: { wire?: boolean } = {},
+  opts: { wire?: boolean; trust?: (id: string) => Promise<boolean | undefined> } = {},
 ): FakeHarness {
   const listeners = new Set<(event: Event) => void>();
   const session = {
@@ -100,13 +101,15 @@ function makeHarness(
   };
   const createdSession = { id: 'new-session', prompt: vi.fn(async () => {}) };
   const wirePrompt = opts.wire === true ? vi.fn(async () => {}) : undefined;
+  const wireTrust = opts.wire === true ? vi.fn(opts.trust ?? (async () => true)) : undefined;
   // A bare prototype instance satisfies the controller's instanceof narrowing
   // without booting a real wire client.
   const wireRpc =
-    wirePrompt === undefined
+    wirePrompt === undefined || wireTrust === undefined
       ? undefined
       : (Object.assign(Object.create(SDKRpcClientWire.prototype) as SDKRpcClientWire, {
           prompt: wirePrompt,
+          getWorkspaceTrustForSession: wireTrust,
         }));
   const listSessions = vi.fn(async () => summaries);
   const resumeSession = vi.fn(async () => session as unknown as Session);
@@ -138,6 +141,7 @@ function makeHarness(
     session,
     createdSession,
     wirePrompt,
+    wireTrust,
     emit: (event: unknown) => {
       for (const listener of listeners) listener(event as Event);
     },
@@ -162,10 +166,14 @@ const SENTINEL_B = { tag: 'sentinel-b' } as unknown as Component;
 
 async function boot(
   summaries: readonly SessionSummary[],
-  opts: { onOpenSession?: (id: string) => void; wire?: boolean } = {},
+  opts: {
+    onOpenSession?: (id: string) => void;
+    wire?: boolean;
+    trust?: (id: string) => Promise<boolean | undefined>;
+  } = {},
 ): Promise<Boot> {
   const homeDir = await mkdtemp(join(tmpdir(), 'agents-view-controller-'));
-  const fake = makeHarness(homeDir, summaries, { wire: opts.wire });
+  const fake = makeHarness(homeDir, summaries, { wire: opts.wire, trust: opts.trust });
   const ui: FakeUI = {
     children: [SENTINEL_A, SENTINEL_B],
     clear() {
@@ -818,5 +826,54 @@ describe('AgentsViewController — dispatch', () => {
     await flush();
     expect(b.render()).toContain('Dispatch failed: workspace rejected');
     b.controller.close(); // clear the pending flash timer
+  });
+});
+
+// ── Task 5: workspace trust lookup on show() → roster badge ──
+
+describe('AgentsViewController — workspace trust', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    dir = undefined;
+  });
+
+  it('show fetches trust per row through the wire rpc and renders the untrusted badge', async () => {
+    const b = await boot([summary('s1'), summary('s2')], {
+      wire: true,
+      trust: async (id) => id === 's2',
+    });
+    dir = b.homeDir;
+    await flush();
+    expect(b.fake.wireTrust).toHaveBeenCalledWith('s1');
+    expect(b.fake.wireTrust).toHaveBeenCalledWith('s2');
+    expect(b.view().roster.get('s1')?.trusted).toBe(false);
+    expect(b.view().roster.get('s2')?.trusted).toBe(true);
+    expect(b.render()).toContain('untrusted');
+  });
+
+  it('a failing trust lookup leaves the row without a badge and spams no error', async () => {
+    const b = await boot([summary('s1'), summary('s2')], {
+      wire: true,
+      trust: async (id) => {
+        if (id === 's1') throw new Error('trust route exploded');
+        return true;
+      },
+    });
+    dir = b.homeDir;
+    await flush();
+    expect(b.view().roster.get('s1')?.trusted).toBeUndefined();
+    expect(b.view().roster.get('s2')?.trusted).toBe(true);
+    expect(b.render()).not.toContain('untrusted');
+    expect(b.view().flashMessage).toBeUndefined();
+    expect(b.showError).not.toHaveBeenCalled();
+  });
+
+  it('non-wire transports skip the trust lookup entirely', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    await flush();
+    expect(b.view().roster.get('s1')?.trusted).toBeUndefined();
+    expect(b.render()).not.toContain('untrusted');
   });
 });

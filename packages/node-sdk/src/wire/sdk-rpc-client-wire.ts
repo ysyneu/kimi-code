@@ -77,6 +77,7 @@ import type {
 import { CursorSupervisor } from './cursor-supervisor';
 import { translateWireEvent } from './event-translator';
 import { WireHttpClient } from './http-client';
+import { EnvelopeError } from './protocol';
 import type {
   WireMessage,
   WireSession,
@@ -569,6 +570,27 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
 
   override async getSessionWarnings(input: SessionIdRpcInput) {
     return this.http.getSessionWarnings(input.sessionId);
+  }
+
+  // -----------------------------------------------------------------------
+  // Workspace trust (wire-only — the base surface has no trust concept)
+  // -----------------------------------------------------------------------
+
+  /**
+   * Resolve the session's workspace and read its trust state. A session the
+   * server doesn't know maps to `undefined` — the 40401 (session.not_found)
+   * envelope is contained here so the agents view can treat a vanished row as
+   * "no trust info"; every other failure propagates.
+   */
+  async getWorkspaceTrustForSession(sessionId: string): Promise<boolean | undefined> {
+    let session: WireSession;
+    try {
+      session = await this.http.getSession(sessionId);
+    } catch (error) {
+      if (error instanceof EnvelopeError && error.code === 40401) return undefined;
+      throw error;
+    }
+    return this.http.getWorkspaceTrust(session.workspace_id);
   }
 
   // -----------------------------------------------------------------------
