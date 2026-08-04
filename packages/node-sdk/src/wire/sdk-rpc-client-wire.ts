@@ -28,8 +28,10 @@
  *   interactions queue until the consumer registers its handlers — consumers
  *   register them after `resumeSession` returns, so attach never auto-cancels
  *   a genuinely pending approval/question. The returned
- *   `ResumedSessionSummary` carries `agents: {}` / `warning: undefined` and a
- *   best-effort `sessionMetadata` — replay detail is refined in M4.
+ *   `ResumedSessionSummary` carries a populated `agents.main` built from the
+ *   snapshot + paged messages (see `resume-replay.ts`) so the TUI's replay
+ *   contract renders the session's history, plus a best-effort
+ *   `sessionMetadata` and `warning: undefined`.
  * - `sessionDir` is `''` everywhere: the server never exposes its on-disk
  *   layout over the wire.
  */
@@ -37,7 +39,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { ErrorCodes, KimiError, noopTelemetryClient } from '@moonshot-ai/agent-core';
-import type { AgentContextData, ContextMessage } from '@moonshot-ai/agent-core';
+import type { AgentContextData } from '@moonshot-ai/agent-core';
 import { ensureKimiHome, resolveConfigPath, resolveKimiHome } from '@moonshot-ai/agent-core-v2';
 import { assertKimiHostIdentity } from '@moonshot-ai/kimi-code-oauth';
 
@@ -51,7 +53,6 @@ import {
 } from '#/rpc';
 import type {
   CompactOptions,
-  ContentPart,
   CreateSessionOptions,
   ForkSessionInput,
   JsonObject,
@@ -71,7 +72,6 @@ import type {
   SessionUsage,
   SkillSummary,
   TelemetryClient,
-  ToolCall,
 } from '#/types';
 
 import { CursorSupervisor } from './cursor-supervisor';
@@ -79,13 +79,17 @@ import { translateWireEvent } from './event-translator';
 import { WireHttpClient } from './http-client';
 import { EnvelopeError } from './protocol';
 import type {
-  WireMessage,
   WireSession,
   WireSessionStatus,
   WireSessionUsage,
   WireSnapshot,
   WsEventFrame,
 } from './protocol';
+import {
+  buildResumedMainAgentState,
+  collectReplayMessages,
+  wireMessageToContextMessage,
+} from './resume-replay';
 import { InteractionBridge } from './reverse-rpc';
 import { WsConnection } from './ws-connection';
 
@@ -211,63 +215,6 @@ function wireUsageToSessionUsage(usage: WireSessionUsage): SessionUsage {
     byModel: undefined,
     currentTurn: undefined,
   };
-}
-
-/**
- * Best-effort `WireMessage` → `ContextMessage` projection (M1). Text,
- * thinking, URL media, tool_use (→ `toolCalls`), and tool_result (→ a `tool`
- * message's `toolCallId` + text content) survive; base64/file media sources
- * and `file` parts have no kosong equivalent and drop out.
- */
-function wireMessageToContextMessage(message: WireMessage): ContextMessage {
-  const content: ContentPart[] = [];
-  const toolCalls: ToolCall[] = [];
-  let toolCallId: string | undefined;
-  for (const raw of message.content) {
-    const part: Record<string, unknown> = raw;
-    switch (part['type']) {
-      case 'text':
-        content.push({ type: 'text', text: part['text'] as string });
-        break;
-      case 'thinking':
-        content.push({
-          type: 'think',
-          think: part['thinking'] as string,
-          encrypted: part['signature'] as string | undefined,
-        });
-        break;
-      case 'image':
-      case 'video': {
-        const source = part['source'] as { kind?: string; url?: string; id?: string } | undefined;
-        if (source?.kind === 'url' && source.url !== undefined) {
-          content.push(
-            part['type'] === 'image'
-              ? { type: 'image_url', imageUrl: { url: source.url, id: source.id } }
-              : { type: 'video_url', videoUrl: { url: source.url, id: source.id } },
-          );
-        }
-        break;
-      }
-      case 'tool_use':
-        toolCalls.push({
-          type: 'function',
-          id: part['tool_call_id'] as string,
-          name: part['tool_name'] as string,
-          arguments: JSON.stringify(part['input'] ?? null),
-        });
-        break;
-      case 'tool_result': {
-        toolCallId = part['tool_call_id'] as string;
-        const output = part['output'];
-        content.push({
-          type: 'text',
-          text: typeof output === 'string' ? output : JSON.stringify(output ?? null),
-        });
-        break;
-      }
-    }
-  }
-  return { role: message.role, content, toolCalls, toolCallId };
 }
 
 export class SDKRpcClientWire extends SDKRpcClientBase {
@@ -450,10 +397,24 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
       epoch: snapshot.epoch,
     });
     this.bridge.replayPending(input.id, snapshot);
+    // Read-only detail fetches happen after the subscribe + pending replay,
+    // keeping the M1 attach order intact. `includeSubagents` cannot be
+    // honored: the messages surface serves the main agent only, so `agents`
+    // always carries exactly `main`.
+    const [status, messages] = await Promise.all([
+      this.http.getSessionStatus(input.id),
+      collectReplayMessages(
+        (beforeId) => this.http.getMessages(input.id, { before_id: beforeId, limit: 100 }),
+        snapshot.messages,
+        input.replayTurnLimit,
+      ),
+    ]);
     return {
       ...wireSessionToSummary(snapshot.session),
       sessionMetadata: snapshotToSessionMeta(snapshot),
-      agents: {},
+      agents: {
+        main: buildResumedMainAgentState(snapshot, status, messages, input.replayTurnLimit),
+      },
       warning: undefined,
     };
   }

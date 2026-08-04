@@ -84,7 +84,13 @@ export const wireSessionSchema = z.object({
   current_prompt_id: z.string().min(1).optional(),
   last_prompt: z.string().optional(),
   metadata: wireSessionMetadataSchema,
-  agent_config: z.object({ model: z.string() }).passthrough(),
+  agent_config: z
+    .object({
+      model: z.string(),
+      system_prompt: z.string().optional(),
+      thinking: z.string().optional(),
+    })
+    .passthrough(),
   usage: wireSessionUsageSchema,
   permission_rules: z.array(z.unknown()),
   message_count: z.number().int().nonnegative(),
@@ -227,13 +233,38 @@ export const wireMessageSchema = z.object({
 });
 export type WireMessage = z.infer<typeof wireMessageSchema>;
 
+/**
+ * A live subagent task in the snapshot roster — kap-server's
+ * `snapshotSubagentSchema` (taskSchema + swarm identity fields).
+ */
+export const wireSnapshotSubagentSchema = z.object({
+  id: z.string().min(1),
+  session_id: z.string().min(1),
+  kind: z.enum(['subagent', 'bash', 'tool']),
+  description: z.string(),
+  status: z.enum(['running', 'completed', 'failed', 'cancelled']),
+  command: z.string().optional(),
+  created_at: isoDateTime,
+  started_at: isoDateTime.optional(),
+  completed_at: isoDateTime.optional(),
+  output_preview: z.string().optional(),
+  output_bytes: z.number().int().nonnegative().optional(),
+  subagent_phase: z.enum(['queued', 'working', 'suspended', 'completed', 'failed']).optional(),
+  subagent_type: z.string().optional(),
+  parent_tool_call_id: z.string().optional(),
+  suspended_reason: z.string().optional(),
+  swarm_index: z.number().int().nonnegative().optional(),
+  run_in_background: z.boolean().optional(),
+});
+export type WireSnapshotSubagent = z.infer<typeof wireSnapshotSubagentSchema>;
+
 export const wireSnapshotSchema = z.object({
   as_of_seq: z.number().int().nonnegative(),
   epoch: z.string().min(1),
   session: wireSessionSchema,
   messages: z.object({ items: z.array(wireMessageSchema), has_more: z.boolean() }),
   in_flight_turn: z.unknown().nullable(),
-  subagents: z.array(z.unknown()).optional(),
+  subagents: z.array(wireSnapshotSubagentSchema).optional(),
   pending_approvals: z.array(wireApprovalRequestSchema),
   pending_questions: z.array(wireQuestionRequestSchema),
 });

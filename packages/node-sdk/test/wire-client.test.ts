@@ -12,7 +12,8 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { createKimiHarnessWire } from '#/index';
 import { WireHttpClient, type WirePromptSubmission } from '#/wire/http-client';
-import type { WireApprovalRequest, WireQuestionRequest } from '#/wire/protocol';
+import type { WireApprovalRequest, WireMessage, WireQuestionRequest } from '#/wire/protocol';
+import { collectReplayMessages } from '#/wire/resume-replay';
 import { InteractionBridge } from '#/wire/reverse-rpc';
 import { SDKRpcClientWire, toWireContent } from '#/wire/sdk-rpc-client-wire';
 
@@ -915,6 +916,168 @@ describe('toWireContent', () => {
       type: 'video',
       source: { kind: 'url', url: 'https://example.com/v.mp4', id: undefined },
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDKRpcClientWire resume replay — the M4 replay-fidelity contract: the wire
+// resume state must carry what the TUI's hydrateFromReplay consumes
+// (apps/kimi-code session-replay.ts): agents.main.{replay, context, config,
+// permission, plan, swarmMode, background, tools}. The stub provider makes
+// every turn fail fast, but the user message persists before the turn runs —
+// that is the history replay must render.
+// ---------------------------------------------------------------------------
+
+function replayUserTexts(main: { readonly replay: readonly unknown[] }): string[] {
+  return (main.replay as Array<{ type: string; message?: { role: string; content: Array<{ type: string; text?: string }> } }>)
+    .filter((record) => record.type === 'message' && record.message?.role === 'user')
+    .map((record) =>
+      (record.message?.content ?? [])
+        .map((part) => (part.type === 'text' ? (part.text ?? '') : ''))
+        .join(''),
+    );
+}
+
+describe('SDKRpcClientWire resume replay', () => {
+  it('populates agents.main replay state from the snapshot and messages', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const http = new WireHttpClient({ baseUrl: base, token });
+    const created = await rpc.createSession({ workDir: cwd });
+    // The stub provider's turn now retries instead of dying instantly, so
+    // abort each turn to settle the session quickly; the user message is
+    // persisted on submit, before the turn runs — that is the history replay
+    // must render.
+    await rpc.prompt({ sessionId: created.id, input: [{ type: 'text', text: 'replay-one' }] });
+    await rpc.cancel({ sessionId: created.id });
+    await waitForAsync(async () => !(await http.getSession(created.id)).busy);
+    await rpc.prompt({ sessionId: created.id, input: [{ type: 'text', text: 'replay-two' }] });
+    await rpc.cancel({ sessionId: created.id });
+    await waitForAsync(async () => !(await http.getSession(created.id)).busy);
+
+    const resumed = await rpc.resumeSession({ id: created.id, replayTurnLimit: 10 });
+    const main = resumed.agents['main'];
+    expect(main).toBeDefined();
+    expect(main?.type).toBe('main');
+
+    // The replay records hydrateFromReplay renders: user/assistant/tool
+    // messages with a numeric time each.
+    for (const record of main?.replay ?? []) {
+      expect(record.time).toEqual(expect.any(Number));
+    }
+    const userTexts = replayUserTexts(main ?? { replay: [] });
+    expect(userTexts).toContain('replay-one');
+    expect(userTexts).toContain('replay-two');
+
+    // The snapshot fields appStateFromResumeAgent / hydrateSnapshot read.
+    expect(main?.config.cwd).toBe(cwd);
+    expect(main?.config.modelCapabilities.max_context_tokens).toBeGreaterThan(0);
+    expect(main?.context.tokenCount).toEqual(expect.any(Number));
+    expect(main?.context.history.some((m) => m.role === 'user')).toBe(true);
+    expect(['manual', 'yolo', 'auto']).toContain(main?.permission.mode);
+    expect(main?.plan).toBeNull();
+    expect(main?.swarmMode).toEqual(expect.any(Boolean));
+    expect(Array.isArray(main?.background)).toBe(true);
+    expect(Array.isArray(main?.tools)).toBe(true);
+    await rpc.close();
+  });
+
+  it('trims the replay to replayTurnLimit user turns', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const http = new WireHttpClient({ baseUrl: base, token });
+    const created = await rpc.createSession({ workDir: cwd });
+    await rpc.prompt({ sessionId: created.id, input: [{ type: 'text', text: 'trim-one' }] });
+    await rpc.cancel({ sessionId: created.id });
+    await waitForAsync(async () => !(await http.getSession(created.id)).busy);
+    await rpc.prompt({ sessionId: created.id, input: [{ type: 'text', text: 'trim-two' }] });
+    await rpc.cancel({ sessionId: created.id });
+    await waitForAsync(async () => !(await http.getSession(created.id)).busy);
+
+    const resumed = await rpc.resumeSession({ id: created.id, replayTurnLimit: 1 });
+    const userTexts = replayUserTexts(resumed.agents['main'] ?? { replay: [] });
+    expect(userTexts).toContain('trim-two');
+    expect(userTexts).not.toContain('trim-one');
+    await rpc.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// collectReplayMessages — the older-history paging behind the resume replay.
+// Stubbed page source: the messages route serves newest-first pages, the
+// helper must prepend them oldest-first and stop at the turn limit or at the
+// end of history.
+// ---------------------------------------------------------------------------
+
+describe('collectReplayMessages', () => {
+  function stubPageSource(pages: Array<{ items: WireMessage[]; has_more: boolean }>) {
+    const calls: Array<string | undefined> = [];
+    const fetchPage = async (beforeId?: string) => {
+      calls.push(beforeId);
+      const page = pages[calls.length - 1];
+      if (page === undefined) throw new Error('unexpected extra page fetch');
+      return page;
+    };
+    return { calls, fetchPage };
+  }
+
+  function stubMessage(id: string, text: string, role: 'user' | 'assistant' = 'user'): WireMessage {
+    return {
+      id,
+      session_id: 's1',
+      role,
+      content: [{ type: 'text', text }],
+      created_at: '2026-07-30T00:00:00.000Z',
+    };
+  }
+
+  it('pages older history until the turn limit is covered, oldest-first', async () => {
+    // Snapshot page (ascending): the newest three messages, one user turn.
+    const firstPage = {
+      items: [stubMessage('m3', 'newest'), stubMessage('m4', 'reply', 'assistant'), stubMessage('m5', 'latest')],
+      has_more: true,
+    };
+    // Messages route page (newest-first): two older user turns.
+    const olderPage = {
+      items: [stubMessage('m2', 'second'), stubMessage('m1', 'first')],
+      has_more: false,
+    };
+    const { calls, fetchPage } = stubPageSource([olderPage]);
+    const messages = await collectReplayMessages(fetchPage, firstPage, 3);
+    expect(calls).toEqual(['m3']);
+    expect(messages.map((m) => m.id)).toEqual(['m1', 'm2', 'm3', 'm4', 'm5']);
+  });
+
+  it('does not page when the snapshot already covers the turn limit', async () => {
+    const firstPage = {
+      items: [stubMessage('m1', 'only turn')],
+      has_more: true,
+    };
+    const { calls, fetchPage } = stubPageSource([]);
+    const messages = await collectReplayMessages(fetchPage, firstPage, 1);
+    expect(calls).toEqual([]);
+    expect(messages.map((m) => m.id)).toEqual(['m1']);
+  });
+
+  it('pages to the end of history when no turn limit is given', async () => {
+    const firstPage = { items: [stubMessage('m3', 'c')], has_more: true };
+    const pageTwo = { items: [stubMessage('m2', 'b')], has_more: true };
+    const pageThree = { items: [stubMessage('m1', 'a')], has_more: false };
+    const { calls, fetchPage } = stubPageSource([pageTwo, pageThree]);
+    const messages = await collectReplayMessages(fetchPage, firstPage, undefined);
+    expect(calls).toEqual(['m3', 'm2']);
+    expect(messages.map((m) => m.id)).toEqual(['m1', 'm2', 'm3']);
+  });
+
+  it('stops paging when a page makes no progress (pivot not found)', async () => {
+    const firstPage = { items: [stubMessage('m3', 'c')], has_more: true };
+    // The server answers with a page whose oldest id is the pivot itself —
+    // continuing would loop forever on the same page.
+    const stuckPage = { items: [stubMessage('m3', 'c')], has_more: true };
+    const { calls, fetchPage } = stubPageSource([stuckPage, stuckPage]);
+    const messages = await collectReplayMessages(fetchPage, firstPage, 5);
+    expect(calls).toEqual(['m3']);
+    expect(messages.map((m) => m.id)).toEqual(['m3']);
   });
 });
 

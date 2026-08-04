@@ -159,13 +159,18 @@ export class WireHttpClient {
     return this.request('GET', `/sessions/${id}/snapshot`, undefined, wireSnapshotSchema);
   }
 
+  /**
+   * Paged message read. Items come back NEWEST-FIRST (the route slices a
+   * reversed transcript); `before_id` pages further into the past. The
+   * `limit` option maps to the route's `page_size` field.
+   */
   getMessages(
     id: string,
     query: { before_id?: string; limit?: number } = {},
   ): Promise<{ items: WireMessage[]; has_more: boolean }> {
     const params = new URLSearchParams();
     if (query.before_id !== undefined) params.set('before_id', query.before_id);
-    if (query.limit !== undefined) params.set('limit', String(query.limit));
+    if (query.limit !== undefined) params.set('page_size', String(query.limit));
     const suffix = params.size > 0 ? `?${params.toString()}` : '';
     return this.request(
       'GET',
