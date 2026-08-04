@@ -252,35 +252,35 @@ export class AgentsViewController {
   private async handleDispatch(submission: DispatchSubmission): Promise<void> {
     const view = this.host.state.agentsView;
     if (view === undefined) return;
+    // Validate before mutate: `Session.prompt` carries no overrides — the
+    // extended rpc-level prompt (`WirePromptRpcInput`, M4-T1) does, reached
+    // through the harness's rpc with an instanceof narrowing (never `any`).
+    // A transport that can't carry the overrides is rejected HERE, before
+    // createSession, so the failure can't orphan a server-side session.
+    const hasOverrides = submission.model !== undefined || submission.profile !== undefined;
+    const rpc = hasOverrides ? wireRpcOf(this.host.harness) : undefined;
+    if (hasOverrides && rpc === undefined) {
+      this.flash('Dispatch failed: /model and /agent overrides require the wire transport');
+      return;
+    }
     try {
       const session = await this.host.harness.createSession({
         workDir: this.host.agentsViewWorkDir(),
       });
-      await this.promptDispatch(session, submission);
+      if (rpc !== undefined) {
+        await rpc.prompt({
+          sessionId: session.id,
+          input: [{ type: 'text', text: submission.text }],
+          model: submission.model,
+          profile: submission.profile,
+        });
+      } else {
+        await session.prompt(submission.text);
+      }
     } catch (error) {
       if (this.host.state.agentsView !== view) return;
       this.flash(`Dispatch failed: ${error instanceof Error ? error.message : String(error)}`);
     }
-  }
-
-  private async promptDispatch(session: Session, submission: DispatchSubmission): Promise<void> {
-    if (submission.model === undefined && submission.profile === undefined) {
-      await session.prompt(submission.text);
-      return;
-    }
-    // `Session.prompt` carries no overrides; the extended rpc-level prompt
-    // (`WirePromptRpcInput`, M4-T1) does. Reach it through the harness's rpc
-    // with an instanceof narrowing — never `any`.
-    const rpc = wireRpcOf(this.host.harness);
-    if (rpc === undefined) {
-      throw new Error('/model and /agent overrides require the wire transport');
-    }
-    await rpc.prompt({
-      sessionId: session.id,
-      input: [{ type: 'text', text: submission.text }],
-      model: submission.model,
-      profile: submission.profile,
-    });
   }
 
   private handleGlobalEvent(event: Event): void {

@@ -779,11 +779,12 @@ describe('AgentsViewController — dispatch', () => {
     expect(b.fake.wirePrompt).not.toHaveBeenCalled();
   });
 
-  it('overrides without the wire transport flash an error and skip the prompt', async () => {
+  it('overrides without the wire transport fail before createSession (no orphan session)', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
     b.view().dispatch.editor.onSubmit?.('/model kimi-k2 fix the flaky test');
     await flush();
+    expect(b.fake.createSession).not.toHaveBeenCalled();
     expect(b.fake.createdSession.prompt).not.toHaveBeenCalled();
     expect(b.view().flashMessage).toContain('wire transport');
     b.controller.close(); // clear the pending flash timer
