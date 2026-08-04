@@ -12,9 +12,11 @@
  *
  * Deliberate M1 semantics:
  * - `closeSession` is a LOCAL DETACH ONLY (unsubscribe + drop the registered
- *   handlers) — no HTTP call, the server-side session stays alive and
- *   resumable. The wire has no per-connection session-close verb, and the
- *   daemon owns the session lifetime.
+ *   handlers + drop the bridge's dedupe/queued state) — no HTTP call, the
+ *   server-side session stays alive and resumable, and a later reattach
+ *   re-presents interactions that are still pending. The wire has no
+ *   per-connection session-close verb, and the daemon owns the session
+ *   lifetime.
  * - `deleteSession` maps to `:archive` (the wire's only session-removal verb).
  * - Turns and state reads map onto the prompts / status / messages REST
  *   surface: `steer` is submit-then-`prompts::steer`, `cancel` is `:abort`,
@@ -22,7 +24,10 @@
  *   serves the newest message page only. `agent_id` is never sent — every
  *   turn override addresses the main agent (M1).
  * - `resumeSession` subscribes at the snapshot cursor and replays the
- *   snapshot's pending interactions into the bridge; the returned
+ *   snapshot's pending interactions into the bridge; replayed (and live)
+ *   interactions queue until the consumer registers its handlers — consumers
+ *   register them after `resumeSession` returns, so attach never auto-cancels
+ *   a genuinely pending approval/question. The returned
  *   `ResumedSessionSummary` carries `agents: {}` / `warning: undefined` and a
  *   best-effort `sessionMetadata` — replay detail is refined in M4.
  * - `sessionDir` is `''` everywhere: the server never exposes its on-disk
@@ -37,6 +42,7 @@ import { ensureKimiHome, resolveConfigPath, resolveKimiHome } from '@moonshot-ai
 import { assertKimiHostIdentity } from '@moonshot-ai/kimi-code-oauth';
 
 import { KimiAuthFacade } from '#/auth';
+import type { ApprovalHandler, QuestionHandler } from '#/events';
 import { SDKRpcClientBase, type SessionIdRpcInput, type SessionPromptRpcInput } from '#/rpc';
 import type {
   CompactOptions,
@@ -252,6 +258,13 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
   private readonly http: WireHttpClient;
   private readonly supervisor: CursorSupervisor;
   private readonly bridge: InteractionBridge;
+  // Handler-presence probes for the bridge: the base class auto-cancels an
+  // approval (dismisses a question) when no handler is registered — correct
+  // for the in-process engines, but on the wire a pending interaction can
+  // arrive at attach time, before the consumer registers its handlers. The
+  // bridge queues those interactions instead, and these sets are how it knows.
+  private readonly approvalHandlerSessions = new Set<string>();
+  private readonly questionHandlerSessions = new Set<string>();
 
   constructor(options: SDKRpcClientWireOptions) {
     super();
@@ -286,6 +299,8 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
       http: this.http,
       requestApproval: (request) => this.requestApproval(request),
       requestQuestion: (request) => this.requestQuestion(request),
+      hasApprovalHandler: (sessionId) => this.approvalHandlerSessions.has(sessionId),
+      hasQuestionHandler: (sessionId) => this.questionHandlerSessions.has(sessionId),
     });
     this.supervisor = new CursorSupervisor({
       makeConnection: () =>
@@ -328,6 +343,40 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
 
   async close(): Promise<void> {
     await this.supervisor.close();
+  }
+
+  // -----------------------------------------------------------------------
+  // Interaction handlers
+  //
+  // Consumers register handlers after `resumeSession` returns, so replayed
+  // (and early live) interactions sit queued in the bridge; registration
+  // flushes them, firing each pending id exactly once per attach.
+  // -----------------------------------------------------------------------
+
+  override setApprovalHandler(sessionId: string, handler: ApprovalHandler | undefined): void {
+    super.setApprovalHandler(sessionId, handler);
+    if (handler === undefined) {
+      this.approvalHandlerSessions.delete(sessionId);
+      return;
+    }
+    this.approvalHandlerSessions.add(sessionId);
+    this.bridge.flush(sessionId, 'approval');
+  }
+
+  override setQuestionHandler(sessionId: string, handler: QuestionHandler | undefined): void {
+    super.setQuestionHandler(sessionId, handler);
+    if (handler === undefined) {
+      this.questionHandlerSessions.delete(sessionId);
+      return;
+    }
+    this.questionHandlerSessions.add(sessionId);
+    this.bridge.flush(sessionId, 'question');
+  }
+
+  override clearSessionHandlers(sessionId: string): void {
+    super.clearSessionHandlers(sessionId);
+    this.approvalHandlerSessions.delete(sessionId);
+    this.questionHandlerSessions.delete(sessionId);
   }
 
   // -----------------------------------------------------------------------
@@ -384,13 +433,16 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
   }
 
   /**
-   * Local detach ONLY — unsubscribe the event cursor and drop the registered
-   * interaction handlers. No HTTP call: the server-side session keeps running
-   * and stays resumable. This is the wire transport's core ownership rule.
+   * Local detach ONLY — unsubscribe the event cursor, drop the registered
+   * interaction handlers, and forget the bridge's dedupe/queued state so a
+   * later reattach re-presents still-pending interactions. No HTTP call: the
+   * server-side session keeps running and stays resumable. This is the wire
+   * transport's core ownership rule.
    */
   override async closeSession(input: SessionIdRpcInput): Promise<void> {
     await this.supervisor.unsubscribe(input.sessionId);
     this.clearSessionHandlers(input.sessionId);
+    this.bridge.forgetSession(input.sessionId);
   }
 
   override async deleteSession(input: SessionIdRpcInput): Promise<void> {

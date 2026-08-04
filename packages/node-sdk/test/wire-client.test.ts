@@ -100,6 +100,8 @@ describe('InteractionBridge', () => {
         return { decision: 'approved', scope: 'session' };
       },
       requestQuestion: async () => null,
+      hasApprovalHandler: () => true,
+      hasQuestionHandler: () => true,
     });
     bridge.handleEvent({
       type: 'event.approval.requested',
@@ -137,6 +139,8 @@ describe('InteractionBridge', () => {
         selectedLabel: 'No, and explain',
       }),
       requestQuestion: async () => null,
+      hasApprovalHandler: () => true,
+      hasQuestionHandler: () => true,
     });
     bridge.handleEvent({ type: 'event.approval.requested', ...APPROVAL_WIRE });
     await flush();
@@ -158,6 +162,8 @@ describe('InteractionBridge', () => {
         handled.push(req);
         return { 'Pick one': 'Yes', 'Pick many': 'A, B' };
       },
+      hasApprovalHandler: () => true,
+      hasQuestionHandler: () => true,
     });
     bridge.handleEvent({ type: 'event.question.requested', ...QUESTION_WIRE, sessionId: 's1' });
     await flush();
@@ -223,6 +229,8 @@ describe('InteractionBridge', () => {
         answers: { 'Pick one': 'something else' },
         method: 'enter',
       }),
+      hasApprovalHandler: () => true,
+      hasQuestionHandler: () => true,
     });
     bridge.handleEvent({ type: 'event.question.requested', ...QUESTION_WIRE });
     await flush();
@@ -247,6 +255,8 @@ describe('InteractionBridge', () => {
       http,
       requestApproval: async () => ({ decision: 'cancelled' }),
       requestQuestion: async () => null,
+      hasApprovalHandler: () => true,
+      hasQuestionHandler: () => true,
     });
     bridge.handleEvent({ type: 'event.question.requested', ...QUESTION_WIRE });
     await flush();
@@ -261,6 +271,8 @@ describe('InteractionBridge', () => {
         throw new Error('handler exploded');
       },
       requestQuestion: async () => null,
+      hasApprovalHandler: () => true,
+      hasQuestionHandler: () => true,
     });
     expect(() =>
       bridge.handleEvent({ type: 'event.approval.requested', ...APPROVAL_WIRE }),
@@ -282,6 +294,8 @@ describe('InteractionBridge', () => {
       requestQuestion: async () => {
         throw new Error('handler exploded');
       },
+      hasApprovalHandler: () => true,
+      hasQuestionHandler: () => true,
     });
     bridge.handleEvent({ type: 'event.question.requested', ...QUESTION_WIRE });
     await flush();
@@ -295,6 +309,8 @@ describe('InteractionBridge', () => {
       http,
       requestApproval: async () => ({ decision: 'approved' }),
       requestQuestion: async () => null,
+      hasApprovalHandler: () => true,
+      hasQuestionHandler: () => true,
       logger: (level, msg) => warnings.push([level, msg]),
     });
     expect(() =>
@@ -320,6 +336,8 @@ describe('InteractionBridge', () => {
         questionHandled.push(req);
         return null;
       },
+      hasApprovalHandler: () => true,
+      hasQuestionHandler: () => true,
     });
     const snapshot = {
       pending_approvals: [APPROVAL_WIRE],
@@ -334,6 +352,148 @@ describe('InteractionBridge', () => {
     expect(approvalHandled.length).toBe(1);
     expect(questionHandled.length).toBe(1);
     expect(http.calls.map((c) => c.method)).toEqual(['resolveApproval', 'dismissQuestion']);
+  });
+
+  it('queues replayed pending items when no handler is registered yet', async () => {
+    const http = createStubHttp();
+    const approvalHandled: unknown[] = [];
+    const questionHandled: unknown[] = [];
+    const bridge = new InteractionBridge({
+      http,
+      requestApproval: async (req) => {
+        approvalHandled.push(req);
+        return { decision: 'approved' };
+      },
+      requestQuestion: async (req) => {
+        questionHandled.push(req);
+        return null;
+      },
+      hasApprovalHandler: () => false,
+      hasQuestionHandler: () => false,
+    });
+    bridge.replayPending('s1', {
+      pending_approvals: [APPROVAL_WIRE],
+      pending_questions: [QUESTION_WIRE],
+    });
+    await flush();
+    // No handler ⇒ no handler call and, critically, no resolve/dismiss POST:
+    // the interactions stay pending on the server.
+    expect(approvalHandled).toEqual([]);
+    expect(questionHandled).toEqual([]);
+    expect(http.calls).toEqual([]);
+  });
+
+  it('queues a live interaction event that arrives before handler registration', async () => {
+    const http = createStubHttp();
+    const approvalHandled: unknown[] = [];
+    let registered = false;
+    const bridge = new InteractionBridge({
+      http,
+      requestApproval: async (req) => {
+        approvalHandled.push(req);
+        return { decision: 'approved' };
+      },
+      requestQuestion: async () => null,
+      hasApprovalHandler: () => registered,
+      hasQuestionHandler: () => true,
+    });
+    bridge.handleEvent({ type: 'event.approval.requested', ...APPROVAL_WIRE });
+    await flush();
+    expect(approvalHandled).toEqual([]);
+    expect(http.calls).toEqual([]);
+    registered = true;
+    bridge.flush('s1', 'approval');
+    await flush();
+    expect(approvalHandled.length).toBe(1);
+    expect(http.calls.map((c) => c.method)).toEqual(['resolveApproval']);
+  });
+
+  it('flush fires each queued pending id exactly once with the mapped request', async () => {
+    const http = createStubHttp();
+    const approvalHandled: unknown[] = [];
+    let registered = false;
+    const bridge = new InteractionBridge({
+      http,
+      requestApproval: async (req) => {
+        approvalHandled.push(req);
+        return { decision: 'approved' };
+      },
+      requestQuestion: async () => null,
+      hasApprovalHandler: () => registered,
+      hasQuestionHandler: () => true,
+    });
+    const snapshot = { pending_approvals: [APPROVAL_WIRE], pending_questions: [] };
+    bridge.replayPending('s1', snapshot);
+    // A duplicate replay within the same attach stays deduped in the queue.
+    bridge.replayPending('s1', snapshot);
+    registered = true;
+    bridge.flush('s1', 'approval');
+    // A second flush is a no-op — the queue drained with the first.
+    bridge.flush('s1', 'approval');
+    await flush();
+    expect(approvalHandled).toEqual([
+      {
+        turnId: 3,
+        toolCallId: 'tc1',
+        toolName: 'Bash',
+        action: 'run command',
+        display: { command: 'ls' },
+        sessionId: 's1',
+        agentId: 'main',
+      },
+    ]);
+    expect(http.calls).toEqual([
+      { method: 'resolveApproval', args: ['s1', 'a1', { decision: 'approved' }] },
+    ]);
+  });
+
+  it('forgetSession clears dedupe so a reattach re-presents a still-pending item', async () => {
+    const http = createStubHttp();
+    const approvalHandled: unknown[] = [];
+    const bridge = new InteractionBridge({
+      http,
+      requestApproval: async (req) => {
+        approvalHandled.push(req);
+        return { decision: 'approved' };
+      },
+      requestQuestion: async () => null,
+      hasApprovalHandler: () => true,
+      hasQuestionHandler: () => true,
+    });
+    // The snapshot still lists the item because it stayed pending on the
+    // server (the consumer detached without answering).
+    const snapshot = { pending_approvals: [APPROVAL_WIRE], pending_questions: [] };
+    bridge.replayPending('s1', snapshot);
+    await flush();
+    expect(approvalHandled.length).toBe(1);
+    // Detach → reattach: the replay of the same snapshot must fire again.
+    bridge.forgetSession('s1');
+    bridge.replayPending('s1', snapshot);
+    await flush();
+    expect(approvalHandled.length).toBe(2);
+    expect(http.calls.map((c) => c.method)).toEqual(['resolveApproval', 'resolveApproval']);
+  });
+
+  it('forgetSession also drops queued entries that never fired', async () => {
+    const http = createStubHttp();
+    const approvalHandled: unknown[] = [];
+    const bridge = new InteractionBridge({
+      http,
+      requestApproval: async (req) => {
+        approvalHandled.push(req);
+        return { decision: 'approved' };
+      },
+      requestQuestion: async () => null,
+      hasApprovalHandler: () => false,
+      hasQuestionHandler: () => true,
+    });
+    bridge.replayPending('s1', { pending_approvals: [APPROVAL_WIRE], pending_questions: [] });
+    bridge.forgetSession('s1');
+    // The next attach's flush has nothing left from the previous attach.
+    bridge.flush('s1', 'approval');
+    await flush();
+    expect(approvalHandled).toEqual([]);
+    expect(http.calls).toEqual([]);
   });
 });
 

@@ -12,9 +12,19 @@
  * throwing/null question handler dismisses, and POST failures are logged —
  * nothing ever throws into the event stream.
  *
- * Dedupe: every interaction id is fed to its handler at most once for the
- * lifetime of the bridge — the same pending item can arrive both via
- * snapshot replay and a live event (and again after a resync).
+ * Queue: an interaction arriving while no handler is registered for its
+ * session (the normal case at attach time — consumers register handlers
+ * after `resumeSession` returns) is queued instead of resolved, so the
+ * base-class no-handler auto-cancel never fires for a genuinely pending
+ * wire interaction. `flush` fires the queued entries once the consumer
+ * registers that kind's handler; a session whose consumer never registers
+ * leaves its interactions pending on the server.
+ *
+ * Dedupe: every interaction id is fed to its handler at most once per
+ * attach — the same pending item can arrive both via snapshot replay and a
+ * live event (and again after a resync). `forgetSession` (local detach)
+ * clears the dedupe and queued state so a reattach re-presents interactions
+ * that are still pending on the server.
  */
 import type {
   ApprovalRequest,
@@ -53,8 +63,18 @@ export interface InteractionBridgeOptions {
   readonly http: Pick<WireHttpClient, 'resolveApproval' | 'answerQuestion' | 'dismissQuestion'>;
   readonly requestApproval: (request: BridgedApprovalRequest) => MaybePromise<ApprovalResponse>;
   readonly requestQuestion: (request: BridgedQuestionRequest) => MaybePromise<QuestionResult>;
+  /** Whether an approval handler is currently registered for the session. */
+  readonly hasApprovalHandler: (sessionId: string) => boolean;
+  /** Whether a question handler is currently registered for the session. */
+  readonly hasQuestionHandler: (sessionId: string) => boolean;
   readonly logger?: WsLogger;
 }
+
+export type InteractionKind = 'approval' | 'question';
+
+type QueuedInteraction =
+  | { readonly kind: 'approval'; readonly request: WireApprovalRequest; readonly agentId: string }
+  | { readonly kind: 'question'; readonly request: WireQuestionRequest; readonly agentId: string };
 
 const noopLogger: WsLogger = () => {};
 
@@ -62,14 +82,20 @@ export class InteractionBridge {
   private readonly http: InteractionBridgeOptions['http'];
   private readonly requestApproval: InteractionBridgeOptions['requestApproval'];
   private readonly requestQuestion: InteractionBridgeOptions['requestQuestion'];
+  private readonly hasApprovalHandler: InteractionBridgeOptions['hasApprovalHandler'];
+  private readonly hasQuestionHandler: InteractionBridgeOptions['hasQuestionHandler'];
   private readonly logger: WsLogger;
-  /** Interaction ids already fed to a handler — `approval:<id>` / `question:<id>`. */
-  private readonly seen = new Set<string>();
+  /** Per-session ids already fed to a handler this attach — `approval:<id>` / `question:<id>`. */
+  private readonly seen = new Map<string, Set<string>>();
+  /** Per-session interactions waiting for a handler to register. */
+  private readonly queued = new Map<string, QueuedInteraction[]>();
 
   constructor(options: InteractionBridgeOptions) {
     this.http = options.http;
     this.requestApproval = options.requestApproval;
     this.requestQuestion = options.requestQuestion;
+    this.hasApprovalHandler = options.hasApprovalHandler;
+    this.hasQuestionHandler = options.hasQuestionHandler;
     this.logger = options.logger ?? noopLogger;
   }
 
@@ -117,8 +143,73 @@ export class InteractionBridge {
     }
   }
 
+  /**
+   * Fire every queued interaction of `kind` for the session — called when the
+   * consumer registers that kind's handler. Entries of the other kind stay
+   * queued until their own handler registers.
+   */
+  flush(sessionId: string, kind: InteractionKind): void {
+    const entries = this.queued.get(sessionId);
+    if (entries === undefined) return;
+    const remaining = entries.filter((entry) => entry.kind !== kind);
+    if (remaining.length === 0) this.queued.delete(sessionId);
+    else this.queued.set(sessionId, remaining);
+    for (const entry of entries) {
+      if (entry.kind === 'approval' && kind === 'approval') {
+        this.fireApproval(entry.request, entry.agentId);
+      } else if (entry.kind === 'question' && kind === 'question') {
+        this.fireQuestion(entry.request, entry.agentId);
+      }
+    }
+  }
+
+  /**
+   * Drop the session's dedupe and queued state (local detach) so a later
+   * reattach re-presents interactions that are still pending on the server.
+   */
+  forgetSession(sessionId: string): void {
+    this.seen.delete(sessionId);
+    this.queued.delete(sessionId);
+  }
+
   private dispatchApproval(request: WireApprovalRequest, agentId: string): void {
-    if (!this.markSeen(`approval:${request.approval_id}`)) return;
+    if (!this.markSeen(request.session_id, `approval:${request.approval_id}`)) return;
+    if (!this.hasApprovalHandler(request.session_id)) {
+      this.enqueue({ kind: 'approval', request, agentId });
+      return;
+    }
+    this.fireApproval(request, agentId);
+  }
+
+  private dispatchQuestion(request: WireQuestionRequest, agentId: string): void {
+    if (!this.markSeen(request.session_id, `question:${request.question_id}`)) return;
+    if (!this.hasQuestionHandler(request.session_id)) {
+      this.enqueue({ kind: 'question', request, agentId });
+      return;
+    }
+    this.fireQuestion(request, agentId);
+  }
+
+  private enqueue(entry: QueuedInteraction): void {
+    const sessionId = entry.request.session_id;
+    const entries = this.queued.get(sessionId);
+    if (entries === undefined) this.queued.set(sessionId, [entry]);
+    else entries.push(entry);
+  }
+
+  /** Returns false when the id was already fed to a handler this attach. */
+  private markSeen(sessionId: string, key: string): boolean {
+    const keys = this.seen.get(sessionId);
+    if (keys !== undefined) {
+      if (keys.has(key)) return false;
+      keys.add(key);
+      return true;
+    }
+    this.seen.set(sessionId, new Set([key]));
+    return true;
+  }
+
+  private fireApproval(request: WireApprovalRequest, agentId: string): void {
     void this.resolveApproval(request, agentId).catch((err) => {
       this.logger('warn', 'interaction-bridge: approval resolve failed', {
         err: String(err),
@@ -128,8 +219,7 @@ export class InteractionBridge {
     });
   }
 
-  private dispatchQuestion(request: WireQuestionRequest, agentId: string): void {
-    if (!this.markSeen(`question:${request.question_id}`)) return;
+  private fireQuestion(request: WireQuestionRequest, agentId: string): void {
     void this.resolveQuestion(request, agentId).catch((err) => {
       this.logger('warn', 'interaction-bridge: question resolve failed', {
         err: String(err),
@@ -137,13 +227,6 @@ export class InteractionBridge {
         questionId: request.question_id,
       });
     });
-  }
-
-  /** Returns false when the id was already fed to a handler. */
-  private markSeen(key: string): boolean {
-    if (this.seen.has(key)) return false;
-    this.seen.add(key);
-    return true;
   }
 
   private async resolveApproval(request: WireApprovalRequest, agentId: string): Promise<void> {
