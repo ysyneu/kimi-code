@@ -11,7 +11,7 @@ import {
   closeSessionById,
   getLiveSessionById,
 } from '@moonshot-ai/agent-core-v2';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { type RunningServer, startServer } from '../src/start';
 import { TEST_HOST_IDENTITY } from './helpers/hostIdentity';
@@ -611,6 +611,22 @@ describe('server-v2 /api/v1 prompts', () => {
     });
     const promptId = submitted.body.data.prompt_id;
 
+    // With the default-profile bind the turn genuinely starts against the stub
+    // provider instead of dying instantly — cancel it and wait for the settle
+    // so the abort below targets an already-settled prompt.
+    const cancelled = await call<{ aborted: boolean }>(
+      'POST',
+      `/api/v1/sessions/${id}/prompts/${promptId}:abort`,
+    );
+    expect(cancelled.body.code).toBe(0);
+    await vi.waitFor(async () => {
+      const list = await call<{ active: PromptItemWire | null; queued: PromptItemWire[] }>(
+        'GET',
+        `/api/v1/sessions/${id}/prompts`,
+      );
+      expect(list.body.data.active).toBeNull();
+    });
+
     const aborted = await call<{ aborted: boolean }>(
       'POST',
       `/api/v1/sessions/${id}/prompts/${promptId}:abort`,
@@ -717,6 +733,28 @@ describe('server-v2 /api/v1 prompts', () => {
     });
     expect(body.code).toBe(40001);
     expect(body.msg).toContain('agent_does_not_exist');
+  });
+
+  it('binds the default profile for a model-less prompt on a REST-created session', async () => {
+    // REST session creation reads only `metadata.cwd`/`title`, so the main
+    // agent is created unbound; without a `profile`/`model` override the
+    // prompt route must bind the default profile (falling back to the
+    // configured default_model) instead of letting the turn die with
+    // `model.not_configured`. No createMainAgent here — the route's
+    // ensureMainAgent path is the one the bug hit.
+    const id = await createSession(home as string);
+
+    const submitted = await call<PromptItemWire>('POST', `/api/v1/sessions/${id}/prompts`, {
+      content: [{ type: 'text', text: 'hello' }],
+    });
+    expect(submitted.body.code).toBe(0);
+
+    const session = getLiveSessionById(server!.core.accessor, id);
+    if (session === undefined) throw new Error(`session ${id} not found`);
+    const profile = session.accessor.get(IAgentLifecycleService).get('main')?.accessor
+      .get(IAgentProfileService);
+    expect(profile?.data().profileName).toBe('agent');
+    expect(profile?.data().modelAlias).toBe('stub');
   });
 
   it('binds a discovered custom agent profile on the first prompt', async () => {
