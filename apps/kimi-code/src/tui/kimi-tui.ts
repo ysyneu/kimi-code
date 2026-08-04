@@ -186,6 +186,10 @@ export interface KimiTUIStartupInput {
   readonly migrationPlan?: MigrationPlan | null;
   /** When true, run only the migration screen, then exit (the `kimi migrate` command). */
   readonly migrateOnly?: boolean;
+  /** When true, skip the startup session and boot into the agents view (the `kimi agents` command). */
+  readonly startupAgentsView?: boolean;
+  /** Agents-view header label for the connected kap-server ("embedded" or host:port). */
+  readonly agentsViewServerLabel?: string;
 }
 
 type EffectiveActivityPaneMode = ActivityPaneMode | 'idle' | 'session';
@@ -324,6 +328,7 @@ export class KimiTUI {
   private isShuttingDown = false;
   private readonly migrationPlan: MigrationPlan | null;
   private readonly migrateOnly: boolean;
+  private readonly agentsViewServerLabelOverride: string | undefined;
   private startupNotice: string | undefined;
   private lastActivityMode: string | undefined;
   private currentLoadingTip: { kind: LoadingTipKind; tip: string | undefined } | undefined =
@@ -393,11 +398,13 @@ export class KimiTUI {
         agentProfile: startupInput.agentProfile,
         agentFiles: startupInput.cliOptions.agentFiles,
         startupNotice: startupInput.startupNotice,
+        agentsView: startupInput.startupAgentsView,
       },
     };
     this.options = tuiOptions;
     this.migrationPlan = startupInput.migrationPlan ?? null;
     this.migrateOnly = startupInput.migrateOnly ?? false;
+    this.agentsViewServerLabelOverride = startupInput.agentsViewServerLabel;
     this.startupNotice = startupInput.startupNotice;
     this.state = createTUIState(tuiOptions);
     this.uninstallRainbowDance = installRainbowDance(() => {
@@ -694,6 +701,10 @@ export class KimiTUI {
       this.startupNotice = undefined;
     }
     void this.showTmuxKeyboardWarningIfNeeded();
+    if (this.state.startupState === 'agents-view') {
+      void this.agentsViewController.show();
+      return;
+    }
     if (this.state.startupState === 'picker') {
       void this.bootstrapFromPicker();
       return;
@@ -738,11 +749,14 @@ export class KimiTUI {
   }
 
   private async init(): Promise<boolean> {
-    setExperimentalFeatures(await this.harness.getExperimentalFeatures());
-    await this.authFlow.refreshAvailableModels();
-    void this.refreshProviderModelsInBackground();
-
     const { startup } = this.options;
+    if (startup.agentsView !== true) {
+      // Session-chat bootstrap the agents view has no surface for (and the
+      // wire transport cannot serve): experimental flags + model catalog.
+      setExperimentalFeatures(await this.harness.getExperimentalFeatures());
+      await this.authFlow.refreshAvailableModels();
+      void this.refreshProviderModelsInBackground();
+    }
     const { workDir } = this.state.appState;
     let session: Session | undefined;
     let shouldReplayHistory = false;
@@ -762,6 +776,13 @@ export class KimiTUI {
     }
 
     try {
+      if (startup.agentsView === true) {
+        // `kimi agents`: the agents view IS the home screen — no startup
+        // session. finishStartup mounts it (same early-return shape as the
+        // picker path below).
+        this.state.startupState = 'agents-view';
+        return false;
+      }
       if (isResumeStartup) {
         if (startup.sessionFlag === '') {
           this.state.startupState = 'picker';
@@ -1472,11 +1493,16 @@ export class KimiTUI {
 
   setAgentsView(value: TUIState['agentsView']): void {
     this.state.agentsView = value;
+    // `kimi agents` startup: the view is the home screen with no session
+    // behind it — closing it exits the app.
+    if (value === undefined && this.state.startupState === 'agents-view' && !this.isShuttingDown) {
+      void this.stop();
+    }
   }
 
-  /** Agents-view header label: the in-process engine counts as embedded. */
+  /** Agents-view header label: attached servers show their host, the in-process engine counts as embedded. */
   agentsViewServerLabel(): string {
-    return 'embedded';
+    return this.agentsViewServerLabelOverride ?? 'embedded';
   }
 
   /** Dispatch cwd for sessions created from the agents view. */

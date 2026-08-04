@@ -60,6 +60,8 @@ interface FakeUI {
   addChild(child: unknown): void;
   setFocus: ReturnType<typeof vi.fn>;
   requestRender: ReturnType<typeof vi.fn>;
+  render(): string[];
+  terminal: { rows: number; columns: number };
 }
 
 function summary(id: string, overrides: Partial<SessionSummary> = {}): SessionSummary {
@@ -184,6 +186,8 @@ async function boot(
     },
     setFocus: vi.fn(),
     requestRender: vi.fn(),
+    render: () => [],
+    terminal: { rows: 30, columns: 120 },
   };
   const state = {
     agentsView: undefined as AgentsViewState | undefined,
@@ -875,5 +879,61 @@ describe('AgentsViewController — workspace trust', () => {
     await flush();
     expect(b.view().roster.get('s1')?.trusted).toBeUndefined();
     expect(b.render()).not.toContain('untrusted');
+  });
+});
+
+// ── Task 6: dispatch editor visual mount (focus split + key routing) ──
+
+describe('AgentsViewController — dispatch editor mount', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    dir = undefined;
+  });
+
+  it('show mounts the dispatch editor into the bottom area, list-focused', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    expect(b.view().dispatchFocused).toBe(false);
+    // The mounted CustomEditor renders its bordered box with the `>` prompt.
+    const out = b.render();
+    expect(out).toContain('─'.repeat(20));
+    expect(out).toContain('>');
+  });
+
+  it('typing a printable char focuses the dispatch editor and feeds it the text', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput('d');
+    expect(b.view().dispatchFocused).toBe(true);
+    expect(b.view().dispatch.editor.focused).toBe(true);
+    expect(b.view().dispatch.editor.getText()).toBe('d');
+    b.component().handleInput('o');
+    expect(b.view().dispatch.editor.getText()).toBe('do');
+  });
+
+  it('Esc returns focus to the list; a second Esc closes the view', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput('d');
+    expect(b.view().dispatchFocused).toBe(true);
+    b.component().handleInput(ESC);
+    expect(b.view().dispatchFocused).toBe(false);
+    expect(b.view().dispatch.editor.focused).toBe(false);
+    expect(b.controller.isOpen).toBe(true);
+    b.component().handleInput(ESC);
+    expect(b.controller.isOpen).toBe(false);
+  });
+
+  it('Enter in the focused dispatch editor submits the dispatch and unfocuses', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    for (const ch of 'do stuff') b.component().handleInput(ch);
+    expect(b.view().dispatchFocused).toBe(true);
+    b.component().handleInput(ENTER);
+    await flush();
+    expect(b.fake.createSession).toHaveBeenCalledWith({ workDir: '/home/user/project' });
+    expect(b.fake.createdSession.prompt).toHaveBeenCalledWith('do stuff');
+    expect(b.view().dispatchFocused).toBe(false);
   });
 });

@@ -651,6 +651,64 @@ describe('KimiTUI startup', () => {
     expect(driver.state.startupState).toBe('picker');
   });
 
+  it('enters agents-view startup without creating a session and mounts the view in finishStartup', async () => {
+    const harness = makeHarness();
+    const driver = makeDriver(harness, { ...makeStartupInput(), startupAgentsView: true });
+    const tui = driver as unknown as {
+      agentsViewController: { show(): Promise<void> };
+      finishStartup(shouldReplayHistory: boolean): Promise<void>;
+    };
+    const show = vi.spyOn(tui.agentsViewController, 'show').mockImplementation(async () => {});
+
+    await expect(driver.init()).resolves.toBe(false);
+
+    expect(harness.createSession).not.toHaveBeenCalled();
+    expect(harness.resumeSession).not.toHaveBeenCalled();
+    expect(driver.state.startupState).toBe('agents-view');
+
+    await tui.finishStartup(false);
+    expect(show).toHaveBeenCalledOnce();
+  });
+
+  it('closing the agents view during agents-view startup stops the TUI', async () => {
+    const harness = makeHarness();
+    const driver = makeDriver(harness, { ...makeStartupInput(), startupAgentsView: true });
+    await driver.init();
+    const stop = vi.spyOn(driver, 'stop').mockImplementation(async () => {});
+
+    (driver as unknown as { setAgentsView(value: unknown): void }).setAgentsView(undefined);
+
+    expect(stop).toHaveBeenCalledOnce();
+  });
+
+  it('closing the agents view in a normal session does not stop the TUI', async () => {
+    const harness = makeHarness();
+    const driver = makeDriver(harness, makeStartupInput());
+    await driver.init();
+    const stop = vi.spyOn(driver, 'stop').mockImplementation(async () => {});
+
+    (driver as unknown as { setAgentsView(value: unknown): void }).setAgentsView(undefined);
+
+    expect(stop).not.toHaveBeenCalled();
+  });
+
+  it('agentsViewServerLabel defaults to embedded and honors the startup override', () => {
+    const harness = makeHarness();
+    const embedded = makeDriver(harness, makeStartupInput());
+    expect(
+      (embedded as unknown as { agentsViewServerLabel(): string }).agentsViewServerLabel(),
+    ).toBe('embedded');
+
+    const attached = makeDriver(harness, {
+      ...makeStartupInput(),
+      startupAgentsView: true,
+      agentsViewServerLabel: '127.0.0.1:58627',
+    });
+    expect(
+      (attached as unknown as { agentsViewServerLabel(): string }).agentsViewServerLabel(),
+    ).toBe('127.0.0.1:58627');
+  });
+
   it('applies --auto after picking a session from bare --session', async () => {
     let permission = 'manual';
     const session = makeSession({

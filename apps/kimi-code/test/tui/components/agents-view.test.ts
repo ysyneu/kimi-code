@@ -1,8 +1,9 @@
-import type { Terminal } from '@moonshot-ai/pi-tui';
+import type { Terminal, TUI } from '@moonshot-ai/pi-tui';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { AgentsGroup, AgentsGroupId, AgentsRosterRow } from '@/tui/agents/roster';
 import { AgentsViewApp, type AgentsViewProps } from '@/tui/components/agents-view/app';
+import { CustomEditor } from '@/tui/components/editor/custom-editor';
 
 const ANSI_SGR = /\[[0-9;]*m/g;
 function strip(text: string): string {
@@ -60,6 +61,17 @@ function group(id: AgentsGroupId, rows: readonly AgentsRosterRow[]): AgentsGroup
   return { id, label: GROUP_LABELS[id], rows };
 }
 
+/** A real dispatch editor over a minimal fake TUI (same stub shape as the
+ *  controller test's FakeUI). */
+function makeDispatchEditor(): CustomEditor {
+  const tui = {
+    requestRender: () => {},
+    render: () => [],
+    terminal: { rows: 40, columns: 120 },
+  } as unknown as TUI;
+  return new CustomEditor(tui);
+}
+
 function makeProps(overrides: Partial<AgentsViewProps> = {}): AgentsViewProps {
   return {
     groups: [],
@@ -71,6 +83,7 @@ function makeProps(overrides: Partial<AgentsViewProps> = {}): AgentsViewProps {
     renameDraft: undefined,
     flashMessage: undefined,
     dispatchFocused: false,
+    dispatchEditor: makeDispatchEditor(),
     onSelect: vi.fn(),
     onOpen: vi.fn(),
     onPeekToggle: vi.fn(),
@@ -81,6 +94,7 @@ function makeProps(overrides: Partial<AgentsViewProps> = {}): AgentsViewProps {
     onPinToggle: vi.fn(),
     onHelpToggle: vi.fn(),
     onQuit: vi.fn(),
+    onDispatchFocusChange: vi.fn(),
     ...overrides,
   };
 }
@@ -164,9 +178,11 @@ describe('AgentsViewApp — full-screen rendering', () => {
     expect(out).toContain('No sessions');
   });
 
-  it('renders a dispatch placeholder line above the footer', () => {
+  it('renders the dispatch editor box above the footer', () => {
     const out = render(makeApp());
-    expect(out).toContain('describe a task');
+    // The mounted CustomEditor renders a bordered box with its `>` prompt.
+    expect(out).toContain('─'.repeat(20));
+    expect(out).toContain('>');
   });
 
   it('collapses completed rows behind a "… N more" row', () => {
@@ -256,7 +272,7 @@ describe('AgentsViewApp — navigation', () => {
     expect(onSelect).toHaveBeenLastCalledWith('group:working');
   });
 
-  it('j/k always navigate (dispatch editor lands in Task 4)', () => {
+  it('j/k navigate while the dispatch editor is empty', () => {
     const onSelect = vi.fn();
     const app = makeApp({ groups, selectedId: 'a', onSelect });
     app.handleInput('j');
@@ -487,5 +503,70 @@ describe('AgentsViewApp — pin / help / quit', () => {
     const onQuit = vi.fn();
     makeApp({ onQuit }).handleInput('[113u');
     expect(onQuit).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('AgentsViewApp — dispatch editor mount', () => {
+  it('a printable char on an empty editor routes to the editor and requests focus', () => {
+    const editor = makeDispatchEditor();
+    const onDispatchFocusChange = vi.fn();
+    const app = makeApp({ dispatchEditor: editor, onDispatchFocusChange });
+    app.handleInput('d');
+    expect(editor.getText()).toBe('d');
+    expect(onDispatchFocusChange).toHaveBeenCalledWith(true);
+  });
+
+  it('j/k/space/q route to the editor once it holds text (no navigation/peek/quit)', () => {
+    const editor = makeDispatchEditor();
+    editor.setText('fix');
+    const onSelect = vi.fn();
+    const onPeekToggle = vi.fn();
+    const onQuit = vi.fn();
+    const onDispatchFocusChange = vi.fn();
+    const app = makeApp({
+      groups: [group('working', [row('a', { busy: true }), row('b', { busy: true })])],
+      selectedId: 'a',
+      dispatchEditor: editor,
+      onSelect,
+      onPeekToggle,
+      onQuit,
+      onDispatchFocusChange,
+    });
+    app.handleInput('j');
+    app.handleInput('k');
+    expect(onSelect).not.toHaveBeenCalled();
+    expect(editor.getText()).toBe('fixjk');
+    app.handleInput(' ');
+    expect(onPeekToggle).not.toHaveBeenCalled();
+    expect(editor.getText()).toBe('fixjk ');
+    app.handleInput('q');
+    expect(onQuit).not.toHaveBeenCalled();
+    expect(onDispatchFocusChange).toHaveBeenCalledWith(true);
+  });
+
+  it('a focused dispatch editor receives every key; Esc reaches the editor onEscape, never onQuit', () => {
+    const editor = makeDispatchEditor();
+    editor.setText('do stuff');
+    const onEscape = vi.fn();
+    editor.onEscape = onEscape;
+    const onQuit = vi.fn();
+    const onDispatchFocusChange = vi.fn();
+    const app = makeApp({
+      dispatchEditor: editor,
+      dispatchFocused: true,
+      onQuit,
+      onDispatchFocusChange,
+    });
+    app.handleInput('x');
+    expect(editor.getText()).toBe('do stuffx');
+    app.handleInput('\u001B');
+    expect(onEscape).toHaveBeenCalledTimes(1);
+    expect(onQuit).not.toHaveBeenCalled();
+  });
+
+  it('the footer shows dispatch hints while the editor is focused', () => {
+    const out = render(makeApp({ dispatchFocused: true }));
+    expect(out).toContain('dispatch');
+    expect(out).toContain('back to list');
   });
 });

@@ -77,7 +77,11 @@ export class AgentsViewDispatch {
     ui: TUI,
     private readonly workDir: string,
   ) {
-    this.editor = new CustomEditor(ui);
+    // disablePasteBurst: the burst guard turns Enter-after-rapid-input into a
+    // newline — right for the main editor's chat box, wrong here: the
+    // dispatch box is a single-task line and scripted input must still
+    // submit.
+    this.editor = new CustomEditor(ui, { disablePasteBurst: true });
     this.editor.onSubmit = (raw) => {
       this.handleEditorSubmit(raw);
     };

@@ -43,6 +43,8 @@ export interface AgentsViewState {
   /** The same Set the roster mutates in place; persisted after every setPinned. */
   pins: Set<string>;
   dispatch: AgentsViewDispatch;
+  /** Focus split between the roster list and the dispatch editor. */
+  dispatchFocused: boolean;
   selectedId: string | undefined;
   peek: AgentsViewPeek | undefined;
   /** Stale-response guard for async peek loads. */
@@ -161,9 +163,16 @@ export class AgentsViewController {
     const roster = new AgentsRoster(pins);
     roster.setAll(summaries);
 
+    // The dispatch editor is built before the component: it renders into the
+    // component's bottom box, so the initial props already reference it.
+    const dispatch = new AgentsViewDispatch(state.ui, this.host.agentsViewWorkDir());
+    dispatch.installAutocomplete(dispatchSlashCommands());
+
     const component = new AgentsViewApp(
       this.buildProps({
         roster,
+        dispatch,
+        dispatchFocused: false,
         selectedId: undefined,
         peek: undefined,
         confirmDeleteId: undefined,
@@ -181,13 +190,18 @@ export class AgentsViewController {
     state.ui.setFocus(component);
     state.ui.requestRender(true);
 
-    const dispatch = new AgentsViewDispatch(state.ui, this.host.agentsViewWorkDir());
-    dispatch.installAutocomplete(dispatchSlashCommands());
     dispatch.onSubmit = (submission) => {
+      this.unfocusDispatch();
       void this.handleDispatch(submission);
     };
     dispatch.onError = (message) => {
+      this.unfocusDispatch();
       this.flash(message);
+    };
+    // Esc inside the focused editor returns focus to the list (the editor's
+    // own autocomplete-cancel wins over this when a dropdown is open).
+    dispatch.editor.onEscape = () => {
+      this.unfocusDispatch();
     };
 
     this.host.setAgentsView({
@@ -196,6 +210,7 @@ export class AgentsViewController {
       roster,
       pins,
       dispatch,
+      dispatchFocused: false,
       selectedId: undefined,
       peek: undefined,
       peekRequestId: 0,
@@ -328,6 +343,8 @@ export class AgentsViewController {
 
   private buildProps(view: {
     roster: AgentsRoster;
+    dispatch: AgentsViewDispatch;
+    dispatchFocused: boolean;
     selectedId: string | undefined;
     peek: AgentsViewPeek | undefined;
     confirmDeleteId: string | undefined;
@@ -351,13 +368,19 @@ export class AgentsViewController {
       confirmDeleteId: view.confirmDeleteId,
       renameDraft: view.renameDraft,
       flashMessage: view.flashMessage,
-      // The dispatch editor (view.dispatch) is fully wired for submission but
-      // not yet mounted into the component's layout — the visual mount
-      // (key routing + editor render into the reserved dispatch line) lands
-      // with the interactive boot in Task 6. Until then nothing can focus it.
-      dispatchFocused: false,
+      dispatchFocused: view.dispatchFocused,
+      dispatchEditor: view.dispatch.editor,
       ...this.buildCallbacks(),
     };
+  }
+
+  /** Returns focus from the dispatch editor to the roster list. */
+  private unfocusDispatch(): void {
+    const view = this.host.state.agentsView;
+    if (view === undefined || !view.dispatchFocused) return;
+    view.dispatchFocused = false;
+    view.dispatch.editor.focused = false;
+    this.pushProps();
   }
 
   private pushProps(): void {
@@ -386,6 +409,7 @@ export class AgentsViewController {
     | 'onPinToggle'
     | 'onHelpToggle'
     | 'onQuit'
+    | 'onDispatchFocusChange'
   > {
     return {
       onSelect: (id) => {
@@ -481,6 +505,13 @@ export class AgentsViewController {
           return;
         }
         this.close();
+      },
+      onDispatchFocusChange: (focused) => {
+        const view = this.host.state.agentsView;
+        if (view === undefined || view.dispatchFocused === focused) return;
+        view.dispatchFocused = focused;
+        view.dispatch.editor.focused = focused;
+        this.pushProps();
       },
     };
   }

@@ -18,11 +18,15 @@
  * - Rename cancel: Esc during rename submits the ORIGINAL title via
  *   `onRenameSubmit`; the controller treats an unchanged title as a cancel
  *   (clears `renameDraft`, skips the SDK call).
- * - j/k always navigate for now; once the Task-4 dispatch editor exists,
- *   printable chars flow to the editor when it is focused / non-empty.
+ * - Dispatch editor: the mounted `dispatchEditor` renders into the bottom
+ *   box. While `dispatchFocused`, every key routes to the editor — Esc is
+ *   the editor's own `onEscape` (the controller wires it to unfocus).
+ *   List-focused, a printable char focuses the editor and feeds it the
+ *   text; the printable shortcuts (j/k/q/Space/?) only act while the
+ *   editor is EMPTY, once it holds text every printable char belongs to it.
  * - The peek reply box renders `peek.replyDraft` read-only; reply editing /
- *   steer submission is owned by the dispatch editor (Task 4), so `q` while
- *   a peek is open is swallowed here rather than quitting.
+ *   steer submission is owned by the dispatch editor, so `q` while a peek
+ *   is open is swallowed here rather than quitting.
  */
 
 import {
@@ -35,6 +39,7 @@ import {
 } from '@moonshot-ai/pi-tui';
 
 import type { AgentsGroup, AgentsGroupId, AgentsRosterRow } from '@/tui/agents/roster';
+import type { CustomEditor } from '@/tui/components/editor/custom-editor';
 import { currentTheme } from '#/tui/theme';
 import { printableChar, isPrintableChar } from '@/tui/utils/printable-key';
 
@@ -59,6 +64,8 @@ export interface AgentsViewProps {
   readonly renameDraft: { readonly sessionId: string; readonly text: string } | undefined;
   readonly flashMessage: string | undefined;
   readonly dispatchFocused: boolean;
+  /** The assembled dispatch editor (controller-owned); rendered into the bottom box. */
+  readonly dispatchEditor: CustomEditor;
   onSelect(id: string): void;
   onOpen(id: string): void;
   onPeekToggle(id: string): void;
@@ -69,6 +76,7 @@ export interface AgentsViewProps {
   onPinToggle(id: string): void;
   onHelpToggle(): void;
   onQuit(): void;
+  onDispatchFocusChange(focused: boolean): void;
 }
 
 /** Minimum dimensions before we just print a "too small" message. */
@@ -95,7 +103,8 @@ interface RenameState {
 const HELP_LINES: readonly string[] = [
   'Shortcuts',
   '',
-  '  ↑/↓ or j/k   move selection',
+  '  ↑/↓ or j/k   move selection (j/k type into a non-empty dispatch box)',
+  '  type         focus the dispatch editor · Enter dispatches · Esc back',
   '  Enter        open session · collapse/expand group · expand completed',
   '  Space        peek latest output',
   '  Ctrl+X       delete session (press twice to confirm)',
@@ -207,6 +216,15 @@ export class AgentsViewApp extends Container implements Focusable {
       return;
     }
 
+    // Dispatch editor focused: every key belongs to the editor. Esc is the
+    // editor's own onEscape (the controller wires it to unfocus); Enter is
+    // the editor's own submit.
+    if (this.props.dispatchFocused) {
+      this.props.dispatchEditor.handleInput(data);
+      this.invalidate();
+      return;
+    }
+
     // Help page: only `?` / Esc leave it.
     if (this.helpVisible) {
       if (k === '?' || matchesKey(data, Key.escape)) {
@@ -214,12 +232,6 @@ export class AgentsViewApp extends Container implements Focusable {
         if (k === '?') this.props.onHelpToggle();
         this.invalidate();
       }
-      return;
-    }
-    if (k === '?') {
-      this.helpVisible = true;
-      this.props.onHelpToggle();
-      this.invalidate();
       return;
     }
 
@@ -239,6 +251,22 @@ export class AgentsViewApp extends Container implements Focusable {
       else this.props.onQuit();
       return;
     }
+
+    // Once the dispatch editor holds text, printable chars belong to it —
+    // the printable shortcuts below (j/k/q/Space/?) only act on an empty
+    // editor.
+    if (this.props.dispatchEditor.getText().length > 0 && isPrintableChar(k)) {
+      this.routeToDispatch(data);
+      return;
+    }
+
+    if (k === '?') {
+      this.helpVisible = true;
+      this.props.onHelpToggle();
+      this.invalidate();
+      return;
+    }
+
     if (k === 'q' || k === 'Q') {
       // With a peek open, text input belongs to the reply box (Task 4).
       if (this.props.peek === undefined) this.props.onQuit();
@@ -255,30 +283,41 @@ export class AgentsViewApp extends Container implements Focusable {
     }
 
     const item = this.deriveItems()[this.selectedIndex];
-    if (item === undefined) return;
-
-    if (matchesKey(data, Key.enter)) {
-      // `more:completed` and `group:*` ids are interpreted by the
-      // controller (expand / collapse); a row id is an open request.
-      this.props.onOpen(item.id);
-      return;
-    }
-    if (k === ' ') {
-      if (item.kind === 'row') this.props.onPeekToggle(item.id);
-      return;
-    }
-    if (matchesKey(data, Key.ctrl('r'))) {
-      if (item.kind === 'row' && item.row !== undefined) {
-        this.rename = { id: item.id, original: item.row.title, text: item.row.title };
-        this.props.onRenameBegin(item.id);
-        this.invalidate();
+    if (item !== undefined) {
+      if (matchesKey(data, Key.enter)) {
+        // `more:completed` and `group:*` ids are interpreted by the
+        // controller (expand / collapse); a row id is an open request.
+        this.props.onOpen(item.id);
+        return;
       }
-      return;
+      if (k === ' ') {
+        if (item.kind === 'row') this.props.onPeekToggle(item.id);
+        return;
+      }
+      if (matchesKey(data, Key.ctrl('r'))) {
+        if (item.kind === 'row' && item.row !== undefined) {
+          this.rename = { id: item.id, original: item.row.title, text: item.row.title };
+          this.props.onRenameBegin(item.id);
+          this.invalidate();
+        }
+        return;
+      }
+      if (matchesKey(data, Key.ctrl('t'))) {
+        if (item.kind === 'row') this.props.onPinToggle(item.id);
+        return;
+      }
     }
-    if (matchesKey(data, Key.ctrl('t'))) {
-      if (item.kind === 'row') this.props.onPinToggle(item.id);
-      return;
+
+    // Empty editor, no shortcut matched: start typing a dispatch.
+    if (isPrintableChar(k)) {
+      this.routeToDispatch(data);
     }
+  }
+
+  private routeToDispatch(data: string): void {
+    this.props.dispatchEditor.handleInput(data);
+    this.props.onDispatchFocusChange(true);
+    this.invalidate();
   }
 
   private moveSelection(delta: number): void {
@@ -298,7 +337,12 @@ export class AgentsViewApp extends Container implements Focusable {
     }
 
     const bodyHeight = rows - 2;
-    const listHeight = bodyHeight - 1; // last body line = dispatch box
+    // The dispatch editor box (bordered CustomEditor: ≥3 lines, taller while
+    // the autocomplete dropdown is open) takes the bottom of the body; the
+    // list keeps at least 3 rows.
+    const dispatchLines = this.props.dispatchEditor.render(width);
+    const dispatchHeight = Math.min(dispatchLines.length, Math.max(3, bodyHeight - 3));
+    const listHeight = Math.max(1, bodyHeight - dispatchHeight);
 
     const lines: string[] = [this.renderHeader(width)];
     if (this.helpVisible) {
@@ -310,7 +354,7 @@ export class AgentsViewApp extends Container implements Focusable {
     } else {
       lines.push(...this.renderList(width, listHeight));
     }
-    lines.push(this.renderDispatch(width));
+    lines.push(...dispatchLines.slice(0, dispatchHeight));
     lines.push(this.renderFooter(width));
     return lines;
   }
@@ -410,14 +454,6 @@ export class AgentsViewApp extends Container implements Focusable {
     return lines.slice(0, height);
   }
 
-  private renderDispatch(width: number): string {
-    // Placeholder seam: the Task-4 dispatch editor renders into this line.
-    const line =
-      currentTheme.fg('accent', ' › ') +
-      currentTheme.fg('textMuted', 'describe a task for a new session');
-    return fitExactly(line, width);
-  }
-
   private renderFooter(width: number): string {
     const key = (text: string): string => currentTheme.boldFg('primary', text);
     const dim = (text: string): string => currentTheme.fg('textMuted', text);
@@ -425,6 +461,8 @@ export class AgentsViewApp extends Container implements Focusable {
     let left: string;
     if (this.draftFor(this.props.renameDraft?.sessionId ?? this.rename?.id ?? '') !== undefined) {
       left = ` ${key('Enter')} ${dim('submit rename')}  ${key('Esc')} ${dim('cancel')} `;
+    } else if (this.props.dispatchFocused) {
+      left = ` ${key('Enter')} ${dim('dispatch')}  ${key('Esc')} ${dim('back to list')} `;
     } else if (this.props.confirmDeleteId !== undefined) {
       left = ` ${currentTheme.boldFg('warning', this.deleteConfirmCopy(this.props.confirmDeleteId))} ${key('^X')} ${dim('confirm')}  ${dim('any other key cancels')} `;
     } else if (this.helpVisible) {
