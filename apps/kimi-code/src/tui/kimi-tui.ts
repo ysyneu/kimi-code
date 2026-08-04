@@ -1479,6 +1479,11 @@ export class KimiTUI {
     return 'embedded';
   }
 
+  /** Dispatch cwd for sessions created from the agents view. */
+  agentsViewWorkDir(): string {
+    return this.state.appState.workDir;
+  }
+
   appendStartupNotice(extra: string): void {
     this.startupNotice = combineStartupNotice(this.startupNotice, extra);
   }

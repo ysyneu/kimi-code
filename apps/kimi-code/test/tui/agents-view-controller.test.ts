@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { Event, KimiHarness, Session, SessionSummary } from '@moonshot-ai/kimi-code-sdk';
+import { SDKRpcClientWire } from '@moonshot-ai/kimi-code-sdk';
 import type { Component, ProcessTerminal, Terminal, TUI } from '@moonshot-ai/pi-tui';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -11,9 +12,14 @@ import type { AgentsViewApp } from '@/tui/components/agents-view/app';
 import type { CustomEditor } from '@/tui/components/editor/custom-editor';
 import {
   AgentsViewController,
+  dispatchSlashCommands,
   type AgentsViewHost,
   type AgentsViewState,
 } from '@/tui/controllers/agents-view';
+import {
+  AgentsViewDispatch,
+  parseDispatchInput,
+} from '@/tui/controllers/agents-view-dispatch';
 import { currentTheme } from '@/tui/theme';
 
 const ANSI_SGR = /\[[0-9;]*m/g;
@@ -74,27 +80,47 @@ interface FakeHarness {
   resumeSession: ReturnType<typeof vi.fn>;
   deleteSession: ReturnType<typeof vi.fn>;
   renameSession: ReturnType<typeof vi.fn>;
+  createSession: ReturnType<typeof vi.fn>;
   session: { getContext: ReturnType<typeof vi.fn>; steer: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> };
+  createdSession: { id: string; prompt: ReturnType<typeof vi.fn> };
+  wirePrompt: ReturnType<typeof vi.fn> | undefined;
   emit(event: unknown): void;
 }
 
-function makeHarness(homeDir: string, summaries: readonly SessionSummary[]): FakeHarness {
+function makeHarness(
+  homeDir: string,
+  summaries: readonly SessionSummary[],
+  opts: { wire?: boolean } = {},
+): FakeHarness {
   const listeners = new Set<(event: Event) => void>();
   const session = {
     getContext: vi.fn(async () => ({ history: [], tokenCount: 0 })),
     steer: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
   };
+  const createdSession = { id: 'new-session', prompt: vi.fn(async () => {}) };
+  const wirePrompt = opts.wire === true ? vi.fn(async () => {}) : undefined;
+  // A bare prototype instance satisfies the controller's instanceof narrowing
+  // without booting a real wire client.
+  const wireRpc =
+    wirePrompt === undefined
+      ? undefined
+      : (Object.assign(Object.create(SDKRpcClientWire.prototype) as SDKRpcClientWire, {
+          prompt: wirePrompt,
+        }));
   const listSessions = vi.fn(async () => summaries);
   const resumeSession = vi.fn(async () => session as unknown as Session);
   const deleteSession = vi.fn(async () => {});
   const renameSession = vi.fn(async () => {});
+  const createSession = vi.fn(async () => createdSession as unknown as Session);
   const harness = {
     homeDir,
     listSessions,
     resumeSession,
     deleteSession,
     renameSession,
+    createSession,
+    rpc: wireRpc,
     onEvent: (listener: (event: Event) => void) => {
       listeners.add(listener);
       return () => {
@@ -108,7 +134,10 @@ function makeHarness(homeDir: string, summaries: readonly SessionSummary[]): Fak
     resumeSession,
     deleteSession,
     renameSession,
+    createSession,
     session,
+    createdSession,
+    wirePrompt,
     emit: (event: unknown) => {
       for (const listener of listeners) listener(event as Event);
     },
@@ -133,10 +162,10 @@ const SENTINEL_B = { tag: 'sentinel-b' } as unknown as Component;
 
 async function boot(
   summaries: readonly SessionSummary[],
-  opts: { onOpenSession?: (id: string) => void } = {},
+  opts: { onOpenSession?: (id: string) => void; wire?: boolean } = {},
 ): Promise<Boot> {
   const homeDir = await mkdtemp(join(tmpdir(), 'agents-view-controller-'));
-  const fake = makeHarness(homeDir, summaries);
+  const fake = makeHarness(homeDir, summaries, { wire: opts.wire });
   const ui: FakeUI = {
     children: [SENTINEL_A, SENTINEL_B],
     clear() {
@@ -166,6 +195,7 @@ async function boot(
       state.agentsView = value;
     },
     agentsViewServerLabel: () => 'test-server',
+    agentsViewWorkDir: () => '/home/user/project',
     onOpenSession: opts.onOpenSession,
   };
   const controller = new AgentsViewController(host);
@@ -574,5 +604,218 @@ describe('AgentsViewController — open', () => {
     const out = b.render();
     expect(out).not.toContain('… 2 more');
     expect(out).toContain('s0 title');
+  });
+});
+
+// ── Task 4: dispatch editor + whitelist autocomplete + submission parsing ──
+
+describe('parseDispatchInput', () => {
+  it('plain text passes through as-is (trimmed)', () => {
+    expect(parseDispatchInput('fix the flaky test')).toEqual({ text: 'fix the flaky test' });
+    expect(parseDispatchInput('  fix the flaky test  ')).toEqual({ text: 'fix the flaky test' });
+  });
+
+  it('a /model prefix stages the model and keeps the rest as text', () => {
+    expect(parseDispatchInput('/model kimi-k2 fix the flaky test')).toEqual({
+      text: 'fix the flaky test',
+      model: 'kimi-k2',
+    });
+  });
+
+  it('a /agent prefix stages the profile and keeps the rest as text', () => {
+    expect(parseDispatchInput('/agent reviewer fix the flaky test')).toEqual({
+      text: 'fix the flaky test',
+      profile: 'reviewer',
+    });
+  });
+
+  it('collapses extra whitespace around the staged argument', () => {
+    expect(parseDispatchInput('/model   kimi-k2   fix the flaky test')).toEqual({
+      text: 'fix the flaky test',
+      model: 'kimi-k2',
+    });
+  });
+
+  it('any other slash command is rejected as session-only', () => {
+    expect(parseDispatchInput('/yolo fix the flaky test')).toEqual({
+      error: '"/yolo" is only available inside a session',
+    });
+    expect(parseDispatchInput('/help')).toEqual({
+      error: '"/help" is only available inside a session',
+    });
+    expect(parseDispatchInput('/modelx fix the flaky test')).toEqual({
+      error: '"/modelx" is only available inside a session',
+    });
+  });
+
+  it('a slash token mid-text is plain text, not a command', () => {
+    expect(parseDispatchInput('fix /model handling')).toEqual({ text: 'fix /model handling' });
+  });
+
+  it('rejects empty and too-short input', () => {
+    expect(parseDispatchInput('')).toEqual({ error: 'Too short — describe the task' });
+    expect(parseDispatchInput('   ')).toEqual({ error: 'Too short — describe the task' });
+    expect(parseDispatchInput('ab')).toEqual({ error: 'Too short — describe the task' });
+    expect(parseDispatchInput('a b')).toEqual({ error: 'Too short — describe the task' });
+  });
+
+  it('counts non-space characters for the minimum length', () => {
+    expect(parseDispatchInput('a b c')).toEqual({ text: 'a b c' });
+  });
+
+  it('a staged /model or /agent without enough task text is too short', () => {
+    expect(parseDispatchInput('/model')).toEqual({ error: 'Too short — describe the task' });
+    expect(parseDispatchInput('/model kimi-k2')).toEqual({ error: 'Too short — describe the task' });
+    expect(parseDispatchInput('/agent')).toEqual({ error: 'Too short — describe the task' });
+  });
+});
+
+describe('AgentsViewDispatch — editor wiring', () => {
+  function makeDispatch(): AgentsViewDispatch {
+    const tui = {
+      requestRender: vi.fn(),
+      render: vi.fn(() => []),
+      terminal: { rows: 40, cols: 120 },
+    } as unknown as TUI;
+    return new AgentsViewDispatch(tui, '/home/user/project');
+  }
+
+  it('an editor submission parses and forwards the DispatchSubmission to onSubmit', () => {
+    const dispatch = makeDispatch();
+    const onSubmit = vi.fn();
+    dispatch.onSubmit = onSubmit;
+    dispatch.editor.onSubmit?.('/model kimi-k2 fix the flaky test');
+    expect(onSubmit).toHaveBeenCalledWith({ text: 'fix the flaky test', model: 'kimi-k2' });
+  });
+
+  it('a parse error goes to onError and never reaches onSubmit', () => {
+    const dispatch = makeDispatch();
+    const onSubmit = vi.fn();
+    const onError = vi.fn();
+    dispatch.onSubmit = onSubmit;
+    dispatch.onError = onError;
+    dispatch.editor.onSubmit?.('/yolo');
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith('"/yolo" is only available inside a session');
+  });
+
+  it('installAutocomplete suggests only the installed commands', async () => {
+    const dispatch = makeDispatch();
+    dispatch.installAutocomplete(dispatchSlashCommands());
+    const provider = (
+      dispatch.editor as unknown as {
+        autocompleteProvider: {
+          getSuggestions(
+            lines: string[],
+            cursorLine: number,
+            cursorCol: number,
+            options: { signal: AbortSignal },
+          ): Promise<{ items: { value: string }[] } | null>;
+        };
+      }
+    ).autocompleteProvider;
+    const suggestions = await provider.getSuggestions(['/'], 0, 1, {
+      signal: new AbortController().signal,
+    });
+    expect(suggestions?.items.map((item) => item.value).toSorted()).toEqual([
+      'agent',
+      'help',
+      'model',
+    ]);
+  });
+
+  it('the dispatch whitelist is /model + /help from the builtins plus a local /agent', () => {
+    const commands = dispatchSlashCommands();
+    expect(commands.map((command) => command.name).toSorted()).toEqual(['agent', 'help', 'model']);
+    const agent = commands.find((command) => command.name === 'agent');
+    expect(agent?.description).toBeTruthy();
+  });
+});
+
+describe('AgentsViewController — dispatch', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    dir = undefined;
+  });
+
+  it('a plain submission creates a session in the view workDir and prompts it', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.view().dispatch.editor.onSubmit?.('fix the flaky test');
+    await flush();
+    expect(b.fake.createSession).toHaveBeenCalledWith({ workDir: '/home/user/project' });
+    expect(b.fake.createdSession.prompt).toHaveBeenCalledWith('fix the flaky test');
+  });
+
+  it('model/profile overrides ride the wire rpc prompt, not Session.prompt', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    b.view().dispatch.editor.onSubmit?.('/model kimi-k2 fix the flaky test');
+    await flush();
+    expect(b.fake.createdSession.prompt).not.toHaveBeenCalled();
+    expect(b.fake.wirePrompt).toHaveBeenCalledWith({
+      sessionId: 'new-session',
+      input: [{ type: 'text', text: 'fix the flaky test' }],
+      model: 'kimi-k2',
+      profile: undefined,
+    });
+    b.view().dispatch.editor.onSubmit?.('/agent reviewer fix the flaky test');
+    await flush();
+    expect(b.fake.wirePrompt).toHaveBeenLastCalledWith({
+      sessionId: 'new-session',
+      input: [{ type: 'text', text: 'fix the flaky test' }],
+      model: undefined,
+      profile: 'reviewer',
+    });
+  });
+
+  it('a plain submission still uses Session.prompt on the wire transport', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    b.view().dispatch.editor.onSubmit?.('fix the flaky test');
+    await flush();
+    expect(b.fake.createdSession.prompt).toHaveBeenCalledWith('fix the flaky test');
+    expect(b.fake.wirePrompt).not.toHaveBeenCalled();
+  });
+
+  it('overrides without the wire transport flash an error and skip the prompt', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.view().dispatch.editor.onSubmit?.('/model kimi-k2 fix the flaky test');
+    await flush();
+    expect(b.fake.createdSession.prompt).not.toHaveBeenCalled();
+    expect(b.view().flashMessage).toContain('wire transport');
+    b.controller.close(); // clear the pending flash timer
+  });
+
+  it('a rejected slash command flashes the error and creates nothing', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.view().dispatch.editor.onSubmit?.('/yolo fix the flaky test');
+    await flush();
+    expect(b.fake.createSession).not.toHaveBeenCalled();
+    expect(b.render()).toContain('"/yolo" is only available inside a session');
+    b.controller.close(); // clear the pending flash timer
+  });
+
+  it('too-short input flashes the Too short hint', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.view().dispatch.editor.onSubmit?.('ab');
+    await flush();
+    expect(b.fake.createSession).not.toHaveBeenCalled();
+    expect(b.render()).toContain('Too short — describe the task');
+    b.controller.close(); // clear the pending flash timer
+  });
+
+  it('a failing createSession flashes the dispatch error', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.fake.createSession.mockRejectedValueOnce(new Error('workspace rejected'));
+    b.view().dispatch.editor.onSubmit?.('fix the flaky test');
+    await flush();
+    expect(b.render()).toContain('Dispatch failed: workspace rejected');
+    b.controller.close(); // clear the pending flash timer
   });
 });

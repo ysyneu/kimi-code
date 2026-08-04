@@ -1,8 +1,11 @@
 import type { Event, KimiHarness, Session, Unsubscribe } from '@moonshot-ai/kimi-code-sdk';
+import { SDKRpcClientWire } from '@moonshot-ai/kimi-code-sdk';
 import type { Component, ProcessTerminal, TUI } from '@moonshot-ai/pi-tui';
 
 import { AgentsRoster, type AgentsGroup, type AgentsGroupId } from '../agents/roster';
 import { loadPins, savePins } from '../agents/roster-persistence';
+import { BUILTIN_SLASH_COMMANDS } from '../commands/registry';
+import type { KimiSlashCommand } from '../commands/types';
 import {
   AgentsViewApp,
   type AgentsViewPeek,
@@ -10,6 +13,8 @@ import {
 } from '../components/agents-view/app';
 import type { CustomEditor } from '../components/editor/custom-editor';
 import type { Theme } from '#/tui/theme';
+
+import { AgentsViewDispatch, type DispatchSubmission } from './agents-view-dispatch';
 
 export interface AgentsViewHost {
   readonly state: {
@@ -25,6 +30,8 @@ export interface AgentsViewHost {
   setAgentsView(value: AgentsViewState | undefined): void;
   /** Header label for the connected kap-server: "embedded" or host:port. */
   agentsViewServerLabel(): string;
+  /** Dispatch target: every session created from the view opens in this cwd. */
+  agentsViewWorkDir(): string;
   /** Attach seam — injected in M4; without it Enter shows a placeholder. */
   onOpenSession?(id: string): void;
 }
@@ -35,6 +42,7 @@ export interface AgentsViewState {
   roster: AgentsRoster;
   /** The same Set the roster mutates in place; persisted after every setPinned. */
   pins: Set<string>;
+  dispatch: AgentsViewDispatch;
   selectedId: string | undefined;
   peek: AgentsViewPeek | undefined;
   /** Stale-response guard for async peek loads. */
@@ -57,6 +65,36 @@ const GLOBAL_EVENT_TYPES: ReadonlySet<string> = new Set([
   'event.session.work_changed',
   'event.session.created',
 ]);
+
+/**
+ * Dispatch-local `/agent` item: the builtin registry has no profile command
+ * (profiles are a `--agent` CLI concept, not an in-session slash command), so
+ * the whitelist entry is defined here. Its parse branch lives in
+ * `parseDispatchInput`.
+ */
+const DISPATCH_AGENT_COMMAND: KimiSlashCommand = {
+  name: 'agent',
+  aliases: [],
+  description: 'Run the new session with an agent profile',
+  priority: 90,
+  argumentHint: '<profile>',
+  availability: 'always',
+};
+
+/** Builtin commands that make sense outside a session (design §4.5 whitelist). */
+const DISPATCH_BUILTIN_WHITELIST: ReadonlySet<string> = new Set(['model', 'help']);
+
+/**
+ * The dispatch autocomplete whitelist: `/model` + `/help` filtered out of
+ * `BUILTIN_SLASH_COMMANDS` (their copy is not reinvented here) plus the
+ * dispatch-local `/agent` item.
+ */
+export function dispatchSlashCommands(): readonly KimiSlashCommand[] {
+  const builtins = BUILTIN_SLASH_COMMANDS.filter((command) =>
+    DISPATCH_BUILTIN_WHITELIST.has(command.name),
+  );
+  return [...builtins, DISPATCH_AGENT_COMMAND];
+}
 
 type SessionContext = Awaited<ReturnType<Session['getContext']>>;
 
@@ -143,11 +181,21 @@ export class AgentsViewController {
     state.ui.setFocus(component);
     state.ui.requestRender(true);
 
+    const dispatch = new AgentsViewDispatch(state.ui, this.host.agentsViewWorkDir());
+    dispatch.installAutocomplete(dispatchSlashCommands());
+    dispatch.onSubmit = (submission) => {
+      void this.handleDispatch(submission);
+    };
+    dispatch.onError = (message) => {
+      this.flash(message);
+    };
+
     this.host.setAgentsView({
       component,
       savedChildren,
       roster,
       pins,
+      dispatch,
       selectedId: undefined,
       peek: undefined,
       peekRequestId: 0,
@@ -194,6 +242,47 @@ export class AgentsViewController {
 
   // ---------------------------------------------------------------------------
 
+  /**
+   * Dispatch flow (design §4.5): create the session in the view's workDir,
+   * then send the first prompt. Staged model/profile overrides must ride that
+   * first prompt's submission body — the wire create route drops per-session
+   * agent config, so they never reach `createSession`. The new roster row
+   * arrives on its own via the `event.session.created` subscription.
+   */
+  private async handleDispatch(submission: DispatchSubmission): Promise<void> {
+    const view = this.host.state.agentsView;
+    if (view === undefined) return;
+    try {
+      const session = await this.host.harness.createSession({
+        workDir: this.host.agentsViewWorkDir(),
+      });
+      await this.promptDispatch(session, submission);
+    } catch (error) {
+      if (this.host.state.agentsView !== view) return;
+      this.flash(`Dispatch failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private async promptDispatch(session: Session, submission: DispatchSubmission): Promise<void> {
+    if (submission.model === undefined && submission.profile === undefined) {
+      await session.prompt(submission.text);
+      return;
+    }
+    // `Session.prompt` carries no overrides; the extended rpc-level prompt
+    // (`WirePromptRpcInput`, M4-T1) does. Reach it through the harness's rpc
+    // with an instanceof narrowing — never `any`.
+    const rpc = wireRpcOf(this.host.harness);
+    if (rpc === undefined) {
+      throw new Error('/model and /agent overrides require the wire transport');
+    }
+    await rpc.prompt({
+      sessionId: session.id,
+      input: [{ type: 'text', text: submission.text }],
+      model: submission.model,
+      profile: submission.profile,
+    });
+  }
+
   private handleGlobalEvent(event: Event): void {
     const view = this.host.state.agentsView;
     if (view === undefined) return;
@@ -227,6 +316,10 @@ export class AgentsViewController {
       confirmDeleteId: view.confirmDeleteId,
       renameDraft: view.renameDraft,
       flashMessage: view.flashMessage,
+      // The dispatch editor (view.dispatch) is fully wired for submission but
+      // not yet mounted into the component's layout — the visual mount
+      // (key routing + editor render into the reserved dispatch line) lands
+      // with the interactive boot in Task 6. Until then nothing can focus it.
       dispatchFocused: false,
       ...this.buildCallbacks(),
     };
@@ -282,8 +375,7 @@ export class AgentsViewController {
           this.pushProps();
           return;
         }
-        const onOpenSession = this.host.onOpenSession;
-        if (onOpenSession !== undefined) onOpenSession(id);
+        if (this.host.onOpenSession !== undefined) this.host.onOpenSession(id);
         else this.host.showStatus('Attach lands in M4');
       },
       onPeekToggle: (id) => {
@@ -471,4 +563,17 @@ export class AgentsViewController {
     }, durationMs);
     this.pushProps();
   }
+}
+
+/**
+ * Type narrowing onto the harness's rpc: the agents view only runs on the
+ * wire transport, whose rpc exposes the extended prompt input (model/profile
+ * overrides). Returns undefined for any other transport — callers must treat
+ * that as "wire-only feature unavailable", never fall back to `any`.
+ */
+function wireRpcOf(harness: KimiHarness): SDKRpcClientWire | undefined {
+  // The double cast pierces the private modifier only; the runtime field is
+  // then checked with instanceof before any use.
+  const rpc: unknown = (harness as unknown as { readonly rpc?: unknown }).rpc;
+  return rpc instanceof SDKRpcClientWire ? rpc : undefined;
 }
