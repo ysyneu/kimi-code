@@ -10,6 +10,7 @@ import {
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { z } from 'zod';
 
+import { isGlobalEventType, translateWireEvent } from '#/wire/event-translator';
 import { WireHttpClient } from '#/wire/http-client';
 import {
   EnvelopeError,
@@ -124,6 +125,41 @@ describe('wire protocol schemas', () => {
     };
     expect(wsEventFrameSchema.parse(frame).payload.type).toBe('turn.started');
     expect(wsEventFrameSchema.safeParse({ ...frame, seq: '42' }).success).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pure unit tests — no live-server fixture required.
+// ---------------------------------------------------------------------------
+
+describe('translateWireEvent', () => {
+  it('passes through a well-formed durable event with payload intact', () => {
+    const event = translateWireEvent({
+      type: 'turn.ended', seq: 9, session_id: 's1', timestamp: '2026-07-30T00:00:00.000Z',
+      payload: { type: 'turn.ended', turnId: 2, reason: 'completed', agentId: 'main', sessionId: 's1' },
+    });
+    expect(event).toMatchObject({ type: 'turn.ended', turnId: 2, sessionId: 's1', agentId: 'main' });
+  });
+
+  it('falls back to the envelope session_id when the payload omits it', () => {
+    const event = translateWireEvent({
+      type: 'event.session.work_changed', seq: 1, session_id: 's1', timestamp: 't',
+      payload: { type: 'event.session.work_changed', busy: false, agentId: 'main' },
+    });
+    expect(event).toMatchObject({ sessionId: 's1', busy: false });
+  });
+
+  it('returns null for structurally invalid frames instead of throwing', () => {
+    expect(translateWireEvent({ type: 'turn.ended', payload: null } as never)).toBeNull();
+    expect(translateWireEvent({ type: 'turn.ended', payload: { turnId: 1 } } as never)).toBeNull();
+  });
+
+  it('classifies global event types exactly like the server', () => {
+    expect(isGlobalEventType('session.meta.updated')).toBe(true);
+    expect(isGlobalEventType('event.session.work_changed')).toBe(true);
+    expect(isGlobalEventType('event.workspace.created')).toBe(true);
+    expect(isGlobalEventType('turn.started')).toBe(false);
+    expect(isGlobalEventType('assistant.delta')).toBe(false);
   });
 });
 
