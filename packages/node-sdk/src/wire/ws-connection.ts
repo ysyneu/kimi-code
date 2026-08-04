@@ -10,8 +10,28 @@
  * messages (a JSON array of frames) are unpacked element by element.
  */
 import { WebSocket } from 'ws';
+import { z } from 'zod';
 
-import { wsFrameSchema, type WsFrame } from './protocol';
+import {
+  wsEventFrameSchema,
+  wsFrameSchema,
+  type WsEventFrame,
+  type WsFrame,
+} from './protocol';
+
+/**
+ * Frame as delivered to `onFrame` handlers and waiters: the control/ack fields
+ * plus the event cursor fields (`seq` / `session_id` / `epoch` / `volatile` /
+ * `offset`) when the frame is an event envelope. Parsing never strips unknown
+ * keys (forward-compat), so extra server fields pass through too.
+ */
+export type WsIncomingFrame = WsFrame &
+  Partial<Pick<WsEventFrame, 'seq' | 'epoch' | 'volatile' | 'offset' | 'session_id'>>;
+
+// Plain `z.object` strips undeclared keys; both schemas get a catchall so
+// event cursor fields (and any future server fields) survive parsing.
+const incomingEventFrameSchema = wsEventFrameSchema.catchall(z.unknown());
+const incomingControlFrameSchema = wsFrameSchema.catchall(z.unknown());
 
 /** Payload of the server's `server_hello` frame. */
 export interface WsServerHello {
@@ -46,16 +66,16 @@ export interface WsConnectionOptions {
 export interface WsConnectionLike {
   connect(): Promise<WsServerHello>;
   sendControl<T>(type: string, payload: unknown): Promise<T>;
-  onFrame(handler: (frame: WsFrame) => void): () => void;
+  onFrame(handler: (frame: WsIncomingFrame) => void): () => void;
   onClose(handler: (info: WsCloseInfo) => void): () => void;
   close(): Promise<void>;
 }
 
-type FrameWaiter = (frame: WsFrame) => boolean;
+type FrameWaiter = (frame: WsIncomingFrame) => boolean;
 
 interface PendingWaiter {
   match: FrameWaiter;
-  resolve: (frame: WsFrame) => void;
+  resolve: (frame: WsIncomingFrame) => void;
   reject: (err: Error) => void;
   timer?: NodeJS.Timeout;
 }
@@ -67,7 +87,7 @@ const noopLogger: WsLogger = () => {};
 export class WsConnection implements WsConnectionLike {
   private ws: WebSocket | null = null;
   private readonly waiters: PendingWaiter[] = [];
-  private readonly frameHandlers = new Set<(frame: WsFrame) => void>();
+  private readonly frameHandlers = new Set<(frame: WsIncomingFrame) => void>();
   private readonly closeHandlers = new Set<(info: WsCloseInfo) => void>();
   private readonly clientId: string;
   private readonly logger: WsLogger;
@@ -121,7 +141,7 @@ export class WsConnection implements WsConnectionLike {
   }
 
   /** Register a frame subscriber. Returns an unsubscribe handle. */
-  onFrame(handler: (frame: WsFrame) => void): () => void {
+  onFrame(handler: (frame: WsIncomingFrame) => void): () => void {
     this.frameHandlers.add(handler);
     return () => {
       this.frameHandlers.delete(handler);
@@ -171,7 +191,7 @@ export class WsConnection implements WsConnectionLike {
    * reject on close or timeout. There is no unmatched-frame queue: frames that
    * match no waiter only reach `onFrame` subscribers.
    */
-  private waitForFrame(predicate: FrameWaiter, timeoutMs: number): Promise<WsFrame> {
+  private waitForFrame(predicate: FrameWaiter, timeoutMs: number): Promise<WsIncomingFrame> {
     return new Promise((resolve, reject) => {
       if (this.closed) {
         reject(new Error(`ws closed before matching frame arrived (code=${this.closeInfo?.code})`));
@@ -223,12 +243,19 @@ export class WsConnection implements WsConnectionLike {
   }
 
   private dispatchFrame(raw: unknown): void {
-    const result = wsFrameSchema.safeParse(raw);
+    // Event envelopes carry a numeric `seq`; control/ack frames never do.
+    const isEvent =
+      typeof raw === 'object' &&
+      raw !== null &&
+      typeof (raw as { seq?: unknown }).seq === 'number';
+    const result = isEvent
+      ? incomingEventFrameSchema.safeParse(raw)
+      : incomingControlFrameSchema.safeParse(raw);
     if (!result.success) {
       this.logger('warn', 'ws: dropped malformed frame', { err: result.error.message });
       return;
     }
-    const frame = result.data;
+    const frame: WsIncomingFrame = result.data;
 
     if (frame.type === 'ping') {
       this.send({ type: 'pong', payload: { nonce: pingNonce(frame) } });

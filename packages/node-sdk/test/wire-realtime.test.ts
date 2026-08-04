@@ -97,6 +97,33 @@ describe('WsConnection', () => {
     await ws.close();
   });
 
+  it('preserves seq/session_id/epoch on event frames delivered to onFrame', async () => {
+    const ws = new WsConnection({ url: wsUrl, token });
+    await ws.connect();
+    const seen = new Promise<{
+      seq?: number;
+      session_id?: string;
+      epoch?: string;
+      timestamp?: string;
+      payload?: unknown;
+    }>((resolve) => {
+      const off = ws.onFrame((frame) => {
+        if (frame.type === 'event.session.created') {
+          off();
+          resolve(frame);
+        }
+      });
+    });
+    const created = await createSession(home);
+    const frame = await seen;
+    expect(typeof frame.seq).toBe('number');
+    expect(frame.session_id).toBe(created.id);
+    expect(typeof frame.epoch).toBe('string');
+    expect(typeof frame.timestamp).toBe('string');
+    expect(frame.payload).toMatchObject({ type: 'event.session.created' });
+    await ws.close();
+  });
+
   it('rejects handshake with a bad token', async () => {
     const ws = new WsConnection({ url: wsUrl, token: 'wrong' });
     await expect(ws.connect()).rejects.toThrow();
