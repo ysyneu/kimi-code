@@ -141,21 +141,35 @@ export class CursorSupervisor {
   // Connection lifecycle
   // ---------------------------------------------------------------------------
 
-  /** One connect attempt on a fresh connection; throws on failure. */
+  /**
+   * One connect attempt on a fresh connection; throws on failure. The socket
+   * is only installed (`this.connection` / `connected = true`) after BOTH the
+   * handshake and the resubscribe succeed — a live but subscription-less
+   * socket is silent event loss, so a failed resubscribe tears the socket
+   * down and counts as a failed attempt.
+   */
   private async connectOnce(): Promise<void> {
     const connection = this.options.makeConnection();
     connection.onFrame((frame) => this.handleFrame(frame));
-    connection.onClose((info) => this.handleClose(info));
+    const offClose = connection.onClose((info) => this.handleClose(info));
     await connection.connect();
     if (this.closed) {
+      offClose();
       await connection.close();
       return;
+    }
+    try {
+      await this.resubscribeAll(connection);
+    } catch (err) {
+      // Detach first so the deliberate teardown doesn't look like a drop.
+      offClose();
+      await connection.close().catch(() => {});
+      throw err;
     }
     this.connection = connection;
     this.connected = true;
     this.reconnectAttempts = 0;
     this.notifyState(true);
-    await this.resubscribeAll(connection);
   }
 
   /** Re-send ONE subscribe carrying ALL recorded cursors (reconnect contract). */
@@ -203,13 +217,15 @@ export class CursorSupervisor {
     try {
       await this.connectOnce();
     } catch (err) {
-      if (!this.closed) {
-        this.logger('warn', 'ws-supervisor: reconnect attempt failed', { err: String(err) });
-        this.scheduleReconnect();
-      }
+      this.logger('warn', 'ws-supervisor: reconnect attempt failed', { err: String(err) });
     } finally {
       this.reconnecting = false;
     }
+    // Every failed attempt (connect, handshake, or resubscribe) continues the
+    // backoff sequence — the loop must survive a down server indefinitely.
+    // Scheduling happens AFTER `reconnecting` clears, or scheduleReconnect's
+    // in-flight guard would swallow the retry and stall the loop for good.
+    if (!this.connected && !this.closed) this.scheduleReconnect();
   }
 
   // ---------------------------------------------------------------------------

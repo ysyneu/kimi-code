@@ -231,4 +231,118 @@ describe('CursorSupervisor', () => {
     expect(subscribes.at(-1)).toEqual({ session_ids: ['s1'], cursors: { s1: { seq: 7 } } });
     await supervisor.close();
   });
+
+  it(
+    'keeps reconnecting across consecutive failed connect attempts',
+    async () => {
+      type SubscribeCall = {
+        session_ids: string[];
+        cursors?: Record<string, { seq: number; epoch?: string }>;
+      };
+      const subscribes: SubscribeCall[] = [];
+      let closeHandler: ((info: { code: number; reason: string }) => void) | undefined;
+      let connects = 0;
+      let failConnects = 0;
+
+      class FlakyConnect {
+        async connect() {
+          connects++;
+          if (failConnects > 0) {
+            failConnects--;
+            throw new Error('connection refused');
+          }
+          return { ws_connection_id: 'c', protocol_version: 2, max_event_buffer_size: 100 };
+        }
+        async sendControl<T>(type: string, payload: unknown): Promise<T> {
+          if (type === 'subscribe') subscribes.push(payload as SubscribeCall);
+          return { accepted: (payload as SubscribeCall).session_ids, not_found: [] } as T;
+        }
+        onFrame() {
+          return () => {};
+        }
+        onClose(handler: (info: { code: number; reason: string }) => void) {
+          closeHandler = handler;
+          return () => {
+            closeHandler = undefined;
+          };
+        }
+        async close() {}
+      }
+
+      const supervisor = new CursorSupervisor({
+        makeConnection: () => new FlakyConnect() as never,
+        onResync: () => {},
+      });
+      await supervisor.start();
+      await supervisor.subscribe('s1', { seq: 0 });
+      failConnects = 2; // the next two reconnect attempts throw immediately
+      closeHandler?.({ code: 1006, reason: 'abnormal' });
+      // backoff 1s (fail) + 2s (fail) + 4s (success) ≈ 7s + jitter:
+      await new Promise((resolve) => setTimeout(resolve, 8000));
+      // 1 initial + 2 failed retries + 1 successful retry (3 post-drop attempts):
+      expect(connects).toBe(4);
+      // the loop survived and the successful attempt re-subscribed:
+      expect(subscribes.at(-1)).toEqual({ session_ids: ['s1'], cursors: { s1: { seq: 0 } } });
+      await supervisor.close();
+    },
+    15_000,
+  );
+
+  it('tears down the socket when resubscribe fails and recovers on the next attempt', async () => {
+    type SubscribeCall = {
+      session_ids: string[];
+      cursors?: Record<string, { seq: number; epoch?: string }>;
+    };
+    const subscribes: SubscribeCall[] = [];
+    let closeHandler: ((info: { code: number; reason: string }) => void) | undefined;
+    let connects = 0;
+    let closes = 0;
+    let failSubscribes = 0;
+
+    class FlakySubscribe {
+      async connect() {
+        connects++;
+        return { ws_connection_id: 'c', protocol_version: 2, max_event_buffer_size: 100 };
+      }
+      async sendControl<T>(type: string, payload: unknown): Promise<T> {
+        if (type === 'subscribe') {
+          if (failSubscribes > 0) {
+            failSubscribes--;
+            throw new Error('subscribe rejected');
+          }
+          subscribes.push(payload as SubscribeCall);
+        }
+        return { accepted: (payload as SubscribeCall).session_ids, not_found: [] } as T;
+      }
+      onFrame() {
+        return () => {};
+      }
+      onClose(handler: (info: { code: number; reason: string }) => void) {
+        closeHandler = handler;
+        return () => {
+          closeHandler = undefined;
+        };
+      }
+      async close() {
+        closes++;
+      }
+    }
+
+    const supervisor = new CursorSupervisor({
+      makeConnection: () => new FlakySubscribe() as never,
+      onResync: () => {},
+    });
+    await supervisor.start();
+    await supervisor.subscribe('s1', { seq: 0 });
+    failSubscribes = 1; // the first resubscribe after the drop rejects
+    closeHandler?.({ code: 1006, reason: 'abnormal' });
+    // backoff 1s (resubscribe fails) + 2s (full recovery) ≈ 3s + jitter:
+    await new Promise((resolve) => setTimeout(resolve, 3800));
+    expect(connects).toBe(3); // initial + failed attempt + recovery attempt
+    // the half-installed socket from the failed attempt was closed/torn down:
+    expect(closes).toBe(1);
+    // the recovery attempt fully re-subscribed:
+    expect(subscribes.at(-1)).toEqual({ session_ids: ['s1'], cursors: { s1: { seq: 0 } } });
+    await supervisor.close();
+  });
 });
