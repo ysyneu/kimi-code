@@ -43,7 +43,12 @@ import { assertKimiHostIdentity } from '@moonshot-ai/kimi-code-oauth';
 
 import { KimiAuthFacade } from '#/auth';
 import type { ApprovalHandler, QuestionHandler } from '#/events';
-import { SDKRpcClientBase, type SessionIdRpcInput, type SessionPromptRpcInput } from '#/rpc';
+import {
+  SDKRpcClientBase,
+  type SessionIdRpcInput,
+  type SessionPromptRpcInput,
+  type SetSessionPermissionRpcInput,
+} from '#/rpc';
 import type {
   CompactOptions,
   ContentPart,
@@ -52,8 +57,11 @@ import type {
   JsonObject,
   KimiHostIdentity,
   ListSessionsOptions,
+  McpStartupMetrics,
   OAuthRefreshOutcome,
   PermissionMode,
+  PluginCommandDef,
+  PluginSummary,
   PromptPart,
   RenameSessionInput,
   ResumeSessionInput,
@@ -61,6 +69,7 @@ import type {
   SessionStatus,
   SessionSummary,
   SessionUsage,
+  SkillSummary,
   TelemetryClient,
   ToolCall,
 } from '#/types';
@@ -90,6 +99,18 @@ export interface SDKRpcClientWireOptions {
   readonly telemetry?: TelemetryClient;
   readonly onOAuthRefresh?: (outcome: OAuthRefreshOutcome) => void;
   readonly uiMode?: string;
+}
+
+/**
+ * Wire-side prompt input. The base `SessionPromptRpcInput` is a closed
+ * interface, so the wire transport widens it with the per-prompt overrides
+ * the kap-server prompt route accepts (`model` / `profile`, verified in
+ * rest-prompt's `promptSubmissionSchema`); the overrides below narrow the
+ * parameter type, which TS allows on method overrides.
+ */
+export interface WirePromptRpcInput extends SessionPromptRpcInput {
+  readonly model?: string;
+  readonly profile?: string;
 }
 
 /**
@@ -265,6 +286,10 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
   // bridge queues those interactions instead, and these sets are how it knows.
   private readonly approvalHandlerSessions = new Set<string>();
   private readonly questionHandlerSessions = new Set<string>();
+  // Deferred permission overrides (design §4.1): the wire has no standalone
+  // setPermission verb, so the mode waits here and rides the NEXT prompt/steer
+  // submission for that session as `permission_mode`, then clears.
+  private readonly pendingPermissions = new Map<string, PermissionMode>();
 
   constructor(options: SDKRpcClientWireOptions) {
     super();
@@ -473,11 +498,18 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
   // `withInteractiveAgent` — subagent targeting arrives with the agents view.
   // -----------------------------------------------------------------------
 
-  override async prompt(input: SessionPromptRpcInput): Promise<void> {
+  override async prompt(input: WirePromptRpcInput): Promise<void> {
+    const permissionMode = this.pendingPermissions.get(input.sessionId);
     await this.http.submitPrompt(input.sessionId, {
       content: input.input.map(toWireContent),
       disabled_tools: input.disabledTools,
+      model: input.model,
+      profile: input.profile,
+      permission_mode: permissionMode,
     });
+    // Cleared only after a successful submission: a failed prompt must not
+    // silently drop the caller's mode change.
+    if (permissionMode !== undefined) this.pendingPermissions.delete(input.sessionId);
   }
 
   /**
@@ -487,10 +519,15 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
    * turn directly (v1's idle-steer-launches-a-turn semantics), so no steer
    * call follows.
    */
-  override async steer(input: SessionPromptRpcInput): Promise<void> {
+  override async steer(input: WirePromptRpcInput): Promise<void> {
+    const permissionMode = this.pendingPermissions.get(input.sessionId);
     const submitted = await this.http.submitPrompt(input.sessionId, {
       content: input.input.map(toWireContent),
+      model: input.model,
+      profile: input.profile,
+      permission_mode: permissionMode,
     });
+    if (permissionMode !== undefined) this.pendingPermissions.delete(input.sessionId);
     if (submitted.status === 'queued') {
       await this.http.steerPrompts(input.sessionId, { prompt_ids: [submitted.prompt_id] });
     }
@@ -532,6 +569,51 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
 
   override async getSessionWarnings(input: SessionIdRpcInput) {
     return this.http.getSessionWarnings(input.sessionId);
+  }
+
+  // -----------------------------------------------------------------------
+  // Degrade surface
+  //
+  // The TUI reads these unconditionally on startup/attach; kap-server has no
+  // routes backing them, so they degrade to empty values instead of loud
+  // not_implemented failures.
+  // -----------------------------------------------------------------------
+
+  /** wire degrade: kap-server has no plugin routes (design §4.1). */
+  override async listPlugins(): Promise<readonly PluginSummary[]> {
+    return [];
+  }
+
+  /** wire degrade: kap-server has no plugin routes (design §4.1). */
+  override async listPluginCommands(
+    input: SessionIdRpcInput,
+  ): Promise<readonly PluginCommandDef[]> {
+    void input;
+    return [];
+  }
+
+  /**
+   * wire degrade: kap-server has no plugin routes (design §4.1). Skills get a
+   * server-side route later; revisit when kap-server exposes one.
+   */
+  override async listSkills(input: SessionIdRpcInput): Promise<readonly SkillSummary[]> {
+    void input;
+    return [];
+  }
+
+  /** wire degrade: kap-server has no plugin routes (design §4.1). */
+  override async getMcpStartupMetrics(input: SessionIdRpcInput): Promise<McpStartupMetrics> {
+    void input;
+    return { durationMs: 0 };
+  }
+
+  /**
+   * The wire has no standalone setPermission verb (design §4.1): the mode is
+   * stored per session and rides the next prompt/steer submission as
+   * `permission_mode`, then clears.
+   */
+  override async setPermission(input: SetSessionPermissionRpcInput): Promise<void> {
+    this.pendingPermissions.set(input.sessionId, input.mode);
   }
 
   /**

@@ -8,10 +8,10 @@ import {
   type RunningServer,
   type ServerHostIdentity,
 } from '@moonshot-ai/kap-server';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { createKimiHarnessWire } from '#/index';
-import { WireHttpClient } from '#/wire/http-client';
+import { WireHttpClient, type WirePromptSubmission } from '#/wire/http-client';
 import type { WireApprovalRequest, WireQuestionRequest } from '#/wire/protocol';
 import { InteractionBridge } from '#/wire/reverse-rpc';
 import { SDKRpcClientWire, toWireContent } from '#/wire/sdk-rpc-client-wire';
@@ -737,7 +737,143 @@ describe('SDKRpcClientWire turns and state', () => {
 
   it('unimplemented methods fail loudly with not_implemented', async () => {
     const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
-    await expect(rpc.listPlugins()).rejects.toMatchObject({ code: ErrorCodes.NOT_IMPLEMENTED });
+    await expect(rpc.listMcpServers({ sessionId: 's' })).rejects.toMatchObject({
+      code: ErrorCodes.NOT_IMPLEMENTED,
+    });
+    await rpc.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDKRpcClientWire degrade surface — the M4 degrade list (design §4.1):
+// empty collections for surfaces kap-server has no routes for, deferred
+// setPermission riding the next prompt/steer, and model/profile passthrough.
+// Body assertions stub at the WireHttpClient.submitPrompt boundary — the body
+// object it receives is stringified verbatim into the HTTP request
+// (WireHttpClient.request), so recording it IS inspecting the HTTP body.
+// ---------------------------------------------------------------------------
+
+function stubSubmitPrompt(status: 'running' | 'queued' = 'running') {
+  const bodies: WirePromptSubmission[] = [];
+  const spy = vi
+    .spyOn(WireHttpClient.prototype, 'submitPrompt')
+    .mockImplementation(async (_id, body) => {
+      bodies.push(body);
+      return {
+        prompt_id: 'p_stub',
+        user_message_id: 'm_stub',
+        status,
+        content: [{ type: 'text', text: 'stub' }],
+        created_at: '2026-07-30T00:00:00.000Z',
+      };
+    });
+  return { bodies, spy };
+}
+
+describe('SDKRpcClientWire degrade surface', () => {
+  it('degrades plugin/skill/MCP-startup surfaces to empty collections', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await expect(rpc.listPlugins()).resolves.toEqual([]);
+    await expect(rpc.listPluginCommands({ sessionId: 's' })).resolves.toEqual([]);
+    await expect(rpc.listSkills({ sessionId: 's' })).resolves.toEqual([]);
+    await expect(rpc.getMcpStartupMetrics({ sessionId: 's' })).resolves.toEqual({
+      durationMs: 0,
+    });
+    await rpc.close();
+  });
+
+  it('defers setPermission onto the next prompt body, then clears it', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const { bodies, spy } = stubSubmitPrompt();
+    await rpc.setPermission({ sessionId: 's1', mode: 'yolo' });
+    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'first' }] });
+    expect(bodies[0]?.permission_mode).toBe('yolo');
+    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'second' }] });
+    expect(bodies[1]?.permission_mode).toBeUndefined();
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('scopes the deferred permission per session', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const { bodies, spy } = stubSubmitPrompt();
+    await rpc.setPermission({ sessionId: 's1', mode: 'yolo' });
+    await rpc.prompt({ sessionId: 's2', input: [{ type: 'text', text: 'other' }] });
+    expect(bodies[0]?.permission_mode).toBeUndefined();
+    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'mine' }] });
+    expect(bodies[1]?.permission_mode).toBe('yolo');
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('defers setPermission onto steer submissions too', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const { bodies, spy } = stubSubmitPrompt();
+    await rpc.setPermission({ sessionId: 's1', mode: 'manual' });
+    await rpc.steer({ sessionId: 's1', input: [{ type: 'text', text: 'steered' }] });
+    expect(bodies[0]?.permission_mode).toBe('manual');
+    await rpc.steer({ sessionId: 's1', input: [{ type: 'text', text: 'again' }] });
+    expect(bodies[1]?.permission_mode).toBeUndefined();
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('keeps the deferred permission when the submission fails', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const { bodies, spy } = stubSubmitPrompt();
+    spy.mockRejectedValueOnce(new Error('boom'));
+    await rpc.setPermission({ sessionId: 's1', mode: 'yolo' });
+    await expect(
+      rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'fails' }] }),
+    ).rejects.toThrow('boom');
+    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'retry' }] });
+    expect(bodies[0]?.permission_mode).toBe('yolo');
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('passes model/profile through on prompt and steer bodies', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const { bodies, spy } = stubSubmitPrompt();
+    await rpc.prompt({
+      sessionId: 's1',
+      input: [{ type: 'text', text: 'hi' }],
+      model: 'k2',
+      profile: 'coder',
+    });
+    expect(bodies[0]).toMatchObject({ model: 'k2', profile: 'coder' });
+    await rpc.steer({
+      sessionId: 's1',
+      input: [{ type: 'text', text: 'hi' }],
+      model: 'k2',
+      profile: 'coder',
+    });
+    expect(bodies[1]).toMatchObject({ model: 'k2', profile: 'coder' });
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('omits model/profile from the body when not provided', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const { bodies, spy } = stubSubmitPrompt();
+    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'hi' }] });
+    expect(bodies[0]?.model).toBeUndefined();
+    expect(bodies[0]?.profile).toBeUndefined();
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('the live prompt route accepts a deferred permission_mode body', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    // Call-through spy: asserts the exact body the live server accepted.
+    const live = vi.spyOn(WireHttpClient.prototype, 'submitPrompt');
+    await rpc.setPermission({ sessionId: created.id, mode: 'manual' });
+    // A schema rejection would surface here as an envelope error.
+    await rpc.prompt({ sessionId: created.id, input: [{ type: 'text', text: 'perm live' }] });
+    expect(live.mock.calls[0]?.[1].permission_mode).toBe('manual');
+    live.mockRestore();
     await rpc.close();
   });
 });
