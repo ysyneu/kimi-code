@@ -436,6 +436,29 @@ describe('SDKRpcClientWire lifecycle', () => {
     await rpc.close();
   });
 
+  it('forwards caller metadata on create and round-trips it on read', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({
+      workDir: cwd,
+      metadata: { origin: 'wire-sdk-test', attempt: 2 },
+    });
+    // v1/v2 return the caller's metadata verbatim on create:
+    expect(created.metadata).toEqual({ origin: 'wire-sdk-test', attempt: 2 });
+
+    // …and the custom keys survived server-side, readable on the wire row
+    // (merged next to the authoritative cwd):
+    const http = new WireHttpClient({ baseUrl: base, token });
+    const row = await http.getSession(created.id);
+    expect(row.metadata).toMatchObject({ origin: 'wire-sdk-test', attempt: 2, cwd });
+    const listed = await rpc.listSessions({});
+    expect(listed.find((s) => s.id === created.id)?.metadata).toMatchObject({
+      origin: 'wire-sdk-test',
+      attempt: 2,
+    });
+    await rpc.close();
+  });
+
   it('rejects a non-loopback serverUrl', () => {
     expect(() => new SDKRpcClientWire({ serverUrl: 'http://192.168.1.10:58627', token: 't' })).toThrow();
   });

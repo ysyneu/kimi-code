@@ -218,12 +218,21 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
         'createSession on the wire transport requires a workDir.',
       );
     }
+    // cwd wins on conflict — the route requires it and rejects a mismatch.
     const created = await this.http.createSession({
-      metadata: { cwd: input.workDir },
+      metadata: { ...input.metadata, cwd: input.workDir },
     });
+    // The create route reads only `metadata.cwd` / `title` from the body and
+    // drops every other custom key; custom metadata is persisted through the
+    // profile route instead (mirrors v2's post-create `update({ custom })`).
+    if (input.metadata !== undefined && Object.keys(input.metadata).length > 0) {
+      await this.http.updateSessionProfile(created.id, { metadata: { ...input.metadata } });
+    }
     // No subscription: an empty session produces no events; resume/prompt
     // attaches the cursor when there is something to stream.
-    return wireSessionToSummary(created);
+    // v1/v2 return the caller's metadata verbatim on create (not the merged
+    // custom map a later listing reports) — same here.
+    return { ...wireSessionToSummary(created), metadata: input.metadata };
   }
 
   override async resumeSession(input: ResumeSessionInput): Promise<ResumedSessionSummary> {

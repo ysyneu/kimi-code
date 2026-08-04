@@ -102,7 +102,10 @@ export class WireHttpClient {
     return this.request('POST', '/sessions', body, wireSessionSchema);
   }
 
-  updateSessionProfile(id: string, body: { title?: string }): Promise<WireSession> {
+  updateSessionProfile(
+    id: string,
+    body: { title?: string; metadata?: Record<string, unknown> },
+  ): Promise<WireSession> {
     return this.request('POST', `/sessions/${id}/profile`, body, wireSessionSchema);
   }
 
