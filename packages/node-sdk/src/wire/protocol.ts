@@ -62,6 +62,7 @@ export const wireSessionUsageSchema = z.object({
   context_limit: z.number().int().nonnegative(),
   turn_count: z.number().int().nonnegative(),
 });
+export type WireSessionUsage = z.infer<typeof wireSessionUsageSchema>;
 
 export const wirePendingInteractionSchema = z.enum(['none', 'approval', 'question']);
 
@@ -119,6 +120,13 @@ export const wireSessionStatusSchema = z.object({
   context_usage: z.number().min(0).max(1),
 });
 export type WireSessionStatus = z.infer<typeof wireSessionStatusSchema>;
+
+export const wireSessionWarningSchema = z.object({
+  code: z.string(),
+  message: z.string(),
+  severity: z.enum(['info', 'warning', 'error']),
+});
+export type WireSessionWarning = z.infer<typeof wireSessionWarningSchema>;
 
 // ---------------------------------------------------------------------------
 // Prompts

@@ -8,6 +8,7 @@ import {
   wireSessionPageSchema,
   wireSessionSchema,
   wireSessionStatusSchema,
+  wireSessionWarningSchema,
   wireSnapshotSchema,
   wireWorkspaceSchema,
   type WireApprovalResponse,
@@ -17,6 +18,7 @@ import {
   type WireSession,
   type WireSessionPage,
   type WireSessionStatus,
+  type WireSessionWarning,
   type WireSnapshot,
   type WireWorkspace,
 } from './protocol';
@@ -113,6 +115,29 @@ export class WireHttpClient {
     return this.request('POST', `/sessions/${id}:${action}`, {}, z.unknown());
   }
 
+  compactSession(id: string, body: { instruction?: string }): Promise<unknown> {
+    return this.request('POST', `/sessions/${id}:compact`, body, z.unknown());
+  }
+
+  undoSession(id: string, body: { count: number }): Promise<unknown> {
+    return this.request('POST', `/sessions/${id}:undo`, body, z.unknown());
+  }
+
+  /** Steer queued prompts into the active turn (the literal `prompts::steer` route). */
+  steerPrompts(id: string, body: { prompt_ids: readonly string[] }): Promise<unknown> {
+    return this.request('POST', `/sessions/${id}/prompts::steer`, body, z.unknown());
+  }
+
+  async getSessionWarnings(id: string): Promise<WireSessionWarning[]> {
+    const data = await this.request(
+      'GET',
+      `/sessions/${id}/warnings`,
+      undefined,
+      z.object({ warnings: z.array(wireSessionWarningSchema) }),
+    );
+    return data.warnings;
+  }
+
   forkSession(
     id: string,
     body: { title?: string; metadata?: Record<string, unknown> },
@@ -122,10 +147,6 @@ export class WireHttpClient {
 
   submitPrompt(id: string, body: WirePromptSubmission): Promise<WirePromptSubmitResult> {
     return this.request('POST', `/sessions/${id}/prompts`, body, wirePromptSubmitResultSchema);
-  }
-
-  steer(id: string, body: { content: readonly Record<string, unknown>[] }): Promise<unknown> {
-    return this.request('POST', `/sessions/${id}/prompts:steer`, body, z.unknown());
   }
 
   async abortPrompt(id: string, promptId: string): Promise<void> {

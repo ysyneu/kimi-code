@@ -16,6 +16,11 @@
  *   resumable. The wire has no per-connection session-close verb, and the
  *   daemon owns the session lifetime.
  * - `deleteSession` maps to `:archive` (the wire's only session-removal verb).
+ * - Turns and state reads map onto the prompts / status / messages REST
+ *   surface: `steer` is submit-then-`prompts::steer`, `cancel` is `:abort`,
+ *   `compact` / `undoHistory` are `:compact` / `:undo`, and `getContext`
+ *   serves the newest message page only. `agent_id` is never sent — every
+ *   turn override addresses the main agent (M1).
  * - `resumeSession` subscribes at the snapshot cursor and replays the
  *   snapshot's pending interactions into the bridge; the returned
  *   `ResumedSessionSummary` carries `agents: {}` / `warning: undefined` and a
@@ -27,29 +32,44 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { ErrorCodes, KimiError, noopTelemetryClient } from '@moonshot-ai/agent-core';
+import type { AgentContextData, ContextMessage } from '@moonshot-ai/agent-core';
 import { ensureKimiHome, resolveConfigPath, resolveKimiHome } from '@moonshot-ai/agent-core-v2';
 import { assertKimiHostIdentity } from '@moonshot-ai/kimi-code-oauth';
 
 import { KimiAuthFacade } from '#/auth';
-import { SDKRpcClientBase, type SessionIdRpcInput } from '#/rpc';
+import { SDKRpcClientBase, type SessionIdRpcInput, type SessionPromptRpcInput } from '#/rpc';
 import type {
+  CompactOptions,
+  ContentPart,
   CreateSessionOptions,
   ForkSessionInput,
   JsonObject,
   KimiHostIdentity,
   ListSessionsOptions,
   OAuthRefreshOutcome,
+  PermissionMode,
+  PromptPart,
   RenameSessionInput,
   ResumeSessionInput,
   ResumedSessionSummary,
+  SessionStatus,
   SessionSummary,
+  SessionUsage,
   TelemetryClient,
+  ToolCall,
 } from '#/types';
 
 import { CursorSupervisor } from './cursor-supervisor';
 import { translateWireEvent } from './event-translator';
 import { WireHttpClient } from './http-client';
-import type { WireSession, WireSnapshot, WsEventFrame } from './protocol';
+import type {
+  WireMessage,
+  WireSession,
+  WireSessionStatus,
+  WireSessionUsage,
+  WireSnapshot,
+  WsEventFrame,
+} from './protocol';
 import { InteractionBridge } from './reverse-rpc';
 import { WsConnection } from './ws-connection';
 
@@ -107,6 +127,119 @@ function wireSessionToSummary(session: WireSession): SessionSummary {
     archived: session.archived,
     metadata: session.metadata as JsonObject,
   };
+}
+
+/**
+ * kosong `PromptPart` → the protocol message content the prompt route
+ * validates (`messageContentSchema` in agent-core-v2's protocolMessage.ts).
+ * The wire carries media as `{ type: 'image' | 'video', source }`; a kosong
+ * URL part maps to the `url` source kind, forwarding the provider file id.
+ */
+export function toWireContent(part: PromptPart): Record<string, unknown> {
+  switch (part.type) {
+    case 'text':
+      return { type: 'text', text: part.text };
+    case 'image_url':
+      return {
+        type: 'image',
+        source: { kind: 'url', url: part.imageUrl.url, id: part.imageUrl.id },
+      };
+    case 'video_url':
+      return {
+        type: 'video',
+        source: { kind: 'url', url: part.videoUrl.url, id: part.videoUrl.id },
+      };
+  }
+}
+
+/** `WireSessionStatus` → the SDK `SessionStatus`. */
+function wireStatusToSessionStatus(status: WireSessionStatus): SessionStatus {
+  return {
+    model: status.model,
+    thinkingEffort: status.thinking_level,
+    permission: status.permission as PermissionMode,
+    planMode: status.plan_mode,
+    swarmMode: status.swarm_mode,
+    contextTokens: status.context_tokens,
+    maxContextTokens: status.max_context_tokens,
+    contextUsage: status.context_usage,
+    // The wire status surface carries no token-usage breakdown.
+    usage: undefined,
+  };
+}
+
+/**
+ * `WireSessionUsage` → the SDK `SessionUsage`. The wire row only carries
+ * session totals — no per-model or current-turn split (M1).
+ */
+function wireUsageToSessionUsage(usage: WireSessionUsage): SessionUsage {
+  return {
+    total: {
+      inputOther: usage.input_tokens,
+      output: usage.output_tokens,
+      inputCacheRead: usage.cache_read_tokens,
+      inputCacheCreation: usage.cache_creation_tokens,
+    },
+    byModel: undefined,
+    currentTurn: undefined,
+  };
+}
+
+/**
+ * Best-effort `WireMessage` → `ContextMessage` projection (M1). Text,
+ * thinking, URL media, tool_use (→ `toolCalls`), and tool_result (→ a `tool`
+ * message's `toolCallId` + text content) survive; base64/file media sources
+ * and `file` parts have no kosong equivalent and drop out.
+ */
+function wireMessageToContextMessage(message: WireMessage): ContextMessage {
+  const content: ContentPart[] = [];
+  const toolCalls: ToolCall[] = [];
+  let toolCallId: string | undefined;
+  for (const raw of message.content) {
+    const part: Record<string, unknown> = raw;
+    switch (part['type']) {
+      case 'text':
+        content.push({ type: 'text', text: part['text'] as string });
+        break;
+      case 'thinking':
+        content.push({
+          type: 'think',
+          think: part['thinking'] as string,
+          encrypted: part['signature'] as string | undefined,
+        });
+        break;
+      case 'image':
+      case 'video': {
+        const source = part['source'] as { kind?: string; url?: string; id?: string } | undefined;
+        if (source?.kind === 'url' && source.url !== undefined) {
+          content.push(
+            part['type'] === 'image'
+              ? { type: 'image_url', imageUrl: { url: source.url, id: source.id } }
+              : { type: 'video_url', videoUrl: { url: source.url, id: source.id } },
+          );
+        }
+        break;
+      }
+      case 'tool_use':
+        toolCalls.push({
+          type: 'function',
+          id: part['tool_call_id'] as string,
+          name: part['tool_name'] as string,
+          arguments: JSON.stringify(part['input'] ?? null),
+        });
+        break;
+      case 'tool_result': {
+        toolCallId = part['tool_call_id'] as string;
+        const output = part['output'];
+        content.push({
+          type: 'text',
+          text: typeof output === 'string' ? output : JSON.stringify(output ?? null),
+        });
+        break;
+      }
+    }
+  }
+  return { role: message.role, content, toolCalls, toolCallId };
 }
 
 export class SDKRpcClientWire extends SDKRpcClientBase {
@@ -278,6 +411,75 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
       metadata: input.metadata,
     });
     return wireSessionToSummary(forked);
+  }
+
+  // -----------------------------------------------------------------------
+  // Turns and state
+  //
+  // M1 scope note: the prompt route's `agent_id` is never sent, so every
+  // override below addresses the session's main agent regardless of
+  // `withInteractiveAgent` — subagent targeting arrives with the agents view.
+  // -----------------------------------------------------------------------
+
+  override async prompt(input: SessionPromptRpcInput): Promise<void> {
+    await this.http.submitPrompt(input.sessionId, {
+      content: input.input.map(toWireContent),
+      disabled_tools: input.disabledTools,
+    });
+  }
+
+  /**
+   * SDK steer = inject content into the running turn. The wire expresses this
+   * as submit-then-steer: the prompt queues behind the active turn and
+   * `prompts::steer` moves it in. On an idle session the submission starts a
+   * turn directly (v1's idle-steer-launches-a-turn semantics), so no steer
+   * call follows.
+   */
+  override async steer(input: SessionPromptRpcInput): Promise<void> {
+    const submitted = await this.http.submitPrompt(input.sessionId, {
+      content: input.input.map(toWireContent),
+    });
+    if (submitted.status === 'queued') {
+      await this.http.steerPrompts(input.sessionId, { prompt_ids: [submitted.prompt_id] });
+    }
+  }
+
+  override async cancel(input: SessionIdRpcInput): Promise<void> {
+    await this.http.sessionAction(input.sessionId, 'abort');
+  }
+
+  override async getStatus(input: SessionIdRpcInput): Promise<SessionStatus> {
+    return wireStatusToSessionStatus(await this.http.getSessionStatus(input.sessionId));
+  }
+
+  /**
+   * M1: the newest message page only (no `before_id` paging) with the live
+   * context token count from the status surface. The TUI's replay path (M4)
+   * will specify exactly what it needs; refine then.
+   */
+  override async getContext(input: SessionIdRpcInput): Promise<AgentContextData> {
+    const [{ items }, status] = await Promise.all([
+      this.http.getMessages(input.sessionId),
+      this.http.getSessionStatus(input.sessionId),
+    ]);
+    return { history: items.map(wireMessageToContextMessage), tokenCount: status.context_tokens };
+  }
+
+  override async getUsage(input: SessionIdRpcInput): Promise<SessionUsage> {
+    const session = await this.http.getSession(input.sessionId);
+    return wireUsageToSessionUsage(session.usage);
+  }
+
+  override async compact(input: SessionIdRpcInput & CompactOptions): Promise<void> {
+    await this.http.compactSession(input.sessionId, { instruction: input.instruction });
+  }
+
+  override async undoHistory(input: SessionIdRpcInput & { count: number }): Promise<void> {
+    await this.http.undoSession(input.sessionId, { count: input.count });
+  }
+
+  override async getSessionWarnings(input: SessionIdRpcInput) {
+    return this.http.getSessionWarnings(input.sessionId);
   }
 
   /**

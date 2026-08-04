@@ -1,7 +1,8 @@
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { ErrorCodes } from '@moonshot-ai/agent-core';
 import {
   startServer,
   type RunningServer,
@@ -12,7 +13,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { WireHttpClient } from '#/wire/http-client';
 import type { WireApprovalRequest, WireQuestionRequest } from '#/wire/protocol';
 import { InteractionBridge } from '#/wire/reverse-rpc';
-import { SDKRpcClientWire } from '#/wire/sdk-rpc-client-wire';
+import { SDKRpcClientWire, toWireContent } from '#/wire/sdk-rpc-client-wire';
 
 // ---------------------------------------------------------------------------
 // InteractionBridge — stub-based (no live server). The stub implements the
@@ -349,12 +350,31 @@ let home: string;
 let token: string;
 let base: string;
 // Real on-disk workspace root — session creation rejects a non-existent cwd
-// (server code 40409). The lifecycle tests below never start a turn, so no
-// stub-provider config.toml is needed.
+// (server code 40409).
 let cwd: string;
+
+// Minimal provider config so prompt submission is accepted (the turn tests
+// below submit prompts). The stub endpoint is unreachable — the turn fails
+// asynchronously, which the REST assertions do not depend on. Mirrors the
+// fixture in wire-rest.test.ts.
+const STUB_PROVIDER_TOML = [
+  'default_model = "stub"',
+  '',
+  '[providers.stub]',
+  'type = "openai"',
+  'base_url = "http://127.0.0.1:9999"',
+  'api_key = "stub"',
+  '',
+  '[models.stub]',
+  'provider = "stub"',
+  'model = "stub"',
+  'max_context_size = 1000',
+  '',
+].join('\n');
 
 beforeAll(async () => {
   home = await mkdtemp(join(tmpdir(), 'kimi-wire-client-'));
+  await writeFile(join(home, 'config.toml'), STUB_PROVIDER_TOML, 'utf-8');
   cwd = join(home, 'workspace');
   await mkdir(cwd);
   server = await startServer({
@@ -461,5 +481,129 @@ describe('SDKRpcClientWire lifecycle', () => {
 
   it('rejects a non-loopback serverUrl', () => {
     expect(() => new SDKRpcClientWire({ serverUrl: 'http://192.168.1.10:58627', token: 't' })).toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDKRpcClientWire turns and state — prompt/steer/cancel + status/history
+// reads against the live server (the stub provider makes every turn fail
+// asynchronously; the REST assertions below do not depend on turn output).
+// ---------------------------------------------------------------------------
+
+/** Async variant of `waitFor` — the condition itself performs HTTP reads. */
+async function waitForAsync(cond: () => Promise<boolean>, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await cond())) {
+    if (Date.now() > deadline) throw new Error('waitForAsync timed out');
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+describe('SDKRpcClientWire turns and state', () => {
+  it('prompts, steers, cancels, and reads status/context/usage/warnings', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    await rpc.resumeSession({ id: created.id });
+
+    await rpc.prompt({ sessionId: created.id, input: [{ type: 'text', text: 'hi' }] });
+
+    const status = await rpc.getStatus({ sessionId: created.id });
+    expect(status).toMatchObject({
+      thinkingEffort: expect.any(String),
+      permission: expect.any(String),
+      planMode: expect.any(Boolean),
+      swarmMode: expect.any(Boolean),
+      contextTokens: expect.any(Number),
+      maxContextTokens: expect.any(Number),
+      contextUsage: expect.any(Number),
+    });
+
+    const context = await rpc.getContext({ sessionId: created.id });
+    expect(context.tokenCount).toEqual(expect.any(Number));
+    expect(
+      context.history.some(
+        (m) => m.role === 'user' && m.content.some((p) => p.type === 'text' && p.text === 'hi'),
+      ),
+    ).toBe(true);
+
+    const usage = await rpc.getUsage({ sessionId: created.id });
+    expect(usage.total).toMatchObject({
+      inputOther: expect.any(Number),
+      output: expect.any(Number),
+      inputCacheRead: expect.any(Number),
+      inputCacheCreation: expect.any(Number),
+    });
+
+    // The stub endpoint refuses connections, so the first turn has already
+    // failed by now; this steer submits its own (also failing) turn.
+    await rpc.steer({ sessionId: created.id, input: [{ type: 'text', text: 'focus' }] });
+    await rpc.cancel({ sessionId: created.id });
+
+    const warnings = await rpc.getSessionWarnings({ sessionId: created.id });
+    expect(Array.isArray(warnings)).toBe(true);
+    await rpc.close();
+  });
+
+  it('undoes the last prompt over :undo', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const http = new WireHttpClient({ baseUrl: base, token });
+    const created = await rpc.createSession({ workDir: cwd });
+    await rpc.prompt({ sessionId: created.id, input: [{ type: 'text', text: 'undo me' }] });
+    // Wait for the async stub-provider failure to settle so the undo is
+    // deterministic.
+    await waitForAsync(async () => !(await http.getSession(created.id)).busy);
+    await rpc.undoHistory({ sessionId: created.id, count: 1 });
+    const context = await rpc.getContext({ sessionId: created.id });
+    expect(context.history.some((m) => m.role === 'user')).toBe(false);
+    await rpc.close();
+  });
+
+  it('routes compact to :compact and surfaces compaction.unable on an empty history', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    // A fresh session has no compactable prefix: the server maps
+    // `compaction.unable` onto envelope code 40910.
+    await expect(
+      rpc.compact({ sessionId: created.id, instruction: 'keep it short' }),
+    ).rejects.toMatchObject({ code: 40910 });
+    await rpc.close();
+  });
+
+  it('unimplemented methods fail loudly with not_implemented', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await expect(rpc.listPlugins()).rejects.toMatchObject({ code: ErrorCodes.NOT_IMPLEMENTED });
+    await rpc.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// toWireContent — the kosong PromptPart → protocol message content mapping
+// the prompt/steer submissions depend on. Pure unit tests (no live server).
+// ---------------------------------------------------------------------------
+
+describe('toWireContent', () => {
+  it('maps text parts verbatim', () => {
+    expect(toWireContent({ type: 'text', text: 'hi' })).toEqual({ type: 'text', text: 'hi' });
+  });
+
+  it('maps image/video URL parts to url-kind media sources, forwarding the file id', () => {
+    expect(
+      toWireContent({
+        type: 'image_url',
+        imageUrl: { url: 'https://example.com/a.png', id: 'file_1' },
+      }),
+    ).toEqual({
+      type: 'image',
+      source: { kind: 'url', url: 'https://example.com/a.png', id: 'file_1' },
+    });
+    expect(
+      toWireContent({ type: 'video_url', videoUrl: { url: 'https://example.com/v.mp4' } }),
+    ).toEqual({
+      type: 'video',
+      source: { kind: 'url', url: 'https://example.com/v.mp4', id: undefined },
+    });
   });
 });
