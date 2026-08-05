@@ -346,6 +346,65 @@ describe('CursorSupervisor', () => {
     await supervisor.close();
   });
 
+  it('adopts the announced cursor and dispatches onResync for a resync_required frame', async () => {
+    type SubscribeCall = {
+      session_ids: string[];
+      cursors?: Record<string, { seq: number; epoch?: string }>;
+    };
+    const subscribes: SubscribeCall[] = [];
+    const resynced: string[] = [];
+    let frameHandler: ((frame: WsIncomingFrame) => void) | undefined;
+    let closeHandler: ((info: { code: number; reason: string }) => void) | undefined;
+
+    class FakeWsConnection {
+      async connect() {
+        return { ws_connection_id: 'c', protocol_version: 2, max_event_buffer_size: 100 };
+      }
+      async sendControl<T>(type: string, payload: unknown): Promise<T> {
+        if (type === 'subscribe') subscribes.push(payload as SubscribeCall);
+        return { accepted: (payload as SubscribeCall).session_ids, not_found: [] } as T;
+      }
+      onFrame(handler: (frame: WsIncomingFrame) => void) {
+        frameHandler = handler;
+        return () => {
+          frameHandler = undefined;
+        };
+      }
+      onClose(handler: (info: { code: number; reason: string }) => void) {
+        closeHandler = handler;
+        return () => {
+          closeHandler = undefined;
+        };
+      }
+      async close() {}
+    }
+
+    const supervisor = new CursorSupervisor({
+      makeConnection: () => new FakeWsConnection() as never,
+      onResync: (sessionId) => resynced.push(sessionId),
+    });
+    await supervisor.start();
+    await supervisor.subscribe('s1', { seq: 0 });
+
+    frameHandler?.({
+      type: 'resync_required',
+      timestamp: '2026-07-30T00:00:00.000Z',
+      payload: {
+        session_id: 's1',
+        reason: 'buffer_overflow',
+        current_seq: 42,
+        epoch: 'e9',
+      },
+    });
+    expect(resynced).toEqual(['s1']);
+
+    // The adopted cursor rides the next reconnect's subscribe frame.
+    closeHandler?.({ code: 1006, reason: 'abnormal' });
+    await new Promise((resolve) => setTimeout(resolve, 1600)); // first backoff ≈1s
+    expect(subscribes.at(-1)).toEqual({ session_ids: ['s1'], cursors: { s1: { seq: 42, epoch: 'e9' } } });
+    await supervisor.close();
+  });
+
   it('closes the fresh socket when close() lands during the resubscribe round-trip', async () => {
     let resolveSubscribe: (() => void) | undefined;
     let connects = 0;

@@ -497,6 +497,43 @@ describe('InteractionBridge', () => {
     expect(approvalHandled).toEqual([]);
     expect(http.calls).toEqual([]);
   });
+
+  it('forgetSession only touches the named session — a second session keeps its dedupe and queue', async () => {
+    const http = createStubHttp();
+    const approvalHandled: unknown[] = [];
+    const bridge = new InteractionBridge({
+      http,
+      requestApproval: async (req) => {
+        approvalHandled.push(req);
+        return { decision: 'approved' };
+      },
+      requestQuestion: async () => null,
+      hasApprovalHandler: (sessionId) => sessionId === 's1',
+      hasQuestionHandler: () => true,
+    });
+    const approvalS1 = APPROVAL_WIRE;
+    const approvalS2 = { ...APPROVAL_WIRE, approval_id: 'a2', session_id: 's2' };
+
+    // s1 has a handler and fires immediately; s2 has none and queues.
+    bridge.replayPending('s1', { pending_approvals: [approvalS1], pending_questions: [] });
+    bridge.replayPending('s2', { pending_approvals: [approvalS2], pending_questions: [] });
+    await flush();
+    expect(approvalHandled.length).toBe(1);
+
+    bridge.forgetSession('s1');
+
+    // s2's dedupe survives: replaying the same item again must NOT re-fire it
+    // (it is still only queued, never delivered).
+    bridge.replayPending('s2', { pending_approvals: [approvalS2], pending_questions: [] });
+    await flush();
+    expect(approvalHandled.length).toBe(1);
+
+    // s2's queue survives too: flushing it delivers the original entry once.
+    bridge.flush('s2', 'approval');
+    await flush();
+    expect(approvalHandled.length).toBe(2);
+    expect(approvalHandled[1]).toMatchObject({ sessionId: 's2' });
+  });
 });
 
 // ---------------------------------------------------------------------------
