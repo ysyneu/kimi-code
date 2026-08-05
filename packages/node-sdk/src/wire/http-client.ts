@@ -123,9 +123,9 @@ export class WireHttpClient {
     return this.request('POST', `/sessions/${id}:undo`, body, z.unknown());
   }
 
-  /** Steer queued prompts into the active turn (the literal `prompts::steer` route). */
+  /** Steer queued prompts into the active turn (the literal `prompts:steer` route). */
   steerPrompts(id: string, body: { prompt_ids: readonly string[] }): Promise<unknown> {
-    return this.request('POST', `/sessions/${id}/prompts::steer`, body, z.unknown());
+    return this.request('POST', `/sessions/${id}/prompts:steer`, body, z.unknown());
   }
 
   async getSessionWarnings(id: string): Promise<WireSessionWarning[]> {

@@ -710,8 +710,9 @@ describe('SDKRpcClientWire turns and state', () => {
       inputCacheCreation: expect.any(Number),
     });
 
-    // The stub endpoint refuses connections, so the first turn has already
-    // failed by now; this steer submits its own (also failing) turn.
+    // The stub endpoint refuses connections but the first turn is still in its
+    // retry backoff by now, so the steer submission queues and is steered into
+    // the active turn through the `prompts:steer` route.
     await rpc.steer({ sessionId: created.id, input: [{ type: 'text', text: 'focus' }] });
     await rpc.cancel({ sessionId: created.id });
 
@@ -726,8 +727,10 @@ describe('SDKRpcClientWire turns and state', () => {
     const http = new WireHttpClient({ baseUrl: base, token });
     const created = await rpc.createSession({ workDir: cwd });
     await rpc.prompt({ sessionId: created.id, input: [{ type: 'text', text: 'undo me' }] });
-    // Wait for the async stub-provider failure to settle so the undo is
+    // The stub provider's turn now retries instead of dying instantly — abort
+    // it (the retry sleep is abortable) and wait for the settle so the undo is
     // deterministic.
+    await rpc.cancel({ sessionId: created.id });
     await waitForAsync(async () => !(await http.getSession(created.id)).busy);
     await rpc.undoHistory({ sessionId: created.id, count: 1 });
     const context = await rpc.getContext({ sessionId: created.id });

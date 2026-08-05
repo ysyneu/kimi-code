@@ -19,7 +19,7 @@
  *   lifetime.
  * - `deleteSession` maps to `:archive` (the wire's only session-removal verb).
  * - Turns and state reads map onto the prompts / status / messages REST
- *   surface: `steer` is submit-then-`prompts::steer`, `cancel` is `:abort`,
+ *   surface: `steer` is submit-then-`prompts:steer`, `cancel` is `:abort`,
  *   `compact` / `undoHistory` are `:compact` / `:undo`, and `getContext`
  *   serves the newest message page only. `agent_id` is never sent — every
  *   turn override addresses the main agent (M1).
@@ -477,7 +477,7 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
   /**
    * SDK steer = inject content into the running turn. The wire expresses this
    * as submit-then-steer: the prompt queues behind the active turn and
-   * `prompts::steer` moves it in. On an idle session the submission starts a
+   * `prompts:steer` moves it in. On an idle session the submission starts a
    * turn directly (v1's idle-steer-launches-a-turn semantics), so no steer
    * call follows.
    */
