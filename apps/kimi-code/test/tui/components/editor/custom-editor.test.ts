@@ -116,6 +116,54 @@ describe('CustomEditor onNonEscapeInput', () => {
   });
 });
 
+describe('CustomEditor onLeftArrowEmpty', () => {
+  const LEFT = '\u001B[D';
+
+  it('consumes ← on an empty editor when the handler returns true', () => {
+    const editor = makeEditor();
+    const onLeftArrowEmpty = vi.fn(() => true);
+    editor.onLeftArrowEmpty = onLeftArrowEmpty;
+
+    editor.handleInput(LEFT);
+
+    expect(onLeftArrowEmpty).toHaveBeenCalledOnce();
+    expect(editor.getText()).toBe('');
+  });
+
+  it('falls through when the handler returns false', () => {
+    const editor = makeEditor();
+    const onLeftArrowEmpty = vi.fn(() => false);
+    editor.onLeftArrowEmpty = onLeftArrowEmpty;
+
+    // Must not throw or corrupt the buffer; the editor stays empty.
+    editor.handleInput(LEFT);
+
+    expect(onLeftArrowEmpty).toHaveBeenCalledOnce();
+    expect(editor.getText()).toBe('');
+  });
+
+  it('keeps cursor semantics on a non-empty editor (handler not called)', () => {
+    const editor = makeEditor();
+    const onLeftArrowEmpty = vi.fn(() => true);
+    editor.onLeftArrowEmpty = onLeftArrowEmpty;
+    editor.setText('ab');
+    expect(editor.getCursor()).toEqual({ line: 0, col: 2 });
+
+    editor.handleInput(LEFT);
+
+    expect(onLeftArrowEmpty).not.toHaveBeenCalled();
+    expect(editor.getCursor()).toEqual({ line: 0, col: 1 });
+  });
+
+  it('is a no-op on an empty editor without a handler', () => {
+    const editor = makeEditor();
+
+    editor.handleInput(LEFT);
+
+    expect(editor.getText()).toBe('');
+  });
+});
+
 describe('CustomEditor slash argument completion refresh', () => {
   it('reopens /add-dir directory completions after tab completion and entering slash', async () => {
     const editor = makeEditor();

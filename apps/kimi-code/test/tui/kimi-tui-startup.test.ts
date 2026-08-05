@@ -1884,6 +1884,7 @@ describe('KimiTUI startup', () => {
 describe('KimiTUI agents-view attach', () => {
   interface AttachDriver extends StartupDriver {
     onOpenSession(id: string): void;
+    returnToAgentsView(): boolean;
     agentsViewController: { show(): Promise<void> };
     resumeSession(id: string): Promise<boolean>;
     session: { id: string } | undefined;
@@ -2050,6 +2051,54 @@ describe('KimiTUI agents-view attach', () => {
     );
     expect(harness.resumeSession).not.toHaveBeenCalled();
     expect(driver.state.appState.sessionId).toBe('ses-1');
+  });
+
+  // ── M4 Task 4: ← return-to-view + attach footer badge ──
+
+  it('returnToAgentsView remounts the view over the live roster and clears the badge', async () => {
+    const session = makeAttachSession('ses-attached');
+    const { harness, emit } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+    driver.onOpenSession('ses-attached');
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    const view = driver.state.agentsView;
+    expect(view?.detached).toBe(true);
+
+    // Live counts reach the footer badge while attached.
+    emit({
+      type: 'event.session.work_changed',
+      sessionId: 'ses-attached',
+      busy: true,
+      pending_interaction: 'none',
+    } as Event);
+    expect(driver.state.footer.render(120)[0]).toContain('[← 1 agent]');
+
+    expect(driver.returnToAgentsView()).toBe(true);
+
+    // Same component remounted, roster state survived, badge cleared.
+    expect(view?.detached).toBe(false);
+    expect(driver.state.ui.children).toContain(view?.component);
+    expect(view?.roster.counts().working).toBe(1);
+    expect(driver.state.footer.render(120)[0]).not.toContain('←');
+  });
+
+  it('returnToAgentsView is a no-op outside attach (view mounted or normal mode)', async () => {
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+
+    // View mounted (not attached): the key must fall through.
+    expect(driver.returnToAgentsView()).toBe(false);
+    expect(driver.state.agentsView?.detached).toBe(false);
+
+    // Normal mode: zero behavior change.
+    const plainSession = makeSession();
+    const plainDriver = makeDriver(makeHarness(plainSession), makeStartupInput()) as unknown as AttachDriver;
+    await plainDriver.init();
+    expect(plainDriver.returnToAgentsView()).toBe(false);
   });
 });
 

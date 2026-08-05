@@ -13,6 +13,7 @@ import type { CustomEditor } from '@/tui/components/editor/custom-editor';
 import {
   AgentsViewController,
   dispatchSlashCommands,
+  hintDeferredPermissionOnce,
   type AgentsViewHost,
   type AgentsViewState,
 } from '@/tui/controllers/agents-view';
@@ -158,6 +159,7 @@ interface Boot {
   ui: FakeUI;
   showError: ReturnType<typeof vi.fn>;
   showStatus: ReturnType<typeof vi.fn>;
+  setAttachBadge: ReturnType<typeof vi.fn>;
   view(): AgentsViewState;
   component(): AgentsViewApp;
   render(): string;
@@ -198,6 +200,7 @@ async function boot(
   };
   const showError = vi.fn();
   const showStatus = vi.fn();
+  const setAttachBadge = vi.fn();
   const host: AgentsViewHost = {
     state,
     harness: fake.harness,
@@ -208,6 +211,7 @@ async function boot(
     },
     agentsViewServerLabel: () => 'test-server',
     agentsViewWorkDir: () => '/home/user/project',
+    setAttachBadge,
     onOpenSession: opts.onOpenSession,
   };
   const controller = new AgentsViewController(host);
@@ -220,6 +224,7 @@ async function boot(
     ui,
     showError,
     showStatus,
+    setAttachBadge,
     view: () => {
       const view = state.agentsView;
       if (view === undefined) throw new Error('agents view is not mounted');
@@ -1008,5 +1013,131 @@ describe('AgentsViewController — detach for attach', () => {
     const out = b.render();
     expect(out).toContain('Working');
     expect(out).toContain('s1 title');
+  });
+});
+
+
+// ── M4 Task 4: attach footer badge feed + deferred-permission hint ──
+
+describe('AgentsViewController — attach badge feed', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    dir = undefined;
+  });
+
+  it('detachForAttach pushes the current roster counts as the initial badge', async () => {
+    const b = await boot([summary('s1'), summary('s2')]);
+    dir = b.homeDir;
+    b.fake.emit({
+      type: 'event.session.work_changed',
+      sessionId: 's1',
+      busy: true,
+      pending_interaction: 'none',
+    });
+    b.setAttachBadge.mockClear();
+
+    b.controller.detachForAttach();
+
+    expect(b.setAttachBadge).toHaveBeenCalledTimes(1);
+    expect(b.setAttachBadge).toHaveBeenLastCalledWith({ agents: 1, awaiting: 0 });
+  });
+
+  it('roster events while detached keep pushing live counts', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.controller.detachForAttach();
+    b.setAttachBadge.mockClear();
+
+    b.fake.emit({
+      type: 'event.session.work_changed',
+      sessionId: 's1',
+      busy: false,
+      pending_interaction: 'approval',
+    });
+
+    expect(b.setAttachBadge).toHaveBeenLastCalledWith({ agents: 0, awaiting: 1 });
+  });
+
+  it('does not push the badge while the view is mounted (it renders counts itself)', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.setAttachBadge.mockClear();
+
+    b.fake.emit({
+      type: 'event.session.work_changed',
+      sessionId: 's1',
+      busy: true,
+      pending_interaction: 'none',
+    });
+
+    expect(b.setAttachBadge).not.toHaveBeenCalled();
+  });
+
+  it('returning to the view (remount) clears the badge', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.controller.detachForAttach();
+    b.setAttachBadge.mockClear();
+
+    await b.controller.show();
+
+    expect(b.view().detached).toBe(false);
+    expect(b.setAttachBadge).toHaveBeenCalledTimes(1);
+    expect(b.setAttachBadge).toHaveBeenLastCalledWith(undefined);
+  });
+});
+
+describe('hintDeferredPermissionOnce', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    dir = undefined;
+  });
+
+  it('stays silent while the view is mounted (not attached)', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+
+    hintDeferredPermissionOnce(b.host);
+
+    expect(b.showStatus).not.toHaveBeenCalled();
+  });
+
+  it('shows the hint once per attach, then never again for that attach', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.controller.detachForAttach();
+
+    hintDeferredPermissionOnce(b.host);
+    hintDeferredPermissionOnce(b.host);
+
+    expect(b.showStatus).toHaveBeenCalledTimes(1);
+    expect(b.showStatus).toHaveBeenCalledWith('Permission mode applies to the next prompt.');
+  });
+
+  it('re-arms on the next attach (detachForAttach resets the flag)', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.controller.detachForAttach();
+    hintDeferredPermissionOnce(b.host);
+    expect(b.showStatus).toHaveBeenCalledTimes(1);
+
+    // Return to the view, then attach again.
+    await b.controller.show();
+    b.controller.detachForAttach();
+    hintDeferredPermissionOnce(b.host);
+
+    expect(b.showStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it('stays silent when there is no agents view at all', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.controller.close();
+
+    hintDeferredPermissionOnce(b.host);
+
+    expect(b.showStatus).not.toHaveBeenCalled();
   });
 });

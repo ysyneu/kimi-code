@@ -15,6 +15,7 @@ interface Harness {
   readonly cancelCompaction: ReturnType<typeof vi.fn>;
   readonly btwCancelRunning: ReturnType<typeof vi.fn>;
   readonly btwCloseOrCancel: ReturnType<typeof vi.fn>;
+  readonly returnToAgentsView: ReturnType<typeof vi.fn>;
 }
 
 function createHarness(options: { streamingPhase?: string; isCompacting?: boolean } = {}): Harness {
@@ -29,6 +30,7 @@ function createHarness(options: { streamingPhase?: string; isCompacting?: boolea
   const cancelCompaction = vi.fn(async () => {});
   const btwCancelRunning = vi.fn(() => false);
   const btwCloseOrCancel = vi.fn(() => false);
+  const returnToAgentsView = vi.fn(() => false);
   const session = { cancel: vi.fn(async () => {}), cancelCompaction };
 
   const host = {
@@ -46,6 +48,7 @@ function createHarness(options: { streamingPhase?: string; isCompacting?: boolea
     btwPanelController: { cancelRunning: btwCancelRunning, closeOrCancel: btwCloseOrCancel },
     openUndoSelector,
     cancelRunningShellCommand,
+    returnToAgentsView,
   } as unknown as EditorKeyboardHost;
 
   const controller = new EditorKeyboardController(
@@ -62,6 +65,7 @@ function createHarness(options: { streamingPhase?: string; isCompacting?: boolea
     cancelCompaction,
     btwCancelRunning,
     btwCloseOrCancel,
+    returnToAgentsView,
   };
 }
 
@@ -283,5 +287,29 @@ describe('EditorKeyboardController shell history recall', () => {
     restore('prompt');
 
     expect(editor['setInputMode'] as unknown as Mock).toHaveBeenCalledWith('prompt');
+  });
+});
+
+
+// ── M4 Task 4: ← on an empty editor returns to the agents view ──
+
+describe('EditorKeyboardController onLeftArrowEmpty', () => {
+  it('delegates to the host and consumes the key when the host returns true', () => {
+    const { editor, returnToAgentsView } = createHarness();
+    returnToAgentsView.mockReturnValue(true);
+    const handler = editor['onLeftArrowEmpty'] as unknown as () => boolean;
+    expect(handler).toBeDefined();
+
+    expect(handler()).toBe(true);
+    expect(returnToAgentsView).toHaveBeenCalledOnce();
+  });
+
+  it('falls through (returns false) when the host is not in agents-attach mode', () => {
+    const { editor, returnToAgentsView } = createHarness();
+    returnToAgentsView.mockReturnValue(false);
+    const handler = editor['onLeftArrowEmpty'] as unknown as () => boolean;
+
+    expect(handler()).toBe(false);
+    expect(returnToAgentsView).toHaveBeenCalledOnce();
   });
 });

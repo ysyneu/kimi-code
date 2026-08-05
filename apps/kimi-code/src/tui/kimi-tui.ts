@@ -1519,6 +1519,28 @@ export class KimiTUI {
     void this.attachAgentsViewSession(targetSessionId);
   }
 
+  /**
+   * Agents-view return (EditorKeyboardHost, Task 4): ← on an empty editor in
+   * agents mode re-mounts the detached view over the still-attached session —
+   * a pure view operation; the server-side turn keeps running. Returns false
+   * outside agents mode or when the view is not detached, so the key falls
+   * through to normal cursor semantics (zero behavior change in normal mode).
+   */
+  returnToAgentsView(): boolean {
+    const view = this.state.agentsView;
+    if (this.state.startupState !== 'agents-view' || view === undefined || !view.detached) {
+      return false;
+    }
+    void this.agentsViewController.show();
+    return true;
+  }
+
+  /** AgentsViewHost (Task 4): attach-mode footer badge feed; undefined clears it. */
+  setAttachBadge(counts: { agents: number; awaiting: number } | undefined): void {
+    this.state.footer.setAttachCounts(counts ?? { agents: 0, awaiting: 0 });
+    this.state.ui.requestRender();
+  }
+
   appendStartupNotice(extra: string): void {
     this.startupNotice = combineStartupNotice(this.startupNotice, extra);
   }

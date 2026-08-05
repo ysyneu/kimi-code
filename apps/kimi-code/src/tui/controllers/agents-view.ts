@@ -32,6 +32,11 @@ export interface AgentsViewHost {
   agentsViewServerLabel(): string;
   /** Dispatch target: every session created from the view opens in this cwd. */
   agentsViewWorkDir(): string;
+  /**
+   * Attach-mode footer badge feed (Task 4): live roster counts while
+   * detached; `undefined` clears the badge (return / close).
+   */
+  setAttachBadge(counts: { agents: number; awaiting: number } | undefined): void;
   /** Attach seam (M4): KimiTUI implements it; without it Enter shows a placeholder. */
   onOpenSession?(id: string): void;
 }
@@ -50,6 +55,13 @@ export interface AgentsViewState {
    * component without a reload.
    */
   detached: boolean;
+  /**
+   * One-time-per-attach flag for the deferred-permission hint (Task 4): the
+   * wire transport carries a stashed setPermission on the NEXT prompt, so the
+   * first user-initiated mode change per attach earns a status hint. Reset by
+   * detachForAttach. Read via {@link hintDeferredPermissionOnce}.
+   */
+  permissionHintShown: boolean;
   /** Focus split between the roster list and the dispatch editor. */
   dispatchFocused: boolean;
   selectedId: string | undefined;
@@ -224,6 +236,7 @@ export class AgentsViewController {
       pins,
       dispatch,
       detached: false,
+      permissionHintShown: false,
       dispatchFocused: false,
       selectedId: undefined,
       peek: undefined,
@@ -255,6 +268,7 @@ export class AgentsViewController {
     }
     view.eventUnsubscribe();
     if (view.flashTimer !== undefined) clearTimeout(view.flashTimer);
+    this.host.setAttachBadge(undefined);
 
     state.ui.clear();
     for (const child of view.savedChildren) {
@@ -275,6 +289,8 @@ export class AgentsViewController {
     const view = state.agentsView;
     if (view === undefined || view.detached) return;
     view.detached = true;
+    // Each attach re-arms the one-time deferred-permission hint (Task 4).
+    view.permissionHintShown = false;
     if (view.flashTimer !== undefined) {
       clearTimeout(view.flashTimer);
       view.flashTimer = undefined;
@@ -287,6 +303,8 @@ export class AgentsViewController {
     }
     state.ui.setFocus(state.editor);
     state.ui.requestRender(true);
+    // Seed the attach-mode footer badge with the current roster counts.
+    this.pushAttachBadge(view);
   }
 
   /** Return-from-attach remount: same component, same roster, no reload. */
@@ -298,6 +316,8 @@ export class AgentsViewController {
     state.ui.addChild(view.component);
     state.ui.setFocus(view.component);
     this.pushProps();
+    // Back on the view: its own rows show the counts — the badge goes away.
+    this.host.setAttachBadge(undefined);
     state.ui.requestRender(true);
   }
 
@@ -394,6 +414,15 @@ export class AgentsViewController {
     if (!GLOBAL_EVENT_TYPES.has(event.type)) return;
     view.roster.applyEvent(event);
     this.pushProps();
+    // While attached the component is unmounted, but the footer badge still
+    // reads live roster counts (the subscription survived the detach).
+    if (view.detached) this.pushAttachBadge(view);
+  }
+
+  /** Pushes the live roster counts to the attach-mode footer badge. */
+  private pushAttachBadge(view: AgentsViewState): void {
+    const counts = view.roster.counts();
+    this.host.setAttachBadge({ agents: counts.working, awaiting: counts.awaiting });
   }
 
   private buildProps(view: {
@@ -697,4 +726,23 @@ function wireRpcOf(harness: KimiHarness): SDKRpcClientWire | undefined {
   // then checked with instanceof before any use.
   const rpc: unknown = (harness as unknown as { readonly rpc?: unknown }).rpc;
   return rpc instanceof SDKRpcClientWire ? rpc : undefined;
+}
+
+/**
+ * Deferred-permission hint (Task 4): on the wire transport setPermission is
+ * stashed and rides the NEXT prompt's submission body (M4-T1), so the first
+ * user-initiated permission-mode change per attach earns a one-time status
+ * hint. The per-attach flag lives on {@link AgentsViewState.permissionHintShown}
+ * (reset by detachForAttach). `detached` is the "attached to a session"
+ * marker — `isOpen` stays true while detached (M3-T3 handoff), so mount
+ * checks must look at `detached`, not at the state's presence.
+ */
+export function hintDeferredPermissionOnce(host: {
+  readonly state: { readonly agentsView: AgentsViewState | undefined };
+  showStatus(msg: string): void;
+}): void {
+  const view = host.state.agentsView;
+  if (view === undefined || !view.detached || view.permissionHintShown) return;
+  view.permissionHintShown = true;
+  host.showStatus('Permission mode applies to the next prompt.');
 }

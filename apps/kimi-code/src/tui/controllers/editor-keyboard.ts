@@ -50,6 +50,12 @@ export interface EditorKeyboardHost {
   cancelRunningShellCommand(): void;
   hideSessionPicker(): void;
   openUndoSelector(): void;
+  /**
+   * Agents-view attach (M4): ← on an empty editor asks the host to return to
+   * the agents view. Return `true` when the return happened (agents mode +
+   * view detached); `false` leaves the key to its normal cursor semantics.
+   */
+  returnToAgentsView(): boolean;
   stop(exitCode?: number): Promise<void>;
   handlePlanToggle(next: boolean): void;
   handleInputModeChange(mode: 'prompt' | 'bash'): void;
@@ -353,6 +359,8 @@ export class EditorKeyboardController {
     };
 
     editor.onDownArrowEmpty = () => host.btwPanelController.scroll('down');
+
+    editor.onLeftArrowEmpty = () => host.returnToAgentsView();
 
     editor.onPasteImage = async () => this.handleClipboardImagePaste();
   }

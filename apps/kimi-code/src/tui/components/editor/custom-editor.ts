@@ -143,6 +143,12 @@ export class CustomEditor extends Editor {
    */
   public onUpArrowEmpty?: () => boolean;
   public onDownArrowEmpty?: () => boolean;
+  /**
+   * Called when ← is pressed in an empty editor. Return `true` to consume
+   * the key (e.g. agents-view attach: return to the view); return `false`
+   * to fall through to the editor default (a no-op on an empty buffer).
+   */
+  public onLeftArrowEmpty?: () => boolean;
   public onShiftTab?: () => void;
   /** 'bash' when entering a `!` shell command. The `!` is never part of the
    *  text buffer — it is a separate mode + prompt symbol (see handleInput). */
@@ -488,6 +494,13 @@ export class CustomEditor extends Editor {
     if (matchesKey(normalized, Key.down)) {
       if (this.getText().length === 0 && this.onDownArrowEmpty) {
         if (this.onDownArrowEmpty()) return;
+      }
+    }
+
+    if (matchesKey(normalized, Key.left)) {
+      if (this.getText().length === 0 && this.onLeftArrowEmpty) {
+        if (this.onLeftArrowEmpty()) return;
+        // fall through: on an empty buffer pi-tui's cursor-left is a no-op
       }
     }
 
