@@ -133,7 +133,7 @@ In `stream-json` mode, regular replies produce an Assistant message; when the mo
 
 ## Subcommands
 
-`kimi` provides the following subcommands: `login` (non-interactive login), `acp` (ACP IDE mode), `web` (run the local REST/WebSocket/web service in the foreground and open the web UI), `doctor` (validate configuration files), `export` (export a session), `migrate` (migrate legacy data), `upgrade` (check for updates), and `provider` (manage providers).
+`kimi` provides the following subcommands: `login` (non-interactive login), `acp` (ACP IDE mode), `web` (run the local REST/WebSocket/web service in the foreground and open the web UI), `agents` (open the agents view to dispatch and monitor sessions on the local Kimi server), `doctor` (validate configuration files), `export` (export a session), `migrate` (migrate legacy data), `upgrade` (check for updates), and `provider` (manage providers).
 
 ### `kimi login`
 
@@ -194,6 +194,43 @@ Deprecated — only stops a server started by a version before 0.28.0. Those ver
 #### `kimi web rotate-token`
 
 Generate a new persistent bearer token (written to `~/.kimi-code/server.token`); the previous token stops working immediately. The token is shared by the whole home directory, so every running instance picks the new one up on its next auth check — no restart needed.
+
+### `kimi agents`
+
+Open the agents view — a full-screen terminal dashboard over the local Kimi server. It lists every session on the server grouped by live status (Awaiting input / Working / Pinned / Completed), updates as sessions make progress or ask for input, and dispatches new sessions from an input box at the bottom, so you can run and supervise many sessions at once without leaving the terminal.
+
+```sh
+kimi agents
+```
+
+This subcommand has no flags.
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` or `j` / `k` | Move the selection |
+| `Enter` | Attach the full chat UI for the selected session; on a group header, collapse or expand the group |
+| `←` | Return to the agents view (from an attached chat, with an empty editor) |
+| `Space` | Peek at the session's latest output; while peeking, type to draft an inline reply and press `Enter` to send it; `Esc` closes the peek |
+| `Ctrl-X` | Archive the selected session (press twice to confirm); on a group header, archive the whole group. A session's running turn is cancelled first |
+| `Ctrl-R` | Rename the session |
+| `Ctrl-T` | Pin or unpin the session; pinned sessions move to the Pinned group |
+| `?` | Show the shortcut list |
+| `q` or `Esc` | Quit |
+
+The bottom input box dispatches a new session in the current working directory: typing any text focuses the box, and `Enter` creates the session with that text as its first prompt. Two slash commands are available there as prefixes — `/model <alias>` and `/agent <profile>` stage a model or agent override for the new session's first prompt (e.g. `/agent reviewer Review the changes on this branch`); `/help` shows its help.
+
+#### Server Lifecycle
+
+The agents view talks to a local Kimi server on this machine only:
+
+- **Attach**: when a server is already running for the same home directory (for example one started by `kimi web`), the view connects to it. The server must run the same version as this CLI; a mismatch is refused with a restart hint. Quitting only disconnects — the server and its sessions keep running.
+- **Embed**: when no server is running, `kimi agents` starts one in-process. Quitting shuts that server down, so if sessions are still running a confirmation appears (`y` confirms, any other key cancels, and the prompt cancels itself after a timeout). Interrupted sessions are saved and can be resumed by running `kimi agents` again.
+
+#### Limitations
+
+- Sessions created or attached from the agents view run on the server's engine; they cannot be reopened with `kimi --resume` — re-enter them through `kimi agents`.
+- The list only shows sessions on the local Kimi server; sessions started with the plain `kimi` command do not appear.
+- Inside the view, `!` shell commands are disabled, and skill and plugin slash commands are unavailable.
 
 ### `kimi doctor`
 

@@ -133,7 +133,7 @@ kimi -p "List changed files" --output-format stream-json
 
 ## 子命令
 
-`kimi` 提供以下子命令：`login`（非交互式登录）、`acp`（ACP IDE 模式）、`web`（前台运行本地 REST/WebSocket/web 服务并打开 web UI）、`doctor`（校验配置文件）、`export`（导出会话）、`migrate`（迁移旧版数据）、`upgrade`（检查更新）、`provider`（管理供应商）。
+`kimi` 提供以下子命令：`login`（非交互式登录）、`acp`（ACP IDE 模式）、`web`（前台运行本地 REST/WebSocket/web 服务并打开 web UI）、`agents`（打开 Agents 视图，在本地 Kimi 服务上派发和看护会话）、`doctor`（校验配置文件）、`export`（导出会话）、`migrate`（迁移旧版数据）、`upgrade`（检查更新）、`provider`（管理供应商）。
 
 ### `kimi login`
 
@@ -194,6 +194,43 @@ kimi web --port 58628    # 指定绑定端口
 #### `kimi web rotate-token`
 
 生成新的持久化 bearer token（写入 `~/.kimi-code/server.token`），旧 token 立即失效。token 是整个 home 目录共享的，所有运行中的实例会在下一次鉴权校验时自动换用新 token，无需重启。
+
+### `kimi agents`
+
+打开 Agents 视图 —— 一个基于本地 Kimi 服务的全屏终端仪表盘。它按实时状态把服务上的所有会话分组列出（Awaiting input / Working / Pinned / Completed），会话有进展或等待输入时实时更新，底部输入框可以直接派发新会话，让你不用离开终端就能同时运行和看护多个会话。
+
+```sh
+kimi agents
+```
+
+该子命令没有任何 flag。
+
+| 按键 | 作用 |
+| --- | --- |
+| `↑` / `↓` 或 `j` / `k` | 移动选择 |
+| `Enter` | 进入所选会话的完整聊天界面；在分组标题上折叠 / 展开分组 |
+| `←` | 返回 Agents 视图（在已接入的聊天中、输入框为空时） |
+| `Space` | 快速查看（peek）会话的最新输出；查看时直接输入可起草一条内联回复，`Enter` 发送，`Esc` 关闭查看 |
+| `Ctrl-X` | 归档所选会话（需按两次确认）；在分组标题上归档整组。会话若有正在运行的轮次会先被取消 |
+| `Ctrl-R` | 重命名会话 |
+| `Ctrl-T` | 置顶 / 取消置顶会话；置顶的会话进入 Pinned 分组 |
+| `?` | 显示快捷键列表 |
+| `q` 或 `Esc` | 退出 |
+
+底部输入框用于在当前工作目录派发新会话：输入任意文本即聚焦输入框，`Enter` 会以该文本作为首条提示词创建会话。输入框支持两个斜杠命令前缀 —— `/model <别名>` 和 `/agent <profile>` 会为新会话的首条提示词指定模型或 Agent 覆盖（如 `/agent reviewer 审查这个分支的改动`）；`/help` 显示帮助。
+
+#### 服务生命周期
+
+Agents 视图只连接本机上的本地 Kimi 服务：
+
+- **接入已有服务**：当同一 home 目录下已有服务在运行（例如由 `kimi web` 启动），视图会直接接入。服务版本必须与当前 CLI 一致，不一致会被拒绝并提示重启。退出只是断开连接 —— 服务和其中的会话继续运行。
+- **内嵌服务**：没有服务在运行时，`kimi agents` 会在进程内启动一个。退出会关闭该服务，因此如果仍有会话在运行，会弹出确认（`y` 确认，其他任意键取消，超时自动取消）。被中断的会话已保存，重新运行 `kimi agents` 即可恢复。
+
+#### 限制
+
+- 从 Agents 视图创建或接入的会话运行在服务端引擎上，不能用 `kimi --resume` 重新打开 —— 请通过 `kimi agents` 再次进入。
+- 列表只显示本地 Kimi 服务上的会话；直接用 `kimi` 命令启动的会话不会出现在列表中。
+- 在视图内，`!` shell 命令不可用，skill 和插件斜杠命令也不可用。
 
 ### `kimi doctor`
 
