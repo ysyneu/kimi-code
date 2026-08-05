@@ -10,6 +10,7 @@ import { BannerProvider } from '#/tui/banner/banner-provider';
 import { readBannerDisplayState } from '#/tui/banner/state';
 import { handleLoginCommand, handleLogoutCommand } from '#/tui/commands/auth';
 import { promptPlatformSelection, promptLogoutProviderSelection } from '#/tui/commands/prompts';
+import { AgentsExitConfirmComponent } from '#/tui/components/agents-view/exit-confirm';
 import { BannerComponent } from '#/tui/components/chrome/banner';
 import { WelcomeComponent } from '#/tui/components/chrome/welcome';
 import { KimiTUI, type KimiTUIStartupInput, type TUIState } from '#/tui/kimi-tui';
@@ -2126,3 +2127,182 @@ function uiContainsFooter(driver: StartupDriver): boolean {
   };
   return visit(driver.state.ui);
 }
+
+
+// ── M4 Task 5: agents-view exit confirmation (embedded server) ──
+
+describe('KimiTUI agents-view exit confirmation', () => {
+  interface ExitConfirmDriver extends StartupDriver {
+    setAgentsView(value: unknown): void;
+    agentsViewController: { show(): Promise<void>; close(): void };
+    onExit?: (code?: number) => Promise<void>;
+  }
+
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  function makeExitHarness() {
+    const homeDir = mkdtempSync(join(tmpdir(), 'kimi-agents-exit-'));
+    dirs.push(homeDir);
+    return makeHarness(makeSession(), {
+      homeDir,
+      onEvent: () => () => {},
+    });
+  }
+
+  function findConfirm(driver: StartupDriver): AgentsExitConfirmComponent | undefined {
+    return driver.state.ui.children.find(
+      (child): child is AgentsExitConfirmComponent =>
+        child instanceof AgentsExitConfirmComponent,
+    );
+  }
+
+  /** Boots into the agents view with the stop()-shutdown I/O stubbed. */
+  async function bootAgentsView(guard: (() => Promise<number>) | undefined) {
+    const harness = makeExitHarness();
+    const driver = makeDriver(harness, {
+      ...makeStartupInput(),
+      startupAgentsView: true,
+      agentsViewExitGuard: guard,
+    }) as unknown as ExitConfirmDriver;
+    await driver.init();
+    expect(driver.state.startupState).toBe('agents-view');
+    // pi-tui stop/drain touch the real TTY — stub the shutdown I/O.
+    vi.spyOn(driver.state.ui, 'stop').mockImplementation(() => {});
+    vi.spyOn(driver.state.terminal, 'drainInput').mockImplementation(async () => {});
+    driver.onExit = vi.fn(async () => {});
+    await driver.agentsViewController.show();
+    expect(driver.state.agentsView).toBeDefined();
+    return { harness, driver };
+  }
+
+  it('embedded + running sessions: y confirms the interruption and shutdown proceeds', async () => {
+    const guard = vi.fn(async () => 3);
+    const { harness, driver } = await bootAgentsView(guard);
+
+    const stopPromise = driver.stop(0);
+    await vi.waitFor(() => {
+      expect(findConfirm(driver)).toBeDefined();
+    });
+
+    findConfirm(driver)?.handleInput('y');
+    await stopPromise;
+
+    expect(guard).toHaveBeenCalledOnce();
+    expect(harness.close).toHaveBeenCalledOnce();
+    expect(driver.onExit).toHaveBeenCalledWith(0);
+  });
+
+  it('declining keeps the TUI alive and the view mounted; a later stop re-asks', async () => {
+    const guard = vi.fn(async () => 2);
+    const { harness, driver } = await bootAgentsView(guard);
+    const view = driver.state.agentsView;
+    // Spied after the boot mount: a decline must not rebuild anything.
+    const show = vi.spyOn(driver.agentsViewController, 'show');
+
+    const first = driver.stop(0);
+    await vi.waitFor(() => {
+      expect(findConfirm(driver)).toBeDefined();
+    });
+    findConfirm(driver)?.handleInput('n');
+    await first;
+
+    expect(harness.close).not.toHaveBeenCalled();
+    expect(driver.onExit).not.toHaveBeenCalled();
+    expect(driver.state.agentsView).toBe(view);
+    expect(driver.state.ui.children).toContain(view?.component);
+    expect(view?.component.focused).toBe(true);
+    expect(show).not.toHaveBeenCalled();
+
+    // Fully reversible: quitting again re-asks from scratch.
+    const second = driver.stop(0);
+    await vi.waitFor(() => {
+      expect(findConfirm(driver)).toBeDefined();
+    });
+    findConfirm(driver)?.handleInput('y');
+    await second;
+    expect(harness.close).toHaveBeenCalledOnce();
+    expect(driver.onExit).toHaveBeenCalledWith(0);
+  });
+
+  it('declining on the Esc/q quit path (view already closed) rebuilds the view', async () => {
+    const guard = vi.fn(async () => 1);
+    const { harness, driver } = await bootAgentsView(guard);
+    const show = vi.spyOn(driver.agentsViewController, 'show');
+
+    // The production quit path: controller.close() → setAgentsView(undefined)
+    // → stop(). The confirm must gate BEFORE the shutdown sequence, and a
+    // decline puts the user back in the view.
+    driver.agentsViewController.close();
+    await vi.waitFor(() => {
+      expect(findConfirm(driver)).toBeDefined();
+    });
+    expect(driver.state.agentsView).toBeUndefined();
+
+    findConfirm(driver)?.handleInput('n');
+
+    await vi.waitFor(() => {
+      expect(driver.state.agentsView).toBeDefined();
+    });
+    expect(show).toHaveBeenCalledOnce();
+    expect(harness.close).not.toHaveBeenCalled();
+    expect(driver.onExit).not.toHaveBeenCalled();
+  });
+
+  it('embedded + no running sessions: no dialog, shutdown proceeds', async () => {
+    const guard = vi.fn(async () => 0);
+    const { harness, driver } = await bootAgentsView(guard);
+
+    // A mounted dialog would await key input forever — resolving proves none.
+    await driver.stop(0);
+
+    expect(guard).toHaveBeenCalledOnce();
+    expect(findConfirm(driver)).toBeUndefined();
+    expect(harness.close).toHaveBeenCalledOnce();
+    expect(driver.onExit).toHaveBeenCalledWith(0);
+  });
+
+  it('attached mode wires no exit guard: no dialog, sessions keep running server-side', async () => {
+    const { harness, driver } = await bootAgentsView(undefined);
+
+    await driver.stop(0);
+
+    expect(findConfirm(driver)).toBeUndefined();
+    expect(harness.close).toHaveBeenCalledOnce();
+    expect(driver.onExit).toHaveBeenCalledWith(0);
+  });
+
+  it('a failed session count never traps the user — shutdown proceeds without the dialog', async () => {
+    const guard = vi.fn(async (): Promise<number> => {
+      throw new Error('server unreachable');
+    });
+    const { harness, driver } = await bootAgentsView(guard);
+
+    await driver.stop(0);
+
+    expect(harness.close).toHaveBeenCalledOnce();
+    expect(driver.onExit).toHaveBeenCalledWith(0);
+  });
+
+  it('normal mode never consults the guard, even if one was wired', async () => {
+    const guard = vi.fn(async () => 5);
+    const harness = makeHarness(makeSession());
+    const driver = makeDriver(harness, {
+      ...makeStartupInput(),
+      agentsViewExitGuard: guard,
+    }) as unknown as ExitConfirmDriver;
+    await driver.init();
+    expect(driver.state.startupState).toBe('ready');
+    vi.spyOn(driver.state.ui, 'stop').mockImplementation(() => {});
+    vi.spyOn(driver.state.terminal, 'drainInput').mockImplementation(async () => {});
+    driver.onExit = vi.fn(async () => {});
+
+    await driver.stop(0);
+
+    expect(guard).not.toHaveBeenCalled();
+    expect(harness.close).toHaveBeenCalledOnce();
+    expect(driver.onExit).toHaveBeenCalledWith(0);
+  });
+});

@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { AgentsGroup, AgentsGroupId, AgentsRosterRow } from '@/tui/agents/roster';
 import { AgentsViewApp, type AgentsViewProps } from '@/tui/components/agents-view/app';
+import { AgentsExitConfirmComponent } from '@/tui/components/agents-view/exit-confirm';
 import { CustomEditor } from '@/tui/components/editor/custom-editor';
 
 const ANSI_SGR = /\[[0-9;]*m/g;
@@ -568,5 +569,70 @@ describe('AgentsViewApp — dispatch editor mount', () => {
     const out = render(makeApp({ dispatchFocused: true }));
     expect(out).toContain('dispatch');
     expect(out).toContain('back to list');
+  });
+});
+
+// ── M4 Task 5: shutdown-time exit confirmation (embedded server) ──
+
+describe('AgentsExitConfirmComponent', () => {
+  it('renders the interruption copy with the running count', () => {
+    const component = new AgentsExitConfirmComponent({ running: 3, onResolve: () => {} });
+    const out = component.render(100).map(strip).join('\n');
+    expect(out).toContain(
+      '3 session(s) still running — quitting interrupts them (saved; resumable).',
+    );
+    expect(out).toContain('Y quit');
+    expect(out).toContain('N cancel');
+  });
+
+  it('y and Y confirm', () => {
+    for (const key of ['y', 'Y']) {
+      const onResolve = vi.fn();
+      const component = new AgentsExitConfirmComponent({ running: 1, onResolve });
+      component.handleInput(key);
+      expect(onResolve).toHaveBeenCalledTimes(1);
+      expect(onResolve).toHaveBeenCalledWith(true);
+    }
+  });
+
+  it('any other key cancels — the safe default for a shutdown confirm is to stay', () => {
+    for (const key of ['n', 'N', 'q', '\u001B', '\u0003', '\t']) {
+      const onResolve = vi.fn();
+      const component = new AgentsExitConfirmComponent({ running: 1, onResolve });
+      component.handleInput(key);
+      expect(onResolve).toHaveBeenCalledTimes(1);
+      expect(onResolve).toHaveBeenCalledWith(false);
+    }
+  });
+
+  it('auto-cancels on timeout — and a late key cannot clobber the timeout', () => {
+    vi.useFakeTimers();
+    try {
+      const onResolve = vi.fn();
+      const component = new AgentsExitConfirmComponent({ running: 1, onResolve });
+      expect(onResolve).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(60_000);
+      expect(onResolve).toHaveBeenCalledTimes(1);
+      expect(onResolve).toHaveBeenCalledWith(false);
+      component.handleInput('y');
+      expect(onResolve).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('resolves only once — the timeout cannot clobber a key answer', () => {
+    vi.useFakeTimers();
+    try {
+      const onResolve = vi.fn();
+      const component = new AgentsExitConfirmComponent({ running: 1, onResolve });
+      component.handleInput('y');
+      vi.advanceTimersByTime(60_000);
+      component.handleInput('n');
+      expect(onResolve).toHaveBeenCalledTimes(1);
+      expect(onResolve).toHaveBeenCalledWith(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

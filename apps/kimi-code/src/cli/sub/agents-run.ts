@@ -101,25 +101,23 @@ export async function runAgents(): Promise<void> {
     startupNotice: configWarning,
     startupAgentsView: true,
     agentsViewServerLabel: server.mode === 'attached' ? new URL(server.baseUrl).host : 'embedded',
+    // The exit confirmation only matters when this process owns the server:
+    // quitting shuts it down and interrupts its running sessions. An attached
+    // server outlives the CLI — disconnecting needs no confirmation.
+    agentsViewExitGuard:
+      server.mode === 'embedded' ? () => countRunningSessions(server) : undefined,
   });
 
   tui.onExit = async (exitCode = 0) => {
-    if (server.mode === 'embedded') {
-      try {
-        const running = await countRunningSessions(server);
-        if (running > 0) {
-          process.stderr.write(
-            `\n${String(running)} session(s) still running — stopping the embedded server interrupts them.\n`,
-          );
-        }
-      } catch {
-        // Best effort: the interruption note must never block shutdown.
-      }
-    }
     // Wire transport: close() only disconnects; an attached server keeps
-    // running, an embedded one is shut down right after.
+    // running, an embedded one is shut down right after (any running
+    // sessions were already confirmed by the stop() exit dialog).
     await harness.close();
     await server.shutdown();
+    // The view's sessions run the v2 engine on the kap-server — `kimi
+    // --resume` (v1 storage) can't reopen them (design §6.1), so the
+    // re-entry point is the view itself.
+    process.stderr.write(`\nTo resume your sessions: kimi agents\n`);
     process.exit(exitCode);
   };
 

@@ -46,6 +46,7 @@ import {
   type SkillListSession,
 } from './commands';
 import * as slashCommands from './commands/dispatch';
+import { AgentsExitConfirmComponent } from './components/agents-view/exit-confirm';
 import { BannerComponent } from './components/chrome/banner';
 import { DeviceCodeBoxComponent } from './components/chrome/device-code-box';
 import { GutterContainer } from './components/chrome/gutter-container';
@@ -190,6 +191,13 @@ export interface KimiTUIStartupInput {
   readonly startupAgentsView?: boolean;
   /** Agents-view header label for the connected kap-server ("embedded" or host:port). */
   readonly agentsViewServerLabel?: string;
+  /**
+   * Agents-mode exit guard (`kimi agents` on an embedded kap-server): returns
+   * how many sessions are still running server-side — stop() confirms before
+   * interrupting them. Undefined for attached servers (they outlive this
+   * process, so disconnecting needs no confirmation) and for the normal TUI.
+   */
+  readonly agentsViewExitGuard?: () => Promise<number>;
 }
 
 type EffectiveActivityPaneMode = ActivityPaneMode | 'idle' | 'session';
@@ -329,6 +337,9 @@ export class KimiTUI {
   private readonly migrationPlan: MigrationPlan | null;
   private readonly migrateOnly: boolean;
   private readonly agentsViewServerLabelOverride: string | undefined;
+  private readonly agentsViewExitGuard: (() => Promise<number>) | undefined;
+  /** Re-entrancy guard: a second stop() while the exit confirmation is on screen is ignored. */
+  private exitConfirmInFlight = false;
   private startupNotice: string | undefined;
   private lastActivityMode: string | undefined;
   private currentLoadingTip: { kind: LoadingTipKind; tip: string | undefined } | undefined =
@@ -405,6 +416,7 @@ export class KimiTUI {
     this.migrationPlan = startupInput.migrationPlan ?? null;
     this.migrateOnly = startupInput.migrateOnly ?? false;
     this.agentsViewServerLabelOverride = startupInput.agentsViewServerLabel;
+    this.agentsViewExitGuard = startupInput.agentsViewExitGuard;
     this.startupNotice = startupInput.startupNotice;
     this.state = createTUIState(tuiOptions);
     this.uninstallRainbowDance = installRainbowDance(() => {
@@ -862,6 +874,30 @@ export class KimiTUI {
 
   async stop(exitCode?: number): Promise<void> {
     if (this.isShuttingDown) return;
+    // Agents mode on an embedded kap-server: quitting interrupts sessions
+    // still running server-side, so confirm BEFORE anything is torn down — a
+    // decline must leave the TUI exactly as it was. The guard is only wired
+    // for embedded servers: attached ones keep running after disconnect, and
+    // the normal TUI never sets it (zero behavior change outside agents
+    // mode, double-gated on the agents-view startup marker).
+    if (this.state.startupState === 'agents-view' && this.agentsViewExitGuard !== undefined) {
+      if (this.exitConfirmInFlight) return;
+      this.exitConfirmInFlight = true;
+      let proceed = false;
+      try {
+        proceed = await this.confirmAgentsViewExit();
+      } finally {
+        this.exitConfirmInFlight = false;
+      }
+      if (!proceed) {
+        // Esc/q quit path: the view's onQuit already closed it before stop()
+        // ran (that close is what triggers stop via setAgentsView), so put
+        // the user back in the view. In attach mode nothing was unmounted —
+        // the detached view state is still live and the chat stays as-is.
+        if (this.state.agentsView === undefined) void this.agentsViewController.show();
+        return;
+      }
+    }
     this.isShuttingDown = true;
     this.unregisterSignalHandlers();
     this.aborted = true;
@@ -906,6 +942,61 @@ export class KimiTUI {
     if (this.onExit) {
       await this.onExit(exitCode);
     }
+  }
+
+  /**
+   * The agents-mode exit gate: count running sessions via the runner-injected
+   * guard. Zero running exits straight away (no dialog); a failed count also
+   * exits — the interruption note is best effort and must never trap the
+   * user in the TUI (the embedded shutdown itself is always graceful).
+   */
+  private async confirmAgentsViewExit(): Promise<boolean> {
+    const guard = this.agentsViewExitGuard;
+    if (guard === undefined) return true;
+    let running: number;
+    try {
+      running = await guard();
+    } catch {
+      return true;
+    }
+    if (running === 0) return true;
+    return this.showAgentsExitConfirm(running);
+  }
+
+  /**
+   * The shutdown-time confirmation dialog (TasksBrowser inline stop-confirm
+   * shape: `y` confirms, anything else cancels, auto-cancel on timeout).
+   * Mounted as a full-screen container swap — the same pattern as the
+   * approval preview — because the agents view is itself a full-screen
+   * takeover: an editor-slot replacement would be invisible behind it.
+   * Resolving restores the previous children and focus untouched, so a
+   * cancel is fully reversible.
+   */
+  private showAgentsExitConfirm(running: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const savedChildren = [...this.state.ui.children];
+      const component = new AgentsExitConfirmComponent({
+        running,
+        onResolve: (confirmed) => {
+          this.state.ui.clear();
+          for (const child of savedChildren) this.state.ui.addChild(child);
+          const view = this.state.agentsView;
+          if (view !== undefined && !view.detached) {
+            this.state.ui.setFocus(view.component);
+          } else if (this.activeApprovalPanel !== undefined) {
+            this.state.ui.setFocus(this.activeApprovalPanel);
+          } else {
+            this.state.ui.setFocus(this.state.editor);
+          }
+          this.state.ui.requestRender(true);
+          resolve(confirmed);
+        },
+      });
+      this.state.ui.clear();
+      this.state.ui.addChild(component);
+      this.state.ui.setFocus(component);
+      this.state.ui.requestRender(true);
+    });
   }
 
   // SIGHUP / dead-terminal EIO → emergencyTerminalExit (no cleanup, avoids
