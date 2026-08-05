@@ -645,6 +645,42 @@ describe('server-v2 /api/v1 prompts', () => {
     expect(body.code).toBe(40402);
   });
 
+  it('steers a queued prompt into the active turn via the single-colon prompts:steer route', async () => {
+    const id = await createSession(home as string);
+    await createMainAgent(id);
+
+    // Turn 1 binds the default profile and genuinely runs against the
+    // unreachable stub endpoint, so turn 2 queues behind it.
+    const first = await call<PromptItemWire>('POST', `/api/v1/sessions/${id}/prompts`, {
+      content: [{ type: 'text', text: 'first' }],
+    });
+    expect(first.body.code).toBe(0);
+    expect(first.body.data.status).toBe('running');
+
+    const second = await call<PromptItemWire>('POST', `/api/v1/sessions/${id}/prompts`, {
+      content: [{ type: 'text', text: 'second' }],
+    });
+    expect(second.body.code).toBe(0);
+    expect(second.body.data.status).toBe('queued');
+
+    // The documented wire path is single-colon `prompts:steer`
+    // (protocol/rest-prompt.ts); the declared route used to carry a literal
+    // double colon that no request URL ever matches.
+    const steered = await call<{ steered: boolean; prompt_ids: string[] }>(
+      'POST',
+      `/api/v1/sessions/${id}/prompts:steer`,
+      { prompt_ids: [second.body.data.prompt_id] },
+    );
+    expect(steered.body.code).toBe(0);
+    expect(steered.body.data).toEqual({
+      steered: true,
+      prompt_ids: [second.body.data.prompt_id],
+    });
+
+    // Settle the session so the test does not leave a retrying turn behind.
+    await call('POST', `/api/v1/sessions/${id}:abort`);
+  });
+
   it('returns 40401 for an unknown session', async () => {
     const { body } = await call<null>('POST', '/api/v1/sessions/nope/prompts', {
       content: [{ type: 'text', text: 'hello' }],

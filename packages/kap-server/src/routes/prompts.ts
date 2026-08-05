@@ -349,7 +349,7 @@ export function registerPromptsRoutes(app: PromptRouteHost, core: Scope): void {
   const steerManyRoute = defineRoute(
     {
       method: 'POST',
-      path: '/sessions/{session_id}/prompts::steer',
+      path: '/sessions/{session_id}/prompts:steer',
       body: promptSteerRequestSchema,
       params: sessionIdParamSchema,
       success: { data: promptSteerResultSchema },
