@@ -2,7 +2,13 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { log, type Event, type GoalSnapshot } from '@moonshot-ai/kimi-code-sdk';
+import {
+  log,
+  type ApprovalHandler,
+  type ApprovalRequest,
+  type Event,
+  type GoalSnapshot,
+} from '@moonshot-ai/kimi-code-sdk';
 import type { MigrationPlan } from '@moonshot-ai/migration-legacy';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -13,7 +19,9 @@ import { promptPlatformSelection, promptLogoutProviderSelection } from '#/tui/co
 import { AgentsExitConfirmComponent } from '#/tui/components/agents-view/exit-confirm';
 import { BannerComponent } from '#/tui/components/chrome/banner';
 import { WelcomeComponent } from '#/tui/components/chrome/welcome';
+import { ApprovalPanelComponent } from '#/tui/components/dialogs/approval-panel';
 import { KimiTUI, type KimiTUIStartupInput, type TUIState } from '#/tui/kimi-tui';
+import type { ApprovalController } from '#/tui/reverse-rpc/approval/controller';
 import { REPLAY_TURN_LIMIT } from '#/tui/utils/message-replay';
 import { copyTextToClipboard } from '#/utils/clipboard/clipboard-text';
 import { quoteShellArg } from '#/utils/shell-quote';
@@ -2029,6 +2037,138 @@ describe('KimiTUI agents-view attach', () => {
     expect(showStatus).not.toHaveBeenCalledWith('Already on this session.');
     expect(driver.state.appState.sessionId).toBe('ses-attached');
     expect(driver.state.ui.children).not.toContain(driver.state.agentsView?.component);
+  });
+
+  // ── Approval-while-view-open focus seam (final re-review C1 compound) ──
+
+  function makeApprovalRequest(toolCallId: string): ApprovalRequest {
+    return {
+      toolCallId,
+      toolName: 'Bash',
+      action: 'run',
+      display: {
+        kind: 'generic',
+        summary: 'run',
+        detail: { command: 'ls /tmp' },
+      },
+    };
+  }
+
+  /** The approval handler the TUI registered on the attached session mock. */
+  function approvalHandlerOf(session: ReturnType<typeof makeAttachSession>): ApprovalHandler {
+    const handler = vi.mocked(session.setApprovalHandler).mock.calls.at(-1)?.[0] as
+      | ApprovalHandler
+      | undefined;
+    if (handler === undefined) throw new Error('no approval handler registered');
+    return handler;
+  }
+
+  function approvalControllerOf(driver: AttachDriver): ApprovalController {
+    return (driver as unknown as { approvalController: ApprovalController }).approvalController;
+  }
+
+  /** Attach ses-attached, then ← back to the roster with the chat live underneath. */
+  async function bootRosterOverAttachedSession(
+    session: ReturnType<typeof makeAttachSession>,
+  ): Promise<AttachDriver> {
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    // initMainTui mounts the editor into its container; init() alone does not.
+    driver.state.editorContainer.addChild(driver.state.editor);
+    driver.onOpenSession('ses-attached');
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(driver.returnToAgentsView()).toBe(true);
+    await vi.waitFor(() => {
+      expect(driver.state.agentsView?.detached).toBe(false);
+    });
+    return driver;
+  }
+
+  it('an approval arriving while the view is open neither mounts nor steals focus', async () => {
+    const session = makeAttachSession('ses-attached');
+    const driver = await bootRosterOverAttachedSession(session);
+    const setFocus = vi.spyOn(driver.state.ui, 'setFocus');
+
+    const pending = approvalHandlerOf(session)(makeApprovalRequest('tc-1'));
+
+    // The request stays pending in the controller; nothing mounts into the
+    // (off-tree) editor container, and the roster keeps keyboard focus.
+    const view = driver.state.agentsView;
+    expect(driver.state.editorContainer.children[0]).toBe(driver.state.editor);
+    expect(view?.component.focused).toBe(true);
+    expect(
+      setFocus.mock.calls.some(([target]) => target instanceof ApprovalPanelComponent),
+    ).toBe(false);
+
+    // Teardown with a queued panel: cancel resolves the request and still
+    // does not touch the roster's focus or the editor container.
+    approvalControllerOf(driver).cancelAll('test teardown');
+    await expect(pending).resolves.toMatchObject({ decision: 'cancelled' });
+    expect(driver.state.editorContainer.children[0]).toBe(driver.state.editor);
+    expect(view?.component.focused).toBe(true);
+  });
+
+  it('attaching into the session mounts the queued approval visible and focused', async () => {
+    const session = makeAttachSession('ses-attached');
+    const driver = await bootRosterOverAttachedSession(session);
+    const pending = approvalHandlerOf(session)(makeApprovalRequest('tc-1'));
+    expect(driver.state.editorContainer.children[0]).toBe(driver.state.editor);
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(driver.state.agentsView?.detached).toBe(true);
+    });
+    const mounted = driver.state.editorContainer.children[0];
+    expect(mounted).toBeInstanceOf(ApprovalPanelComponent);
+    expect(driver.state.ui.children).toContain(driver.state.editorContainer);
+    expect((mounted as ApprovalPanelComponent).focused).toBe(true);
+
+    // The full answer cycle works: respond resolves the request and the
+    // editor slot returns to the editor.
+    approvalControllerOf(driver).respond({ decision: 'approved' });
+    await expect(pending).resolves.toEqual({ decision: 'approved' });
+    expect(driver.state.editorContainer.children[0]).toBe(driver.state.editor);
+  });
+
+  it('attaching into a DIFFERENT session never pops the pending panel into its chat', async () => {
+    const sessionA = makeAttachSession('ses-attached');
+    const sessionB = makeAttachSession('ses-other');
+    const { harness } = makeAgentsHarness(sessionA);
+    harness.resumeSession = vi.fn(async (input: { id: string }) =>
+      input.id === 'ses-other' ? sessionB : sessionA,
+    ) as unknown as typeof harness.resumeSession;
+    const driver = await bootAgentsView(harness);
+    // initMainTui mounts the editor into its container; init() alone does not.
+    driver.state.editorContainer.addChild(driver.state.editor);
+    driver.onOpenSession('ses-attached');
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(driver.returnToAgentsView()).toBe(true);
+    await vi.waitFor(() => {
+      expect(driver.state.agentsView?.detached).toBe(false);
+    });
+    const pending = approvalHandlerOf(sessionA)(makeApprovalRequest('tc-1'));
+    const setFocus = vi.spyOn(driver.state.ui, 'setFocus');
+
+    driver.onOpenSession('ses-other');
+
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-other');
+    });
+    // Session A's panel never mounted into B's chat and never took focus.
+    // The pending request is resolved by the session switch's cancel — the
+    // same semantics as any switch with a pending approval — rather than
+    // surfacing in the wrong chat.
+    await expect(pending).resolves.toMatchObject({ decision: 'cancelled' });
+    expect(driver.state.editorContainer.children[0]).toBe(driver.state.editor);
+    expect(
+      setFocus.mock.calls.some(([target]) => target instanceof ApprovalPanelComponent),
+    ).toBe(false);
+    expect(driver.session?.id).toBe('ses-other');
   });
 
   it('agents mode relaxes the streaming switch guard (wire detach never kills a turn)', async () => {

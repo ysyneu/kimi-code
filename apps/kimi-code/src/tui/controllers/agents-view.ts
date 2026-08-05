@@ -1,6 +1,6 @@
 import type { Event, KimiHarness, Session, Unsubscribe, WireSession } from '@moonshot-ai/kimi-code-sdk';
 import { SDKRpcClientWire } from '@moonshot-ai/kimi-code-sdk';
-import type { Component, ProcessTerminal, TUI } from '@moonshot-ai/pi-tui';
+import type { Component, Container, ProcessTerminal, TUI } from '@moonshot-ai/pi-tui';
 
 import { AgentsRoster, type AgentsGroup, type AgentsGroupId } from '../agents/roster';
 import { loadPins, savePins } from '../agents/roster-persistence';
@@ -23,6 +23,7 @@ export interface AgentsViewHost {
     readonly terminal: ProcessTerminal;
     readonly ui: TUI;
     readonly editor: CustomEditor;
+    readonly editorContainer: Container;
   };
   readonly harness: KimiHarness;
   showError(msg: string): void;
@@ -44,6 +45,14 @@ export interface AgentsViewHost {
   getCurrentSessionId(): string;
   /** Attach seam: the host implements it; without it Enter shows a status hint. */
   onOpenSession?(id: string): void;
+  /**
+   * Mounts any reverse-RPC panels (approval/question) deferred while the
+   * view takeover was on screen. The controller calls it when the user
+   * leaves the view for the chat that owns the pending interaction —
+   * detachForAttach (only when the attached session IS the current one) and
+   * close(). Without it deferred panels never surface.
+   */
+  flushDeferredPanels?(): void;
 }
 
 export interface AgentsViewState {
@@ -297,8 +306,11 @@ export class AgentsViewController {
       state.ui.addChild(child);
     }
     this.host.setAgentsView(undefined);
-    state.ui.setFocus(state.editor);
+    state.ui.setFocus(state.editorContainer.children[0] ?? state.editor);
     state.ui.requestRender(true);
+    // Panels deferred while the takeover was up mount now — the user is back
+    // in the chat that owns the pending interaction.
+    this.host.flushDeferredPanels?.();
   }
 
   /**
@@ -328,10 +340,20 @@ export class AgentsViewController {
     for (const child of view.savedChildren) {
       state.ui.addChild(child);
     }
-    state.ui.setFocus(state.editor);
+    // Focus whatever occupies the editor slot: when a reverse-RPC panel is
+    // mounted there the editor is off-tree, and focusing it would leave the
+    // restored panel visible but keyboard-dead.
+    state.ui.setFocus(state.editorContainer.children[0] ?? state.editor);
     state.ui.requestRender(true);
     // Seed the attach-mode footer badge with the current roster counts.
     this.pushAttachBadge(view, sessionId);
+    // Pending approvals/questions belong to the CURRENT session (handlers
+    // are per-session), so only an attach into that session surfaces what
+    // the view deferred. Attaching into a DIFFERENT session must not pop
+    // this session's panel into the wrong chat — those entries stay
+    // deferred until the switch's unload cancels them (the same cancel
+    // semantics as any session switch with a pending approval).
+    if (sessionId === this.host.getCurrentSessionId()) this.host.flushDeferredPanels?.();
   }
 
   /** Return-from-attach remount: same component, same roster, no reload. */

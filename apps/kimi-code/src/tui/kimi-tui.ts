@@ -369,6 +369,17 @@ export class KimiTUI {
   // preview viewer can restore focus to the exact same instance (and its
   // selection / feedback state) when it closes.
   private activeApprovalPanel: ApprovalPanelComponent | undefined;
+  // Agents-view deferral slots: while the view takeover is on screen a
+  // reverse-RPC panel must NOT mount — it would land in the off-tree
+  // editorContainer (invisible) and mountEditorReplacement would
+  // unconditionally steal keyboard focus from the roster. The base
+  // controller keeps the request pending (the roster's awaiting badge keeps
+  // signalling it) and the latest show per kind is replayed by
+  // flushDeferredPanels when the user leaves the view for the owning
+  // session's chat. One slot per kind matches mountEditorReplacement's
+  // replace semantics; queued requests stay in the base controller's queue.
+  private deferredApprovalMount: (() => void) | undefined;
+  private deferredQuestionMount: (() => void) | undefined;
   // Active full-screen approval preview. While set, the root UI's normal
   // children are stashed in `savedChildren`; closing restores them.
   private approvalPreview:
@@ -3003,6 +3014,26 @@ export class KimiTUI {
     this.state.ui.requestRender();
   }
 
+  /** True while the agents-view takeover owns the screen (mounted, not detached for an attach). */
+  private isAgentsViewTakeoverActive(): boolean {
+    const view = this.state.agentsView;
+    return view !== undefined && !view.detached;
+  }
+
+  /**
+   * AgentsViewHost seam: replays the reverse-RPC panel mounts deferred
+   * while the agents-view takeover was on screen. Runs after the view has
+   * detached/closed, so the replayed shows mount (and focus) normally.
+   */
+  flushDeferredPanels(): void {
+    const approval = this.deferredApprovalMount;
+    const question = this.deferredQuestionMount;
+    this.deferredApprovalMount = undefined;
+    this.deferredQuestionMount = undefined;
+    approval?.();
+    question?.();
+  }
+
   restoreEditor(): void {
     this.state.editorContainer.clear();
     this.state.editorContainer.addChild(this.state.editor);
@@ -3220,6 +3251,15 @@ export class KimiTUI {
   }
 
   private showApprovalPanel(payload: ApprovalPanelData): void {
+    if (this.isAgentsViewTakeoverActive()) {
+      // Defer: mounting now would be invisible behind the takeover and
+      // would steal the roster's keyboard focus. The request stays pending
+      // in the approval controller; the roster badge signals it.
+      this.deferredApprovalMount = () => {
+        this.showApprovalPanel(payload);
+      };
+      return;
+    }
     this.patchLivePane({ pendingApproval: { data: payload } });
     notifyTerminalOnce(this.state, `approval:${payload.id}`, {
       title: 'Kimi Code approval required',
@@ -3242,6 +3282,12 @@ export class KimiTUI {
   }
 
   private hideApprovalPanel(): void {
+    if (this.deferredApprovalMount !== undefined) {
+      // The show was deferred, so nothing was ever mounted — restoreEditor
+      // here would focus the off-tree editor behind the takeover.
+      this.deferredApprovalMount = undefined;
+      return;
+    }
     // If the full-screen preview is open, fold it back first so the saved-
     // children stack stays consistent with what mountEditorReplacement set up.
     if (this.approvalPreview !== undefined) this.closeApprovalPreview();
@@ -3287,6 +3333,13 @@ export class KimiTUI {
   }
 
   private showQuestionDialog(payload: QuestionPanelData): void {
+    if (this.isAgentsViewTakeoverActive()) {
+      // Defer for the same reason as showApprovalPanel.
+      this.deferredQuestionMount = () => {
+        this.showQuestionDialog(payload);
+      };
+      return;
+    }
     this.patchLivePane({ pendingQuestion: { data: payload } });
     notifyTerminalOnce(this.state, `question:${payload.id}`, {
       title: 'Kimi Code needs your answer',
@@ -3306,6 +3359,11 @@ export class KimiTUI {
   }
 
   private hideQuestionDialog(): void {
+    if (this.deferredQuestionMount !== undefined) {
+      // Deferred shows never mounted — skip restoreEditor (see hideApprovalPanel).
+      this.deferredQuestionMount = undefined;
+      return;
+    }
     this.patchLivePane({ pendingQuestion: null });
     this.restoreEditor();
   }

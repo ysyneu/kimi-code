@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import type { Event, KimiHarness, Session, SessionSummary, WireSession } from '@moonshot-ai/kimi-code-sdk';
 import { SDKRpcClientWire } from '@moonshot-ai/kimi-code-sdk';
-import type { Component, ProcessTerminal, Terminal, TUI } from '@moonshot-ai/pi-tui';
+import type { Component, Container, ProcessTerminal, Terminal, TUI } from '@moonshot-ai/pi-tui';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { loadPins } from '@/tui/agents/roster-persistence';
@@ -250,7 +250,9 @@ async function boot(
     terminal: fakeTerminal(30) as unknown as ProcessTerminal,
     ui: ui as unknown as TUI,
     editor: { tag: 'editor' } as unknown as CustomEditor,
+    editorContainer: undefined as unknown as Container,
   };
+  state.editorContainer = { children: [state.editor] } as unknown as Container;
   const showError = vi.fn();
   const showStatus = vi.fn();
   const setAttachBadge = vi.fn();
