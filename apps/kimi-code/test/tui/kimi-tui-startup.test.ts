@@ -2116,6 +2116,29 @@ describe('KimiTUI agents-view attach', () => {
     await plainDriver.init();
     expect(plainDriver.returnToAgentsView()).toBe(false);
   });
+
+  it('seeds the badge excluding the session being attached (already-awaiting attach)', async () => {
+    // Regression (review round 2): the seed runs before switchToSession sets
+    // appState.sessionId, so it must exclude the TARGET id — an attach target
+    // that already awaits input must not appear in its own badge.
+    const session = makeAttachSession('ses-attached');
+    const { harness, emit } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+    emit({
+      type: 'event.session.work_changed',
+      sessionId: 'ses-attached',
+      busy: false,
+      pending_interaction: 'approval',
+    } as Event);
+
+    driver.onOpenSession('ses-attached');
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+
+    expect(driver.state.footer.render(120)[0]).not.toContain('←');
+  });
 });
 
 function uiContainsFooter(driver: StartupDriver): boolean {

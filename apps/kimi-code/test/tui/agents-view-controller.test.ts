@@ -957,7 +957,7 @@ describe('AgentsViewController — detach for attach', () => {
   it('detachForAttach unmounts the component and restores the saved children', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
-    b.controller.detachForAttach();
+    b.controller.detachForAttach('s1');
     expect(b.view().detached).toBe(true);
     expect(b.ui.children).toEqual([SENTINEL_A, SENTINEL_B]);
     expect(b.ui.setFocus).toHaveBeenLastCalledWith(b.host.state.editor);
@@ -968,7 +968,7 @@ describe('AgentsViewController — detach for attach', () => {
   it('the roster subscription keeps reducing events while detached, without rendering', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
-    b.controller.detachForAttach();
+    b.controller.detachForAttach('s1');
     b.ui.requestRender.mockClear();
     b.fake.emit({
       type: 'event.session.work_changed',
@@ -985,7 +985,7 @@ describe('AgentsViewController — detach for attach', () => {
   it('close while detached is a no-op — the subscription survives the runtime reset', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
-    b.controller.detachForAttach();
+    b.controller.detachForAttach('s1');
     b.controller.close();
     expect(b.controller.isOpen).toBe(true);
     b.fake.emit({
@@ -1000,7 +1000,7 @@ describe('AgentsViewController — detach for attach', () => {
   it('show while detached remounts the same component over the live roster', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
-    b.controller.detachForAttach();
+    b.controller.detachForAttach('s1');
     b.fake.emit({
       type: 'event.session.work_changed',
       sessionId: 's1',
@@ -1039,8 +1039,38 @@ describe('AgentsViewController — attach badge feed', () => {
     });
     b.setAttachBadge.mockClear();
 
-    b.controller.detachForAttach();
+    // Attaching s2: the working s1 is an OTHER session and counts.
+    b.controller.detachForAttach('s2');
 
+    expect(b.setAttachBadge).toHaveBeenCalledTimes(1);
+    expect(b.setAttachBadge).toHaveBeenLastCalledWith({ agents: 1, awaiting: 0 });
+  });
+
+  it('seeds the badge excluding the session being attached (no pre-seeded current id)', async () => {
+    // Regression (review round 2): the harness deliberately does NOT pre-seed
+    // currentSessionId — at real attach time appState.sessionId still holds
+    // the previous session, so the seed must exclude the id passed into
+    // detachForAttach, not the stale current one.
+    const b = await boot([summary('s1'), summary('s2')]);
+    dir = b.homeDir;
+    // s1 (about to be attached) already awaits input; s2 is working.
+    b.fake.emit({
+      type: 'event.session.work_changed',
+      sessionId: 's1',
+      busy: false,
+      pending_interaction: 'approval',
+    });
+    b.fake.emit({
+      type: 'event.session.work_changed',
+      sessionId: 's2',
+      busy: true,
+      pending_interaction: 'none',
+    });
+    b.setAttachBadge.mockClear();
+
+    b.controller.detachForAttach('s1');
+
+    // s1 is excluded from the seed even though the host's current id is ''.
     expect(b.setAttachBadge).toHaveBeenCalledTimes(1);
     expect(b.setAttachBadge).toHaveBeenLastCalledWith({ agents: 1, awaiting: 0 });
   });
@@ -1048,7 +1078,7 @@ describe('AgentsViewController — attach badge feed', () => {
   it('roster events while detached keep pushing live counts', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
-    b.controller.detachForAttach();
+    b.controller.detachForAttach('s1');
     b.setAttachBadge.mockClear();
 
     b.fake.emit({
@@ -1079,7 +1109,7 @@ describe('AgentsViewController — attach badge feed', () => {
     });
     b.setAttachBadge.mockClear();
 
-    b.controller.detachForAttach();
+    b.controller.detachForAttach('s1');
 
     // Only s2 counts — the attached s1 is on screen, not badge-worthy.
     expect(b.setAttachBadge).toHaveBeenLastCalledWith({ agents: 0, awaiting: 1 });
@@ -1113,7 +1143,7 @@ describe('AgentsViewController — attach badge feed', () => {
   it('returning to the view (remount) clears the badge', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
-    b.controller.detachForAttach();
+    b.controller.detachForAttach('s1');
     b.setAttachBadge.mockClear();
 
     await b.controller.show();
@@ -1143,7 +1173,7 @@ describe('hintDeferredPermissionOnce', () => {
   it('shows the hint once per attach, then never again for that attach', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
-    b.controller.detachForAttach();
+    b.controller.detachForAttach('s1');
 
     hintDeferredPermissionOnce(b.host);
     hintDeferredPermissionOnce(b.host);
@@ -1155,13 +1185,13 @@ describe('hintDeferredPermissionOnce', () => {
   it('re-arms on the next attach (detachForAttach resets the flag)', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
-    b.controller.detachForAttach();
+    b.controller.detachForAttach('s1');
     hintDeferredPermissionOnce(b.host);
     expect(b.showStatus).toHaveBeenCalledTimes(1);
 
     // Return to the view, then attach again.
     await b.controller.show();
-    b.controller.detachForAttach();
+    b.controller.detachForAttach('s1');
     hintDeferredPermissionOnce(b.host);
 
     expect(b.showStatus).toHaveBeenCalledTimes(2);

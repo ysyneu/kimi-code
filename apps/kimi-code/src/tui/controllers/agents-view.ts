@@ -288,8 +288,13 @@ export class AgentsViewController {
    * Attach detach: unmounts the component but keeps the roster and its global
    * event subscription alive (see {@link AgentsViewState.detached}). The user
    * returns via the Task-4 key, which re-runs show().
+   *
+   * `sessionId` is the session being attached — the seeded badge excludes it.
+   * It must be passed in: at this point `appState.sessionId` still holds the
+   * PREVIOUS session (switchToSession runs after the detach), so reading the
+   * current id here would seed the badge with the wrong exclusion.
    */
-  detachForAttach(): void {
+  detachForAttach(sessionId: string): void {
     const { state } = this.host;
     const view = state.agentsView;
     if (view === undefined || view.detached) return;
@@ -309,7 +314,7 @@ export class AgentsViewController {
     state.ui.setFocus(state.editor);
     state.ui.requestRender(true);
     // Seed the attach-mode footer badge with the current roster counts.
-    this.pushAttachBadge(view);
+    this.pushAttachBadge(view, sessionId);
   }
 
   /** Return-from-attach remount: same component, same roster, no reload. */
@@ -421,12 +426,12 @@ export class AgentsViewController {
     this.pushProps();
     // While attached the component is unmounted, but the footer badge still
     // reads live roster counts (the subscription survived the detach).
-    if (view.detached) this.pushAttachBadge(view);
+    if (view.detached) this.pushAttachBadge(view, this.host.getCurrentSessionId());
   }
 
   /** Pushes the live roster counts to the attach-mode footer badge. */
-  private pushAttachBadge(view: AgentsViewState): void {
-    const counts = view.roster.counts(this.host.getCurrentSessionId());
+  private pushAttachBadge(view: AgentsViewState, excludeId: string): void {
+    const counts = view.roster.counts(excludeId);
     this.host.setAttachBadge({ agents: counts.working, awaiting: counts.awaiting });
   }
 

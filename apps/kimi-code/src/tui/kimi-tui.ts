@@ -1956,7 +1956,7 @@ export class KimiTUI {
       this.showError(`Failed to attach session ${targetSessionId}: ${msg}`);
       return;
     }
-    this.agentsViewController.detachForAttach();
+    this.agentsViewController.detachForAttach(targetSessionId);
     try {
       await this.switchToSession(session, `Attached to session (${session.id}).`);
     } catch (error) {
