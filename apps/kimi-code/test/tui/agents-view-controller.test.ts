@@ -649,146 +649,6 @@ describe('AgentsViewController — rename', () => {
   });
 });
 
-describe('AgentsViewController — peek', () => {
-  let dir: string | undefined;
-  afterEach(async () => {
-    if (dir !== undefined) {
-      // maxRetries: a fire-and-forget persistState can still be mid-write
-      // (ENOTEMPTY on rmdir) when the test body returns.
-      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
-    }
-    dir = undefined;
-  });
-
-  it('Space resumes the session, projects the context tail and detaches', async () => {
-    const b = await boot([summary('s1')]);
-    dir = b.homeDir;
-    b.fake.session.getContext.mockResolvedValueOnce({
-      history: [
-        { role: 'user', content: [{ type: 'text', text: 'hello agent' }] },
-        { role: 'assistant', content: [{ type: 'text', text: 'working on it\nalmost done' }] },
-      ],
-      tokenCount: 42,
-    });
-    b.component().handleInput(DOWN);
-    b.component().handleInput(' ');
-    await flush();
-    expect(b.fake.resumeSession).toHaveBeenCalledWith({ id: 's1' });
-    expect(b.fake.session.getContext).toHaveBeenCalled();
-    expect(b.fake.session.close).toHaveBeenCalled();
-    const out = b.render();
-    expect(out).toContain('Peek: s1 title');
-    expect(out).toContain('almost done');
-  });
-
-  it('Esc closes the peek without resuming again', async () => {
-    const b = await boot([summary('s1')]);
-    dir = b.homeDir;
-    b.component().handleInput(DOWN);
-    b.component().handleInput(' ');
-    await flush();
-    expect(b.render()).toContain('Peek:');
-    b.component().handleInput(ESC);
-    expect(b.controller.isOpen).toBe(true);
-    expect(b.view().peek).toBeUndefined();
-    expect(b.fake.resumeSession).toHaveBeenCalledTimes(1);
-  });
-
-  it('a failed peek flashes the error and closes the panel', async () => {
-    const b = await boot([summary('s1')]);
-    dir = b.homeDir;
-    b.fake.resumeSession.mockRejectedValueOnce(new Error('no such session'));
-    b.component().handleInput(DOWN);
-    b.component().handleInput(' ');
-    await flush();
-    expect(b.view().peek).toBeUndefined();
-    expect(b.render()).toContain('no such session');
-    b.controller.close(); // clear the pending flash timer
-  });
-
-  it('submitPeekReply resumes, steers and detaches the session', async () => {
-    const b = await boot([summary('s1')]);
-    dir = b.homeDir;
-    await b.controller.submitPeekReply('s1', 'please continue');
-    expect(b.fake.resumeSession).toHaveBeenCalledWith({ id: 's1' });
-    expect(b.fake.session.steer).toHaveBeenCalledWith('please continue');
-    expect(b.fake.session.close).toHaveBeenCalled();
-    b.controller.close();
-  });
-
-  it('typing while peeked drafts the reply and never touches the dispatch editor', async () => {
-    const b = await boot([summary('s1')]);
-    dir = b.homeDir;
-    b.component().handleInput(DOWN);
-    b.component().handleInput(' ');
-    await flush();
-    expect(b.view().peek?.sessionId).toBe('s1');
-
-    b.component().handleInput('h');
-    b.component().handleInput('i');
-
-    expect(b.view().peek?.replyDraft).toBe('hi');
-    // The dangerous misroute (final review C2): a reply must NOT become a
-    // new-session dispatch.
-    expect(b.view().dispatch.editor.getText()).toBe('');
-    expect(b.view().dispatchFocused).toBe(false);
-    expect(b.render()).toContain('reply › hi');
-  });
-
-  it('Enter while peeked steers the peeked session and clears the draft', async () => {
-    const b = await boot([summary('s1')]);
-    dir = b.homeDir;
-    b.component().handleInput(DOWN);
-    b.component().handleInput(' ');
-    await flush();
-    b.component().handleInput('g');
-    b.component().handleInput('o');
-    b.component().handleInput(ENTER);
-    await flush();
-
-    expect(b.fake.resumeSession).toHaveBeenCalledWith({ id: 's1' });
-    expect(b.fake.session.steer).toHaveBeenCalledWith('go');
-    expect(b.fake.session.close).toHaveBeenCalled();
-    expect(b.view().peek?.replyDraft).toBe('');
-    expect(b.fake.createSession).not.toHaveBeenCalled();
-  });
-
-  it('Esc clears the reply draft first, a second Esc closes the peek', async () => {
-    const b = await boot([summary('s1')]);
-    dir = b.homeDir;
-    b.component().handleInput(DOWN);
-    b.component().handleInput(' ');
-    await flush();
-    b.component().handleInput('x');
-    expect(b.view().peek?.replyDraft).toBe('x');
-
-    b.component().handleInput(ESC);
-    expect(b.view().peek?.replyDraft).toBe('');
-    expect(b.view().peek).toBeDefined();
-
-    b.component().handleInput(ESC);
-    expect(b.view().peek).toBeUndefined();
-    expect(b.controller.isOpen).toBe(true);
-  });
-
-  it('a failed reply flashes the error and keeps the peek open', async () => {
-    const b = await boot([summary('s1')]);
-    dir = b.homeDir;
-    b.component().handleInput(DOWN);
-    b.component().handleInput(' ');
-    await flush();
-    b.component().handleInput('g');
-    b.component().handleInput('o');
-    b.fake.session.steer.mockRejectedValueOnce(new Error('steer exploded'));
-    b.component().handleInput(ENTER);
-    await flush();
-
-    expect(b.view().peek?.sessionId).toBe('s1');
-    expect(b.render()).toContain('Reply failed: steer exploded');
-    b.controller.close(); // clear the pending flash timer
-  });
-});
-
 describe('AgentsViewController — list/detail arrow split', () => {
   let dir: string | undefined;
   afterEach(async () => {
@@ -800,18 +660,13 @@ describe('AgentsViewController — list/detail arrow split', () => {
     dir = undefined;
   });
 
-  it('→ on a row opens the peek detail, ← closes it back to the list', async () => {
-    const b = await boot([summary('s1')]);
+  it('→ on a row opens the session — same effect as Enter', async () => {
+    const onOpenSession = vi.fn();
+    const b = await boot([summary('s1')], { onOpenSession });
     dir = b.homeDir;
     b.component().handleInput(DOWN); // onto row s1
     b.component().handleInput(RIGHT);
-    await flush();
-    expect(b.view().peek?.sessionId).toBe('s1');
-    expect(b.render()).toContain('Peek:');
-    b.component().handleInput(LEFT);
-    expect(b.view().peek).toBeUndefined();
-    expect(b.render()).not.toContain('Peek:');
-    expect(b.controller.isOpen).toBe(true);
+    expect(onOpenSession).toHaveBeenCalledWith('s1');
   });
 
   it('→ expands a collapsed group header, ← collapses an expanded one', async () => {
@@ -827,12 +682,13 @@ describe('AgentsViewController — list/detail arrow split', () => {
     expect(b.controller.isOpen).toBe(true);
   });
 
-  it('← on a plain row is a no-op (nothing to go back from)', async () => {
-    const b = await boot([summary('s1')]);
+  it('← on a plain row is a no-op (nothing to collapse)', async () => {
+    const onOpenSession = vi.fn();
+    const b = await boot([summary('s1')], { onOpenSession });
     dir = b.homeDir;
     b.component().handleInput(DOWN); // onto row s1
     b.component().handleInput(LEFT);
-    expect(b.view().peek).toBeUndefined();
+    expect(onOpenSession).not.toHaveBeenCalled();
     expect(b.render()).toContain('s1 title');
     expect(b.controller.isOpen).toBe(true);
   });
@@ -1616,13 +1472,11 @@ describe('AgentsViewController — reconnect reconciliation (I2)', () => {
     expect(out).toContain('Completed');
   });
 
-  it('a disconnect does not re-list; a row vanished during the drop drops its selection/peek', async () => {
+  it('a disconnect does not re-list; a row vanished during the drop drops its selection', async () => {
     const b = await boot([summary('s1')], { wire: true });
     dir = b.homeDir;
     b.component().handleInput(DOWN); // select s1
-    b.component().handleInput(' '); // peek s1
-    await flush();
-    expect(b.view().peek?.sessionId).toBe('s1');
+    expect(b.view().selectedId).toBe('s1');
     b.fake.wireRows?.mockClear();
 
     b.fake.emitConnection(false);
@@ -1635,7 +1489,6 @@ describe('AgentsViewController — reconnect reconciliation (I2)', () => {
     await flush();
     expect(b.view().roster.get('s1')).toBeUndefined();
     expect(b.view().selectedId).toBeUndefined();
-    expect(b.view().peek).toBeUndefined();
   });
 
   it('close unsubscribes the connection-state feed', async () => {

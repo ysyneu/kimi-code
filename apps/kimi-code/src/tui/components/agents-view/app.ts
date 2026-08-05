@@ -2,13 +2,14 @@
  * AgentsViewApp — full-screen alt-screen takeover listing the view's OWN
  * sessions (dispatched from or attached through this view — the server-wide
  * list is filtered controller-side) as a grouped roster (Awaiting input /
- * Working / Pinned / Completed). Mirrors the TasksBrowserApp mount/render
- * contract: mounted by a controller via container swap, `render(width)`
- * returns exactly `terminal.rows` lines (header 1 + body rows-2 + footer 1),
- * data flows in via `setProps`, user actions fire the `on*` callbacks.
+ * Working / Pinned / Completed), each group separated by a blank spacer
+ * line. Mirrors the TasksBrowserApp mount/render contract: mounted by a
+ * controller via container swap, `render(width)` returns exactly
+ * `terminal.rows` lines (header 1 + body rows-2 + footer 1), data flows in
+ * via `setProps`, user actions fire the `on*` callbacks.
  *
- * Zero SDK access: the controller owns the roster, peek content, delete /
- * rename / pin side effects and re-pushes props after every action.
+ * Zero SDK access: the controller owns the roster, delete / rename / pin
+ * side effects and re-pushes props after every action.
  *
  * Behaviour notes for the controller:
  * - Delete confirm: while `confirmDeleteId` is set the component still
@@ -23,13 +24,10 @@
  *   box. While `dispatchFocused`, every key routes to the editor — Esc is
  *   the editor's own `onEscape` (the controller wires it to unfocus).
  *   List-focused, a printable char focuses the editor and feeds it the
- *   text; the printable shortcuts (j/k/q/Space/?) only act while the
- *   editor is EMPTY, once it holds text every printable char belongs to it.
- * - Peek reply: while a peek is open, printable input edits the reply draft
- *   via `onPeekReplyChange` (the controller owns the draft and the steer
- *   side effect), Enter fires `onPeekReplySubmit`, and Esc clears a
- *   non-empty draft before closing the peek. The dispatch editor never
- *   sees these keys — a reply must not become a new-session dispatch.
+ *   text; the printable shortcuts (j/k/q/?) only act while the editor is
+ *   EMPTY, once it holds text every printable char belongs to it.
+ * - Open: Enter and → both fire `onOpen` on a row — opening always hands
+ *   off to the session's own full-screen chat, never an in-view detail.
  */
 
 import {
@@ -48,12 +46,6 @@ import { printableChar, isPrintableChar } from '@/tui/utils/printable-key';
 
 import { fitExactly, renderGroupHeader, renderMoreRow, renderRosterRow } from './rows';
 
-export interface AgentsViewPeek {
-  readonly sessionId: string;
-  readonly lines: readonly string[];
-  readonly replyDraft: string;
-}
-
 export interface AgentsViewProps {
   readonly groups: readonly AgentsGroup[];
   readonly counts: { awaiting: number; working: number; completed: number };
@@ -61,7 +53,6 @@ export interface AgentsViewProps {
   readonly selectedId: string | undefined;
   /** "embedded" or host:port of the connected kap-server. */
   readonly serverLabel: string;
-  readonly peek: AgentsViewPeek | undefined;
   /** Ctrl+X first-press target awaiting a second Ctrl+X. */
   readonly confirmDeleteId: string | undefined;
   readonly renameDraft: { readonly sessionId: string; readonly text: string } | undefined;
@@ -71,7 +62,6 @@ export interface AgentsViewProps {
   readonly dispatchEditor: CustomEditor;
   onSelect(id: string): void;
   onOpen(id: string): void;
-  onPeekToggle(id: string): void;
   onDeleteRequest(id: string): void;
   onDeleteConfirm(id: string): void;
   onRenameBegin(id: string): void;
@@ -80,10 +70,6 @@ export interface AgentsViewProps {
   onHelpToggle(): void;
   onQuit(): void;
   onDispatchFocusChange(focused: boolean): void;
-  /** Peek reply draft edit (printable char / Backspace / Esc-clear). */
-  onPeekReplyChange(text: string): void;
-  /** Enter while peeked: submit the current draft as a steer to this session. */
-  onPeekReplySubmit(sessionId: string): void;
 }
 
 /** Minimum dimensions before we just print a "too small" message. */
@@ -92,7 +78,7 @@ const MIN_HEIGHT = 10;
 
 const MORE_ITEM_ID = 'more:completed';
 
-type ViewItemKind = 'header' | 'row' | 'more';
+type ViewItemKind = 'header' | 'row' | 'more' | 'spacer';
 
 interface ViewItem {
   readonly id: string;
@@ -111,15 +97,15 @@ const HELP_LINES: readonly string[] = [
   'Shortcuts',
   '',
   '  ↑/↓ or j/k   move selection (j/k type into a non-empty dispatch box)',
-  '  → / Space    open peek detail · type to draft a reply · Enter sends',
-  '  ←            close peek · collapse group (→ expands a collapsed one)',
+  '  →            open session (same as Enter) · expand a collapsed group',
+  '  ←            collapse an expanded group',
   '  type         focus the dispatch editor · Enter dispatches · Esc back',
   '  Enter        open session · collapse/expand group · expand completed',
   '  Ctrl+X       delete session (press twice to confirm)',
   '  Ctrl+R       rename session',
   '  Ctrl+T       pin / unpin',
   '  ?            toggle this help',
-  '  Esc / q      quit (Esc clears the reply draft, then closes peek)',
+  '  Esc / q      quit',
 ];
 
 export class AgentsViewApp extends Container implements Focusable {
@@ -159,6 +145,8 @@ export class AgentsViewApp extends Container implements Focusable {
   private deriveItems(): ViewItem[] {
     const items: ViewItem[] = [];
     for (const group of this.props.groups) {
+      // A blank line between groups, never before the first one.
+      if (items.length > 0) items.push({ id: `spacer:${group.id}`, kind: 'spacer', group });
       items.push({ id: `group:${group.id}`, kind: 'header', group });
       for (const row of group.rows) items.push({ id: row.id, kind: 'row', group, row });
       if (group.id === 'completed' && this.hiddenCompletedCount() > 0) {
@@ -183,14 +171,16 @@ export class AgentsViewApp extends Container implements Focusable {
       this.listScroll = 0;
       return;
     }
+    let idx = this.selectedIndex;
     if (this.props.selectedId !== undefined) {
-      const idx = items.findIndex((item) => item.id === this.props.selectedId);
-      if (idx !== -1) {
-        this.selectedIndex = idx;
-        return;
-      }
+      const found = items.findIndex((item) => item.id === this.props.selectedId);
+      if (found !== -1) idx = found;
     }
-    if (this.selectedIndex >= items.length) this.selectedIndex = items.length - 1;
+    if (idx >= items.length) idx = items.length - 1;
+    // A spacer is never a valid selection target — nudge onto the header
+    // that always follows it.
+    if (items[idx]?.kind === 'spacer') idx = Math.min(idx + 1, items.length - 1);
+    this.selectedIndex = idx;
   }
 
   // ── key routing ─────────────────────────────────────────────────────
@@ -254,36 +244,12 @@ export class AgentsViewApp extends Container implements Focusable {
     }
 
     if (matchesKey(data, Key.escape)) {
-      const peek = this.props.peek;
-      // Esc clears a non-empty reply draft first; the next Esc closes the peek.
-      if (peek !== undefined && peek.replyDraft !== '') this.props.onPeekReplyChange('');
-      else if (peek !== undefined) this.props.onPeekToggle(peek.sessionId);
-      else this.props.onQuit();
+      this.props.onQuit();
       return;
     }
 
-    // Peek reply box: while a peek is open, printable input drafts the reply
-    // — NEVER the dispatch editor, or a reply would silently become a
-    // new-session dispatch. Enter submits, Backspace edits; navigation keys
-    // fall through to the list handling below.
-    const peek = this.props.peek;
-    if (peek !== undefined) {
-      if (matchesKey(data, Key.enter)) {
-        this.props.onPeekReplySubmit(peek.sessionId);
-        return;
-      }
-      if (matchesKey(data, Key.backspace)) {
-        this.props.onPeekReplyChange([...peek.replyDraft].slice(0, -1).join(''));
-        return;
-      }
-      if (isPrintableChar(k)) {
-        this.props.onPeekReplyChange(peek.replyDraft + k);
-        return;
-      }
-    }
-
     // Once the dispatch editor holds text, printable chars belong to it —
-    // the printable shortcuts below (j/k/q/Space/?) only act on an empty
+    // the printable shortcuts below (j/k/q/?) only act on an empty
     // editor.
     if (this.props.dispatchEditor.getText().length > 0 && isPrintableChar(k)) {
       this.routeToDispatch(data);
@@ -311,23 +277,19 @@ export class AgentsViewApp extends Container implements Focusable {
       return;
     }
 
-    // ← / → : the list ↔ detail split. → on a row opens its peek detail,
-    // ← closes an open peek (back to the list); on group headers → expands
-    // a collapsed group and ← collapses an expanded one. A collapsed header
-    // is recognizable by its emptied rows (the controller zeroes them).
+    // ← / → : a tree-navigation convention on group headers only — → expands
+    // a collapsed group, ← collapses an expanded one. A collapsed header is
+    // recognizable by its emptied rows (the controller zeroes them). On a
+    // row, → opens the session (same as Enter); ← is a no-op there.
     if (matchesKey(data, Key.right)) {
       const item = this.deriveItems()[this.selectedIndex];
-      if (item !== undefined && this.props.peek === undefined) {
-        if (item.kind === 'row') this.props.onPeekToggle(item.id);
+      if (item !== undefined) {
+        if (item.kind === 'row') this.props.onOpen(item.id);
         else if (item.kind === 'header' && item.group.rows.length === 0) this.props.onOpen(item.id);
       }
       return;
     }
     if (matchesKey(data, Key.left)) {
-      if (this.props.peek !== undefined) {
-        this.props.onPeekToggle(this.props.peek.sessionId);
-        return;
-      }
       const item = this.deriveItems()[this.selectedIndex];
       if (item !== undefined && item.kind === 'header' && item.group.rows.length > 0) {
         this.props.onOpen(item.id);
@@ -341,10 +303,6 @@ export class AgentsViewApp extends Container implements Focusable {
         // `more:completed` and `group:*` ids are interpreted by the
         // controller (expand / collapse); a row id is an open request.
         this.props.onOpen(item.id);
-        return;
-      }
-      if (k === ' ') {
-        if (item.kind === 'row') this.props.onPeekToggle(item.id);
         return;
       }
       if (matchesKey(data, Key.ctrl('r'))) {
@@ -376,7 +334,14 @@ export class AgentsViewApp extends Container implements Focusable {
   private moveSelection(delta: number): void {
     const items = this.deriveItems();
     if (items.length === 0) return;
-    this.selectedIndex = Math.max(0, Math.min(items.length - 1, this.selectedIndex + delta));
+    let next = Math.max(0, Math.min(items.length - 1, this.selectedIndex + delta));
+    // A spacer is never a valid stop — step over it in the same direction.
+    // It always sits strictly between two groups, so this cannot run off
+    // either end.
+    while (items[next]?.kind === 'spacer') {
+      next = Math.max(0, Math.min(items.length - 1, next + delta));
+    }
+    this.selectedIndex = next;
     this.props.onSelect(items[this.selectedIndex]?.id ?? '');
     this.invalidate();
   }
@@ -400,10 +365,6 @@ export class AgentsViewApp extends Container implements Focusable {
     const lines: string[] = [this.renderHeader(width)];
     if (this.helpVisible) {
       lines.push(...this.renderHelp(width, listHeight));
-    } else if (this.props.peek !== undefined) {
-      const peekHeight = Math.max(3, Math.floor(listHeight / 3));
-      lines.push(...this.renderList(width, listHeight - peekHeight));
-      lines.push(...this.renderPeek(width, peekHeight, this.props.peek));
     } else {
       lines.push(...this.renderList(width, listHeight));
     }
@@ -447,6 +408,9 @@ export class AgentsViewApp extends Container implements Focusable {
   }
 
   private renderItem(item: ViewItem, selected: boolean, width: number): string {
+    if (item.kind === 'spacer') {
+      return ' '.repeat(width);
+    }
     if (item.kind === 'header') {
       return renderGroupHeader(item.group.label, item.group.rows.length, selected, width);
     }
@@ -474,28 +438,6 @@ export class AgentsViewApp extends Container implements Focusable {
     return undefined;
   }
 
-  private renderPeek(width: number, height: number, peek: AgentsViewPeek): string[] {
-    const title = this.findRow(peek.sessionId)?.title ?? peek.sessionId;
-    const label = `─ Peek: ${title} `;
-    const lines: string[] = [
-      fitExactly(currentTheme.fg('primary', label + '─'.repeat(Math.max(0, width - visibleWidth(label)))), width),
-    ];
-    const bodyRows = height - 2;
-    for (const text of peek.lines.slice(-Math.max(0, bodyRows))) {
-      lines.push(fitExactly(currentTheme.fg('textDim', ` ${text}`), width));
-    }
-    while (lines.length < height - 1) lines.push(' '.repeat(width));
-    lines.push(
-      fitExactly(
-        currentTheme.fg('accent', ' reply › ') +
-          currentTheme.fg('text', peek.replyDraft) +
-          currentTheme.fg('textDim', '▌'),
-        width,
-      ),
-    );
-    return lines.slice(0, height);
-  }
-
   private renderHelp(width: number, height: number): string[] {
     const lines: string[] = [];
     for (const [i, text] of HELP_LINES.entries()) {
@@ -520,8 +462,6 @@ export class AgentsViewApp extends Container implements Focusable {
       left = ` ${currentTheme.boldFg('warning', this.deleteConfirmCopy(this.props.confirmDeleteId))} ${key('^X')} ${dim('confirm')}  ${dim('any other key cancels')} `;
     } else if (this.helpVisible) {
       left = ` ${key('?')}${dim('/')}${key('Esc')} ${dim('close')} `;
-    } else if (this.props.peek !== undefined) {
-      left = ` ${key('Enter')} ${dim('send reply')}  ${key('Esc')} ${dim('clear draft / close peek')} `;
     } else {
       const item = this.deriveItems()[this.selectedIndex];
       if (item === undefined) {
@@ -531,7 +471,7 @@ export class AgentsViewApp extends Container implements Focusable {
       } else if (item.kind === 'more') {
         left = ` ${key('↑↓')} ${dim('select')}  ${key('Enter')} ${dim('expand')}  ${key('q')} ${dim('quit')} `;
       } else {
-        left = ` ${key('↑↓')} ${dim('select')}  ${key('Enter')} ${dim('open')}  ${key('→')} ${dim('peek')}  ${key('^X')} ${dim('delete')}  ${key('^R')} ${dim('rename')}  ${key('^T')} ${dim('pin')}  ${key('?')} ${dim('shortcuts')}  ${key('q')} ${dim('quit')} `;
+        left = ` ${key('↑↓')} ${dim('select')}  ${key('Enter/→')} ${dim('open')}  ${key('^X')} ${dim('delete')}  ${key('^R')} ${dim('rename')}  ${key('^T')} ${dim('pin')}  ${key('?')} ${dim('shortcuts')}  ${key('q')} ${dim('quit')} `;
       }
     }
 

@@ -79,7 +79,6 @@ function makeProps(overrides: Partial<AgentsViewProps> = {}): AgentsViewProps {
     counts: { awaiting: 0, working: 0, completed: 0 },
     selectedId: undefined,
     serverLabel: 'embedded',
-    peek: undefined,
     confirmDeleteId: undefined,
     renameDraft: undefined,
     flashMessage: undefined,
@@ -87,7 +86,6 @@ function makeProps(overrides: Partial<AgentsViewProps> = {}): AgentsViewProps {
     dispatchEditor: makeDispatchEditor(),
     onSelect: vi.fn(),
     onOpen: vi.fn(),
-    onPeekToggle: vi.fn(),
     onDeleteRequest: vi.fn(),
     onDeleteConfirm: vi.fn(),
     onRenameBegin: vi.fn(),
@@ -96,8 +94,6 @@ function makeProps(overrides: Partial<AgentsViewProps> = {}): AgentsViewProps {
     onHelpToggle: vi.fn(),
     onQuit: vi.fn(),
     onDispatchFocusChange: vi.fn(),
-    onPeekReplyChange: vi.fn(),
-    onPeekReplySubmit: vi.fn(),
     ...overrides,
   };
 }
@@ -159,6 +155,23 @@ describe('AgentsViewApp — full-screen rendering', () => {
     expect(out.indexOf('work-1 title')).toBeGreaterThan(workingHeader);
     expect(out.indexOf('work-1 title')).toBeLessThan(completedHeader);
     expect(out.indexOf('done-1 title')).toBeGreaterThan(completedHeader);
+  });
+
+  it('inserts a blank spacer line between groups, never before the first one', () => {
+    const app = makeApp({
+      groups: [
+        group('awaiting', [row('await-1', { pendingInteraction: 'approval' })]),
+        group('working', [row('work-1', { busy: true })]),
+      ],
+    });
+    const lines = app.render(120).map(strip);
+    const awaitingHeaderIdx = lines.findIndex((l) => l.includes('Awaiting input'));
+    const workingHeaderIdx = lines.findIndex((l) => l.includes('Working'));
+    // The line right above the second group's header is a blank spacer.
+    expect(lines[workingHeaderIdx - 1]?.trim()).toBe('');
+    // The line right above the FIRST group's header is the app header row
+    // (server label / counts), never a spacer.
+    expect(lines[awaitingHeaderIdx - 1]).toContain('KIMI AGENTS');
   });
 
   it('renders the awaiting marker, cwd basename and untrusted badge on rows', () => {
@@ -292,9 +305,9 @@ describe('AgentsViewApp — footer hints follow the selection target', () => {
   ];
   const counts = { awaiting: 0, working: 1, completed: 11 };
 
-  it('session row footer mentions peek/rename/pin', () => {
+  it('session row footer mentions open/rename/pin', () => {
     const out = render(makeApp({ groups, counts, selectedId: 'work-1' }));
-    expect(out).toContain('peek');
+    expect(out).toContain('open');
     expect(out).toContain('rename');
     expect(out).toContain('pin');
   });
@@ -342,6 +355,19 @@ describe('AgentsViewApp — navigation', () => {
     expect(onSelect).toHaveBeenLastCalledWith('a');
   });
 
+  it('steps over the spacer between groups instead of stopping on it', () => {
+    const onSelect = vi.fn();
+    const spacedGroups = [group('working', [row('a', { busy: true })]), group('completed', [row('b')])];
+    const app = makeApp({ groups: spacedGroups, selectedId: 'a', onSelect });
+    // Items: header:working, row:a, spacer:completed, header:completed, row:b.
+    // Down from row a must land on the next group's header, not the spacer.
+    app.handleInput('\u001B[B');
+    expect(onSelect).toHaveBeenLastCalledWith('group:completed');
+    // Up back must land on row a again, not the spacer.
+    app.handleInput('\u001B[A');
+    expect(onSelect).toHaveBeenLastCalledWith('a');
+  });
+
   it('keeps selection across setProps when the id still exists', () => {
     const app = makeApp({ groups, selectedId: 'b' });
     app.setProps(makeProps({ groups, selectedId: 'b' }));
@@ -352,7 +378,7 @@ describe('AgentsViewApp — navigation', () => {
   });
 });
 
-describe('AgentsViewApp — open / peek', () => {
+describe('AgentsViewApp — open', () => {
   it('Enter on a session row invokes onOpen with the row id', () => {
     const onOpen = vi.fn();
     const app = makeApp({ groups: [group('working', [row('s1', { busy: true })])], selectedId: 's1', onOpen });
@@ -383,144 +409,18 @@ describe('AgentsViewApp — open / peek', () => {
     app.handleInput('\r');
     expect(onOpen).toHaveBeenCalledWith('more:completed');
   });
+});
 
-  it('Space on a session row invokes onPeekToggle', () => {
-    const onPeekToggle = vi.fn();
-    const app = makeApp({
-      groups: [group('working', [row('s1', { busy: true })])],
-      selectedId: 's1',
-      onPeekToggle,
-    });
-    app.handleInput(' ');
-    expect(onPeekToggle).toHaveBeenCalledWith('s1');
-  });
-
-  it('peek open renders the tail lines and the reply draft', () => {
-    const out = render(
-      makeApp({
-        groups: [group('working', [row('s1', { busy: true })])],
-        selectedId: 's1',
-        peek: { sessionId: 's1', lines: ['first line', 'latest output'], replyDraft: 'hel' },
-      }),
-    );
-    expect(out).toContain('first line');
-    expect(out).toContain('latest output');
-    expect(out).toContain('hel');
-  });
-
-  it('Esc closes an open peek before quitting', () => {
-    const onPeekToggle = vi.fn();
-    const onQuit = vi.fn();
-    const app = makeApp({
-      groups: [group('working', [row('s1', { busy: true })])],
-      selectedId: 's1',
-      peek: { sessionId: 's1', lines: ['x'], replyDraft: '' },
-      onPeekToggle,
-      onQuit,
-    });
-    app.handleInput('\u001B');
-    expect(onPeekToggle).toHaveBeenCalledWith('s1');
-    expect(onQuit).not.toHaveBeenCalled();
-  });
-
-  it('Esc clears a non-empty reply draft first; the next Esc closes the peek', () => {
-    const onPeekReplyChange = vi.fn();
-    const onPeekToggle = vi.fn();
-    const app = makeApp({
-      groups: [group('working', [row('s1', { busy: true })])],
-      selectedId: 's1',
-      peek: { sessionId: 's1', lines: ['x'], replyDraft: 'draft' },
-      onPeekReplyChange,
-      onPeekToggle,
-    });
-    app.handleInput('\u001B');
-    expect(onPeekReplyChange).toHaveBeenCalledWith('');
-    expect(onPeekToggle).not.toHaveBeenCalled();
-  });
-
-  it('printable input while peeked edits the reply draft, never the dispatch editor', () => {
-    const onPeekReplyChange = vi.fn();
-    const dispatchEditor = makeDispatchEditor();
-    const app = makeApp({
-      groups: [group('working', [row('s1', { busy: true })])],
-      selectedId: 's1',
-      peek: { sessionId: 's1', lines: ['x'], replyDraft: 'hel' },
-      dispatchEditor,
-      onPeekReplyChange,
-    });
-    app.handleInput('l');
-    expect(onPeekReplyChange).toHaveBeenCalledWith('hell');
-    expect(dispatchEditor.getText()).toBe('');
-    // Backspace edits the draft too.
-    app.handleInput('\u007F');
-    expect(onPeekReplyChange).toHaveBeenLastCalledWith('he');
-  });
-
-  it('Enter while peeked submits the reply, not the selected row', () => {
-    const onPeekReplySubmit = vi.fn();
+describe('AgentsViewApp — left/right list-detail split', () => {
+  it('→ on a session row invokes onOpen — same effect as Enter', () => {
     const onOpen = vi.fn();
     const app = makeApp({
       groups: [group('working', [row('s1', { busy: true })])],
       selectedId: 's1',
-      peek: { sessionId: 's1', lines: ['x'], replyDraft: 'go on' },
-      onPeekReplySubmit,
       onOpen,
     });
-    app.handleInput('\r');
-    expect(onPeekReplySubmit).toHaveBeenCalledWith('s1');
-    expect(onOpen).not.toHaveBeenCalled();
-  });
-
-  it('q does not quit while a peek is open (it drafts the reply)', () => {
-    const onQuit = vi.fn();
-    const onPeekReplyChange = vi.fn();
-    const app = makeApp({
-      groups: [group('working', [row('s1', { busy: true })])],
-      selectedId: 's1',
-      peek: { sessionId: 's1', lines: ['x'], replyDraft: '' },
-      onQuit,
-      onPeekReplyChange,
-    });
-    app.handleInput('q');
-    expect(onQuit).not.toHaveBeenCalled();
-    expect(onPeekReplyChange).toHaveBeenCalledWith('q');
-  });
-});
-
-describe('AgentsViewApp — left/right list-detail split', () => {
-  it('→ on a session row invokes onPeekToggle', () => {
-    const onPeekToggle = vi.fn();
-    const app = makeApp({
-      groups: [group('working', [row('s1', { busy: true })])],
-      selectedId: 's1',
-      onPeekToggle,
-    });
     app.handleInput('\u001B[C');
-    expect(onPeekToggle).toHaveBeenCalledWith('s1');
-  });
-
-  it('→ with an open peek does not re-open or stack peeks', () => {
-    const onPeekToggle = vi.fn();
-    const app = makeApp({
-      groups: [group('working', [row('s1', { busy: true }), row('s2', { busy: true })])],
-      selectedId: 's2',
-      peek: { sessionId: 's1', lines: [], replyDraft: '' },
-      onPeekToggle,
-    });
-    app.handleInput('\u001B[C');
-    expect(onPeekToggle).not.toHaveBeenCalled();
-  });
-
-  it('← with an open peek closes it via onPeekToggle', () => {
-    const onPeekToggle = vi.fn();
-    const app = makeApp({
-      groups: [group('working', [row('s1', { busy: true })])],
-      selectedId: 's1',
-      peek: { sessionId: 's1', lines: [], replyDraft: '' },
-      onPeekToggle,
-    });
-    app.handleInput('\u001B[D');
-    expect(onPeekToggle).toHaveBeenCalledWith('s1');
+    expect(onOpen).toHaveBeenCalledWith('s1');
   });
 
   it('→ expands a collapsed group header, ← collapses an expanded one', () => {
@@ -543,18 +443,15 @@ describe('AgentsViewApp — left/right list-detail split', () => {
     expect(onOpen).toHaveBeenCalledWith('group:completed');
   });
 
-  it('← on a plain row is a no-op (nothing to go back from)', () => {
+  it('← on a plain row is a no-op (nothing to collapse)', () => {
     const onOpen = vi.fn();
-    const onPeekToggle = vi.fn();
     const app = makeApp({
       groups: [group('working', [row('s1', { busy: true })])],
       selectedId: 's1',
       onOpen,
-      onPeekToggle,
     });
     app.handleInput('\u001B[D');
     expect(onOpen).not.toHaveBeenCalled();
-    expect(onPeekToggle).not.toHaveBeenCalled();
   });
 });
 
@@ -690,11 +587,10 @@ describe('AgentsViewApp — dispatch editor mount', () => {
     expect(onDispatchFocusChange).toHaveBeenCalledWith(true);
   });
 
-  it('j/k/space/q route to the editor once it holds text (no navigation/peek/quit)', () => {
+  it('j/k/space/q route to the editor once it holds text (no navigation/quit)', () => {
     const editor = makeDispatchEditor();
     editor.setText('fix');
     const onSelect = vi.fn();
-    const onPeekToggle = vi.fn();
     const onQuit = vi.fn();
     const onDispatchFocusChange = vi.fn();
     const app = makeApp({
@@ -702,7 +598,6 @@ describe('AgentsViewApp — dispatch editor mount', () => {
       selectedId: 'a',
       dispatchEditor: editor,
       onSelect,
-      onPeekToggle,
       onQuit,
       onDispatchFocusChange,
     });
@@ -711,7 +606,6 @@ describe('AgentsViewApp — dispatch editor mount', () => {
     expect(onSelect).not.toHaveBeenCalled();
     expect(editor.getText()).toBe('fixjk');
     app.handleInput(' ');
-    expect(onPeekToggle).not.toHaveBeenCalled();
     expect(editor.getText()).toBe('fixjk ');
     app.handleInput('q');
     expect(onQuit).not.toHaveBeenCalled();

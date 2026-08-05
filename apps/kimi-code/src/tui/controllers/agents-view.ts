@@ -1,4 +1,4 @@
-import type { Event, KimiHarness, Session, Unsubscribe, WireSession } from '@moonshot-ai/kimi-code-sdk';
+import type { Event, KimiHarness, Unsubscribe, WireSession } from '@moonshot-ai/kimi-code-sdk';
 import { SDKRpcClientWire } from '@moonshot-ai/kimi-code-sdk';
 import type { Component, Container, ProcessTerminal, TUI } from '@moonshot-ai/pi-tui';
 
@@ -6,11 +6,7 @@ import { AgentsRoster, type AgentsGroup, type AgentsGroupId } from '../agents/ro
 import { loadAgentsViewState, saveAgentsViewState } from '../agents/roster-persistence';
 import { BUILTIN_SLASH_COMMANDS } from '../commands/registry';
 import type { KimiSlashCommand } from '../commands/types';
-import {
-  AgentsViewApp,
-  type AgentsViewPeek,
-  type AgentsViewProps,
-} from '../components/agents-view/app';
+import { AgentsViewApp, type AgentsViewProps } from '../components/agents-view/app';
 import type { CustomEditor } from '../components/editor/custom-editor';
 import type { Theme } from '#/tui/theme';
 
@@ -87,9 +83,6 @@ export interface AgentsViewState {
   /** Focus split between the roster list and the dispatch editor. */
   dispatchFocused: boolean;
   selectedId: string | undefined;
-  peek: AgentsViewPeek | undefined;
-  /** Stale-response guard for async peek loads. */
-  peekRequestId: number;
   confirmDeleteId: string | undefined;
   renameDraft: { sessionId: string; text: string } | undefined;
   flashMessage: string | undefined;
@@ -108,9 +101,6 @@ export interface AgentsViewState {
    *  post-reconnect roster reconciliation. Dies with the view on close(). */
   connectionUnsubscribe: Unsubscribe | undefined;
 }
-
-/** How many projected text lines a peek keeps from the context tail. */
-const PEEK_LINE_LIMIT = 200;
 
 /** The only event types the roster reduces; everything else is dropped here. */
 const GLOBAL_EVENT_TYPES: ReadonlySet<string> = new Set([
@@ -147,30 +137,6 @@ export function dispatchSlashCommands(): readonly KimiSlashCommand[] {
     DISPATCH_BUILTIN_WHITELIST.has(command.name),
   );
   return [...builtins, DISPATCH_AGENT_COMMAND];
-}
-
-type SessionContext = Awaited<ReturnType<Session['getContext']>>;
-
-/**
- * Projects the context history into plain peek lines: user and assistant text
- * only, newest `maxLines` kept. Tool calls / results are not
- * text-projected.
- */
-export function projectPeekLines(
-  history: SessionContext['history'],
-  maxLines: number,
-): string[] {
-  const lines: string[] = [];
-  for (const message of history) {
-    if (message.role !== 'user' && message.role !== 'assistant') continue;
-    for (const part of message.content) {
-      if (part.type !== 'text') continue;
-      const [first, ...rest] = part.text.split('\n');
-      lines.push((message.role === 'user' ? 'you › ' : '') + (first ?? ''));
-      lines.push(...rest);
-    }
-  }
-  return lines.slice(-maxLines);
 }
 
 /**
@@ -241,7 +207,6 @@ export class AgentsViewController {
         dispatch,
         dispatchFocused: false,
         selectedId: undefined,
-        peek: undefined,
         confirmDeleteId: undefined,
         renameDraft: undefined,
         flashMessage: undefined,
@@ -282,8 +247,6 @@ export class AgentsViewController {
       permissionHintShown: false,
       dispatchFocused: false,
       selectedId: undefined,
-      peek: undefined,
-      peekRequestId: 0,
       confirmDeleteId: undefined,
       renameDraft: undefined,
       flashMessage: undefined,
@@ -401,20 +364,6 @@ export class AgentsViewController {
     state.ui.requestRender(true);
   }
 
-  /**
-   * Peek reply seam: re-attaches, steers and detaches. The peek reply
-   * box wires it: printable keys draft via the onPeekReplyChange callback,
-   * Enter submits through {@link handlePeekReplySubmit}.
-   */
-  async submitPeekReply(sessionId: string, text: string): Promise<void> {
-    const session = await this.host.harness.resumeSession({ id: sessionId });
-    try {
-      await session.steer(text);
-    } finally {
-      await session.close();
-    }
-  }
-
   // ---------------------------------------------------------------------------
 
   /**
@@ -468,12 +417,9 @@ export class AgentsViewController {
     if (this.host.state.agentsView !== view) return;
     view.roster.setAllRows(rows.filter((row) => view.viewSessions.has(row.id)));
     // A session that vanished during the drop must not leave a dangling
-    // selection or peek behind.
+    // selection behind.
     if (view.selectedId !== undefined && view.roster.get(view.selectedId) === undefined) {
       view.selectedId = undefined;
-    }
-    if (view.peek !== undefined && view.roster.get(view.peek.sessionId) === undefined) {
-      view.peek = undefined;
     }
     this.syncBusyTicker();
     this.pushProps();
@@ -559,7 +505,6 @@ export class AgentsViewController {
     dispatch: AgentsViewDispatch;
     dispatchFocused: boolean;
     selectedId: string | undefined;
-    peek: AgentsViewPeek | undefined;
     confirmDeleteId: string | undefined;
     renameDraft: { sessionId: string; text: string } | undefined;
     flashMessage: string | undefined;
@@ -577,7 +522,6 @@ export class AgentsViewController {
       counts: view.roster.counts(),
       selectedId: view.selectedId,
       serverLabel: this.host.agentsViewServerLabel(),
-      peek: view.peek,
       confirmDeleteId: view.confirmDeleteId,
       renameDraft: view.renameDraft,
       flashMessage: view.flashMessage,
@@ -614,7 +558,6 @@ export class AgentsViewController {
     AgentsViewProps,
     | 'onSelect'
     | 'onOpen'
-    | 'onPeekToggle'
     | 'onDeleteRequest'
     | 'onDeleteConfirm'
     | 'onRenameBegin'
@@ -623,8 +566,6 @@ export class AgentsViewController {
     | 'onHelpToggle'
     | 'onQuit'
     | 'onDispatchFocusChange'
-    | 'onPeekReplyChange'
-    | 'onPeekReplySubmit'
   > {
     return {
       onSelect: (id) => {
@@ -658,19 +599,6 @@ export class AgentsViewController {
         } else {
           this.host.showStatus('Attach is not available from this host');
         }
-      },
-      onPeekToggle: (id) => {
-        const view = this.host.state.agentsView;
-        if (view === undefined) return;
-        this.clearConfirm(view);
-        if (view.peek !== undefined && view.peek.sessionId === id) {
-          // Closing is free: the wire attach was already detached on load.
-          view.peek = undefined;
-          view.peekRequestId += 1;
-          this.pushProps();
-          return;
-        }
-        void this.openPeek(id);
       },
       onDeleteRequest: (id) => {
         const view = this.host.state.agentsView;
@@ -735,72 +663,7 @@ export class AgentsViewController {
         view.dispatch.editor.focused = focused;
         this.pushProps();
       },
-      onPeekReplyChange: (text) => {
-        const view = this.host.state.agentsView;
-        if (view === undefined || view.peek === undefined) return;
-        view.peek = { ...view.peek, replyDraft: text };
-        this.pushProps();
-      },
-      onPeekReplySubmit: (sessionId) => {
-        const view = this.host.state.agentsView;
-        if (view === undefined) return;
-        void this.handlePeekReplySubmit(sessionId);
-      },
     };
-  }
-
-  /**
-   * Peek reply submit: the draft clears immediately (the reply box resets for
-   * the next message), then the peek seam steers the peeked session — resume →
-   * steer → detach. An empty draft is a no-op.
-   */
-  private async handlePeekReplySubmit(sessionId: string): Promise<void> {
-    const view = this.host.state.agentsView;
-    if (view === undefined || view.peek?.sessionId !== sessionId) return;
-    const text = view.peek.replyDraft.trim();
-    if (text === '') return;
-    view.peek = { ...view.peek, replyDraft: '' };
-    this.pushProps();
-    try {
-      await this.submitPeekReply(sessionId, text);
-    } catch (error) {
-      if (this.host.state.agentsView !== view) return;
-      this.flash(`Reply failed: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-
-  private async openPeek(id: string): Promise<void> {
-    const view = this.host.state.agentsView;
-    if (view === undefined) return;
-    const requestId = (view.peekRequestId += 1);
-    view.peek = { sessionId: id, lines: [], replyDraft: '' };
-    this.pushProps();
-
-    let lines: string[];
-    try {
-      const session = await this.host.harness.resumeSession({ id });
-      try {
-        const context = await session.getContext();
-        lines = projectPeekLines(context.history, PEEK_LINE_LIMIT);
-      } finally {
-        // wire transport: close() is a local detach — the server-side
-        // session keeps running.
-        await session.close();
-      }
-    } catch (error) {
-      const current = this.host.state.agentsView;
-      if (current !== view || current.peekRequestId !== requestId) return;
-      current.peek = undefined;
-      this.flash(`Peek failed: ${error instanceof Error ? error.message : String(error)}`);
-      return;
-    }
-    const current = this.host.state.agentsView;
-    if (current !== view || current.peekRequestId !== requestId) return;
-    if (current.peek?.sessionId !== id) return;
-    // Keep whatever the user already typed into the reply box while the
-    // context was loading.
-    current.peek = { sessionId: id, lines, replyDraft: current.peek.replyDraft };
-    this.pushProps();
   }
 
   private async handleDelete(id: string): Promise<void> {
@@ -824,7 +687,6 @@ export class AgentsViewController {
         view.viewSessions.delete(sessionId);
         removed += 1;
         if (view.selectedId === sessionId) view.selectedId = undefined;
-        if (view.peek?.sessionId === sessionId) view.peek = undefined;
       } catch {
         failed += 1;
       }
