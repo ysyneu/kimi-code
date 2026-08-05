@@ -232,7 +232,8 @@ The agents view talks to a local Kimi server on this machine only:
 
 - Sessions created or attached from the agents view run on the server's engine; they cannot be reopened with `kimi --resume` — re-enter them through `kimi agents`.
 - The list only shows sessions the view itself created or attached on the local Kimi server; sessions started with the plain `kimi` command or created by other clients (for example `kimi web`) do not appear.
-- Inside the view, `!` shell commands are disabled, and skill and plugin slash commands are unavailable.
+- For the whole `kimi agents` run — in the view and in any attached session — `!` shell commands are disabled.
+- Inside the view, skill and plugin slash commands are unavailable.
 - Inside an attached session, configuration slash commands such as `/model` are not yet available.
 
 ### `kimi doctor`
