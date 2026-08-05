@@ -199,6 +199,8 @@ Generate a new persistent bearer token (written to `~/.kimi-code/server.token`);
 
 Open the agents view — a full-screen terminal dashboard over the local Kimi server. It lists the sessions the view owns — every session dispatched from or attached through it — grouped by live status (Awaiting input / Working / Pinned / Completed), updates as sessions make progress or ask for input, and dispatches new sessions from an input box at the bottom, so you can run and supervise many sessions at once without leaving the terminal.
 
+Each row shows the session's status, name, a summary of its latest assistant reply, and how long ago it last updated.
+
 ```sh
 kimi agents
 ```
@@ -209,9 +211,8 @@ This subcommand has no flags.
 | --- | --- |
 | `↑` / `↓` or `j` / `k` | Move the selection |
 | `Enter` | Attach the full chat UI for the selected session; on a group header, collapse or expand the group |
-| `→` | Peek at the selected session's latest output; expand a collapsed group |
-| `←` | Close the peek or collapse a group; from an attached chat (with an empty editor), return to the agents view |
-| `Space` | Peek at the session's latest output; while peeking, type to draft an inline reply and press `Enter` to send it; `Esc` closes the peek |
+| `→` | Same as `Enter` for opening a session; on a group header, expand a collapsed group |
+| `←` | Collapse an expanded group; from an attached chat (with an empty editor), return to the agents view |
 | `Ctrl-X` | Archive the selected session (press twice to confirm); on a group header, archive the whole group. A session's running turn is cancelled first |
 | `Ctrl-R` | Rename the session |
 | `Ctrl-T` | Pin or unpin the session; pinned sessions move to the Pinned group |
@@ -232,6 +233,7 @@ The agents view talks to a local Kimi server on this machine only:
 - Sessions created or attached from the agents view run on the server's engine; they cannot be reopened with `kimi --resume` — re-enter them through `kimi agents`.
 - The list only shows sessions the view itself created or attached on the local Kimi server; sessions started with the plain `kimi` command or created by other clients (for example `kimi web`) do not appear.
 - Inside the view, `!` shell commands are disabled, and skill and plugin slash commands are unavailable.
+- Inside an attached session, configuration slash commands such as `/model` are not yet available.
 
 ### `kimi doctor`
 
