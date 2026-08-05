@@ -1984,6 +1984,11 @@ export class KimiTUI {
     } catch (error) {
       const msg = formatErrorMessage(error);
       this.showError(`Failed to attach session ${targetSessionId}: ${msg}`);
+      // switchToSession can fail after this.session is already assigned
+      // (syncRuntimeState's live HTTP calls, replay, ...) — remount the view
+      // so the failure is recoverable regardless of cause, instead of
+      // leaving the half-attached state behind.
+      void this.agentsViewController.show();
     }
   }
 

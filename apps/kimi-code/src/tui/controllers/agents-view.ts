@@ -1,5 +1,4 @@
 import type { Event, KimiHarness, Unsubscribe, WireSession } from '@moonshot-ai/kimi-code-sdk';
-import { SDKRpcClientWire } from '@moonshot-ai/kimi-code-sdk';
 import type { Component, Container, ProcessTerminal, TUI } from '@moonshot-ai/pi-tui';
 
 import { AgentsRoster, type AgentsGroup, type AgentsGroupId } from '../agents/roster';
@@ -173,7 +172,7 @@ export class AgentsViewController {
     // falls back to the plain SessionSummary list. Both are then narrowed to
     // the view's own registry: sessions dispatched from or attached through
     // this view, never the whole server-wide list.
-    const rpc = wireRpcOf(this.host.harness);
+    const rpc = this.host.harness.wireRpc();
     let persisted: Awaited<ReturnType<typeof loadAgentsViewState>>;
     let summaries: Awaited<ReturnType<KimiHarness['listSessions']>> | undefined;
     let wireRows: readonly WireSession[] | undefined;
@@ -376,7 +375,7 @@ export class AgentsViewController {
   private async loadTrust(ids: readonly string[]): Promise<void> {
     const view = this.host.state.agentsView;
     if (view === undefined) return;
-    const rpc = wireRpcOf(this.host.harness);
+    const rpc = this.host.harness.wireRpc();
     if (rpc === undefined) return;
     let changed = false;
     await Promise.all(
@@ -406,7 +405,7 @@ export class AgentsViewController {
   private async refreshRoster(): Promise<void> {
     const view = this.host.state.agentsView;
     if (view === undefined) return;
-    const rpc = wireRpcOf(this.host.harness);
+    const rpc = this.host.harness.wireRpc();
     if (rpc === undefined) return;
     let rows: readonly WireSession[];
     try {
@@ -443,7 +442,7 @@ export class AgentsViewController {
     // A transport that can't carry the overrides is rejected HERE, before
     // createSession, so the failure can't orphan a server-side session.
     const hasOverrides = submission.model !== undefined || submission.profile !== undefined;
-    const rpc = hasOverrides ? wireRpcOf(this.host.harness) : undefined;
+    const rpc = hasOverrides ? this.host.harness.wireRpc() : undefined;
     if (hasOverrides && rpc === undefined) {
       this.flash('Dispatch failed: /model and /agent overrides require the wire transport');
       return;
@@ -799,19 +798,6 @@ export class AgentsViewController {
     }, durationMs);
     this.pushProps();
   }
-}
-
-/**
- * Type narrowing onto the harness's rpc: the agents view only runs on the
- * wire transport, whose rpc exposes the extended prompt input (model/profile
- * overrides). Returns undefined for any other transport — callers must treat
- * that as "wire-only feature unavailable", never fall back to `any`.
- */
-function wireRpcOf(harness: KimiHarness): SDKRpcClientWire | undefined {
-  // The double cast pierces the private modifier only; the runtime field is
-  // then checked with instanceof before any use.
-  const rpc: unknown = (harness as unknown as { readonly rpc?: unknown }).rpc;
-  return rpc instanceof SDKRpcClientWire ? rpc : undefined;
 }
 
 /**

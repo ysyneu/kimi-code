@@ -350,22 +350,32 @@ describe('AgentsViewApp — navigation', () => {
     expect(onSelect).toHaveBeenLastCalledWith('group:working');
   });
 
-  it('j/k navigate while the dispatch editor is empty', () => {
+  it('j/k type into the dispatch editor, even on an empty list — no navigation', () => {
+    const editor = makeDispatchEditor();
     const onSelect = vi.fn();
-    const app = makeApp({ groups, selectedId: 'a', onSelect });
+    const onDispatchFocusChange = vi.fn();
+    const app = makeApp({
+      groups,
+      selectedId: 'a',
+      onSelect,
+      dispatchEditor: editor,
+      onDispatchFocusChange,
+    });
     app.handleInput('j');
-    expect(onSelect).toHaveBeenLastCalledWith('b');
     app.handleInput('k');
-    expect(onSelect).toHaveBeenLastCalledWith('a');
+    expect(onSelect).not.toHaveBeenCalled();
+    expect(editor.getText()).toBe('jk');
+    expect(onDispatchFocusChange).toHaveBeenCalledWith(true);
   });
 
-  it('Kitty CSI-u encoded j/k navigate', () => {
+  it('Kitty CSI-u encoded j/k also type into the dispatch editor', () => {
+    const editor = makeDispatchEditor();
     const onSelect = vi.fn();
-    const app = makeApp({ groups, selectedId: 'a', onSelect });
+    const app = makeApp({ groups, selectedId: 'a', onSelect, dispatchEditor: editor });
     app.handleInput('[106u'); // j
-    expect(onSelect).toHaveBeenLastCalledWith('b');
     app.handleInput('[107u'); // k
-    expect(onSelect).toHaveBeenLastCalledWith('a');
+    expect(onSelect).not.toHaveBeenCalled();
+    expect(editor.getText()).toBe('jk');
   });
 
   it('steps over the spacer between groups instead of stopping on it', () => {
@@ -424,7 +434,7 @@ describe('AgentsViewApp — open', () => {
   });
 });
 
-describe('AgentsViewApp — left/right list-detail split', () => {
+describe('AgentsViewApp — arrow keys open the selected session', () => {
   it('→ on a session row invokes onOpen — same effect as Enter', () => {
     const onOpen = vi.fn();
     const app = makeApp({
@@ -577,16 +587,24 @@ describe('AgentsViewApp — pin / help / quit', () => {
     expect(onQuit).toHaveBeenCalledTimes(1);
   });
 
-  it('q quits from the plain list', () => {
+  it('q types into the dispatch editor on an empty list — no quit', () => {
+    const editor = makeDispatchEditor();
     const onQuit = vi.fn();
-    makeApp({ onQuit }).handleInput('q');
-    expect(onQuit).toHaveBeenCalledTimes(1);
+    const onDispatchFocusChange = vi.fn();
+    const app = makeApp({ dispatchEditor: editor, onQuit, onDispatchFocusChange });
+    app.handleInput('q');
+    expect(onQuit).not.toHaveBeenCalled();
+    expect(editor.getText()).toBe('q');
+    expect(onDispatchFocusChange).toHaveBeenCalledWith(true);
   });
 
-  it('Kitty CSI-u encoded q quits', () => {
+  it('Kitty CSI-u encoded q also types into the dispatch editor', () => {
+    const editor = makeDispatchEditor();
     const onQuit = vi.fn();
-    makeApp({ onQuit }).handleInput('[113u');
-    expect(onQuit).toHaveBeenCalledTimes(1);
+    const app = makeApp({ dispatchEditor: editor, onQuit });
+    app.handleInput('[113u');
+    expect(onQuit).not.toHaveBeenCalled();
+    expect(editor.getText()).toBe('q');
   });
 });
 

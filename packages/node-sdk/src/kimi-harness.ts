@@ -105,6 +105,19 @@ export class KimiHarness {
     return this.rpc.withInteractiveAgent(agentId, fn);
   }
 
+  /**
+   * Narrow onto the wire transport's rpc client: the agents view needs its
+   * extended prompt input (model/profile overrides), a feature only the wire
+   * transport exposes. Returns undefined for any other transport — callers
+   * must treat that as "wire-only feature unavailable", never fall back to
+   * `any`. A public accessor instead of reaching past `rpc`'s private
+   * modifier from outside the class, so a rename here stays a compile error
+   * at every call site instead of a silent runtime `undefined`.
+   */
+  wireRpc(): SDKRpcClientWire | undefined {
+    return this.rpc instanceof SDKRpcClientWire ? this.rpc : undefined;
+  }
+
   track(event: string, properties?: TelemetryProperties): void {
     this.telemetry.track(event, properties);
   }

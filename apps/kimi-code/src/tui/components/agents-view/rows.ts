@@ -81,7 +81,7 @@ function summaryText(row: AgentsRosterRow, name: string): string {
 }
 
 /**
- * `<ptr><symbol> <name> <助手摘要> <相对时间> [untrusted]`.
+ * `<ptr><symbol> <name> <assistant summary> <relative time> [untrusted]`.
  *
  * One name per row: the server auto-titles a session with its first prompt
  * verbatim, so rendering `lastPrompt` next to the title reads as the same
@@ -90,7 +90,7 @@ function summaryText(row: AgentsRosterRow, name: string): string {
  */
 export function renderRosterRow(row: AgentsRosterRow, selected: boolean, width: number): string {
   const symbol = statusSymbol(row);
-  const name = row.title || singleLine(row.lastPrompt ?? '') || '(untitled)';
+  const name = singleLine(row.title) || singleLine(row.lastPrompt ?? '') || '(untitled)';
   const prefix =
     pointer(selected) +
     currentTheme.fg(symbol.color, symbol.glyph) +

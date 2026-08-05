@@ -215,6 +215,9 @@ function makeHarness(session = makeSession(), overrides: Record<string, unknown>
     track: vi.fn(),
     setTelemetryContext: vi.fn(),
     getExperimentalFeatures: vi.fn(async () => []),
+    // No fixture here runs the wire transport — the agents view's
+    // wire-only narrowing (AgentsViewController.show) must see "unavailable".
+    wireRpc: vi.fn(() => undefined),
     auth: {
       status: vi.fn(async () => ({ providers: [] })),
       login: vi.fn(async () => {}),
@@ -2012,6 +2015,26 @@ describe('KimiTUI agents-view attach', () => {
     expect(driver.state.agentsView?.detached).toBe(false);
     expect(driver.session).toBeUndefined();
     expect(driver.state.appState.sessionId).toBe('');
+  });
+
+  it('a failed switchToSession after a successful resume remounts the agents view', async () => {
+    // I2: syncRuntimeState's getStatus()/getGoal() are live HTTP calls that
+    // can reject (server restart, network blip) after resumeSession already
+    // succeeded and the view detached for the attach — the view must
+    // remount instead of leaving a half-attached state (appState.model
+    // stuck at '', "LLM not set" gate on the next Enter) behind.
+    const session = makeAttachSession('ses-attached');
+    session.getStatus.mockRejectedValueOnce(new Error('status fetch failed'));
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    const showError = vi.spyOn(driver, 'showError').mockImplementation(() => {});
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(showError).toHaveBeenCalledWith(expect.stringContaining('status fetch failed'));
+    });
+    expect(driver.state.agentsView?.detached).toBe(false);
   });
 
   it('re-entering the current session resurfaces its chat without resuming again', async () => {

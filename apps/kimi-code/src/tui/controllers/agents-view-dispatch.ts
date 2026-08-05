@@ -27,7 +27,7 @@ export interface DispatchSubmission {
 
 export type DispatchParseResult = DispatchSubmission | { readonly error: string };
 
-/** Claude's `Too short` floor: at least this many non-space characters. */
+/** `Too short` floor: at least this many non-space characters. */
 const MIN_NON_SPACE_CHARS = 3;
 
 /**

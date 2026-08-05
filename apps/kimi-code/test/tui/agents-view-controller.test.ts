@@ -173,7 +173,7 @@ function makeHarness(
     deleteSession,
     renameSession,
     createSession,
-    rpc: wireRpc,
+    wireRpc: () => wireRpc,
     onEvent: (listener: (event: Event) => void) => {
       listeners.add(listener);
       return () => {
@@ -649,7 +649,7 @@ describe('AgentsViewController — rename', () => {
   });
 });
 
-describe('AgentsViewController — list/detail arrow split', () => {
+describe('AgentsViewController — arrow keys open the selected session', () => {
   let dir: string | undefined;
   afterEach(async () => {
     if (dir !== undefined) {

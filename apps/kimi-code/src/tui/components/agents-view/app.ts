@@ -24,7 +24,7 @@
  *   box. While `dispatchFocused`, every key routes to the editor — Esc is
  *   the editor's own `onEscape` (the controller wires it to unfocus).
  *   List-focused, a printable char focuses the editor and feeds it the
- *   text; the printable shortcuts (j/k/q/?) only act while the editor is
+ *   text; the sole printable shortcut (`?`) only acts while the editor is
  *   EMPTY, once it holds text every printable char belongs to it.
  * - Open: Enter and → both fire `onOpen` on a row — opening always hands
  *   off to the session's own full-screen chat, never an in-view detail.
@@ -96,7 +96,7 @@ interface RenameState {
 const HELP_LINES: readonly string[] = [
   'Shortcuts',
   '',
-  '  ↑/↓ or j/k   move selection (j/k type into a non-empty dispatch box)',
+  '  ↑/↓          move selection',
   '  →            open session (same as Enter) · expand a collapsed group',
   '  ←            collapse an expanded group',
   '  type         focus the dispatch editor · Enter dispatches · Esc back',
@@ -105,7 +105,7 @@ const HELP_LINES: readonly string[] = [
   '  Ctrl+R       rename session',
   '  Ctrl+T       pin / unpin',
   '  ?            toggle this help',
-  '  Esc / q      quit',
+  '  Esc          quit',
 ];
 
 export class AgentsViewApp extends Container implements Focusable {
@@ -263,16 +263,11 @@ export class AgentsViewApp extends Container implements Focusable {
       return;
     }
 
-    if (k === 'q' || k === 'Q') {
-      this.props.onQuit();
-      return;
-    }
-
-    if (matchesKey(data, Key.up) || k === 'k') {
+    if (matchesKey(data, Key.up)) {
       this.moveSelection(-1);
       return;
     }
-    if (matchesKey(data, Key.down) || k === 'j') {
+    if (matchesKey(data, Key.down)) {
       this.moveSelection(1);
       return;
     }
@@ -465,13 +460,13 @@ export class AgentsViewApp extends Container implements Focusable {
     } else {
       const item = this.deriveItems()[this.selectedIndex];
       if (item === undefined) {
-        left = ` ${key('?')} ${dim('shortcuts')}  ${key('q')} ${dim('quit')} `;
+        left = ` ${key('?')} ${dim('shortcuts')}  ${key('Esc')} ${dim('quit')} `;
       } else if (item.kind === 'header') {
-        left = ` ${key('↑↓')} ${dim('select')}  ${key('Enter')} ${dim('collapse')}  ${key('←→')} ${dim('expand/collapse')}  ${key('^X')} ${dim('delete group')}  ${key('?')} ${dim('shortcuts')}  ${key('q')} ${dim('quit')} `;
+        left = ` ${key('↑↓')} ${dim('select')}  ${key('Enter')} ${dim('collapse')}  ${key('←→')} ${dim('expand/collapse')}  ${key('^X')} ${dim('delete group')}  ${key('?')} ${dim('shortcuts')}  ${key('Esc')} ${dim('quit')} `;
       } else if (item.kind === 'more') {
-        left = ` ${key('↑↓')} ${dim('select')}  ${key('Enter')} ${dim('expand')}  ${key('q')} ${dim('quit')} `;
+        left = ` ${key('↑↓')} ${dim('select')}  ${key('Enter')} ${dim('expand')}  ${key('Esc')} ${dim('quit')} `;
       } else {
-        left = ` ${key('↑↓')} ${dim('select')}  ${key('Enter/→')} ${dim('open')}  ${key('^X')} ${dim('delete')}  ${key('^R')} ${dim('rename')}  ${key('^T')} ${dim('pin')}  ${key('?')} ${dim('shortcuts')}  ${key('q')} ${dim('quit')} `;
+        left = ` ${key('↑↓')} ${dim('select')}  ${key('Enter/→')} ${dim('open')}  ${key('^X')} ${dim('delete')}  ${key('^R')} ${dim('rename')}  ${key('^T')} ${dim('pin')}  ${key('?')} ${dim('shortcuts')}  ${key('Esc')} ${dim('quit')} `;
       }
     }
 

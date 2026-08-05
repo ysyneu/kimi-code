@@ -1,6 +1,6 @@
 /**
  * Scenario: agents-view roster row rendering.
- * Responsibilities: the Claude-style `glyph name summary time` layout, the
+ * Responsibilities: the `glyph name summary time` row layout, the
  * lastAssistantText → lastPrompt fallback, and the no-cwd/no-duplicate rules.
  * Wiring: pure function, no TUI/component harness needed.
  * Run: pnpm exec vitest run test/tui/components/agents-view-rows.test.ts
@@ -61,6 +61,17 @@ describe('renderRosterRow', () => {
     const line = strip(
       renderRosterRow(row({ title: 'fix the flaky test', lastPrompt: 'fix the flaky test' }), false, 80),
     );
+    expect(line.indexOf('fix the flaky test')).toBe(line.lastIndexOf('fix the flaky test'));
+  });
+
+  it('normalizes a multi-line title for both the rendered row and the lastPrompt dedup', () => {
+    // kap-server accepts multi-line titles; the row must still render as one
+    // line, and the dedup below must still match a single-line lastPrompt.
+    const line = strip(
+      renderRosterRow(row({ title: 'fix the\nflaky test', lastPrompt: 'fix the flaky test' }), false, 80),
+    );
+    expect(line).toContain('fix the flaky test');
+    expect(line).not.toContain('\n');
     expect(line.indexOf('fix the flaky test')).toBe(line.lastIndexOf('fix the flaky test'));
   });
 
