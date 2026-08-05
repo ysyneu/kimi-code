@@ -149,6 +149,14 @@ export class CustomEditor extends Editor {
    * to fall through to the editor default (a no-op on an empty buffer).
    */
   public onLeftArrowEmpty?: () => boolean;
+  /**
+   * Called when the user tries to enter bash (`!`) mode — the typed `!`
+   * keystroke on an empty prompt, or a `!…` paste into one. Return `true`
+   * to veto the mode switch (agents view: the wire surface has no one-shot
+   * shell route); the typed keystroke is swallowed, a paste stays literal.
+   * The host shows the hint. Undefined / `false` keeps normal behavior.
+   */
+  public onBashModeAttempt?: () => boolean;
   public onShiftTab?: () => void;
   /** 'bash' when entering a `!` shell command. The `!` is never part of the
    *  text buffer — it is a separate mode + prompt symbol (see handleInput). */
@@ -528,6 +536,9 @@ export class CustomEditor extends Editor {
       printableChar(normalized) === '!' &&
       this.getText().length === 0
     ) {
+      // A veto (agents view: no shell route on the wire surface) swallows
+      // the keystroke; the host shows why.
+      if (this.onBashModeAttempt?.() === true) return;
       this.inputMode = 'bash';
       this.onInputModeChange?.('bash');
       return;
@@ -541,9 +552,12 @@ export class CustomEditor extends Editor {
     // pastes whose content starts with `!`. Strip the leading `!` so the buffer
     // holds only the command, exactly like the typed path.
     if (emptyPromptBeforeInput && this.inputMode === 'prompt' && this.getText().startsWith('!')) {
-      this.inputMode = 'bash';
-      this.onInputModeChange?.('bash');
-      this.setText(this.getText().slice(1));
+      // A veto keeps the pasted text literal instead of stripping the `!`.
+      if (this.onBashModeAttempt?.() !== true) {
+        this.inputMode = 'bash';
+        this.onInputModeChange?.('bash');
+        this.setText(this.getText().slice(1));
+      }
     }
 
     this.reopenAutocompleteAfterInput();

@@ -775,6 +775,46 @@ describe('CustomEditor bash mode via paste', () => {
   });
 });
 
+
+// ── M4 Task 6: bash (`!`) mode gate — the agents view has no shell route ──
+
+describe('CustomEditor bash mode gate', () => {
+  it('a veto swallows the typed ! keystroke: prompt mode kept, buffer untouched', () => {
+    const editor = makeEditor();
+    const onInputModeChange = vi.fn();
+    const onBashModeAttempt = vi.fn(() => true);
+    editor.onInputModeChange = onInputModeChange;
+    editor.onBashModeAttempt = onBashModeAttempt;
+
+    editor.handleInput('!');
+
+    expect(onBashModeAttempt).toHaveBeenCalledOnce();
+    expect(editor.inputMode).toBe('prompt');
+    expect(editor.getText()).toBe('');
+    expect(onInputModeChange).not.toHaveBeenCalled();
+  });
+
+  it('a pass-through gate (false) keeps the normal bash-mode switch', () => {
+    const editor = makeEditor();
+    editor.onBashModeAttempt = vi.fn(() => false);
+
+    editor.handleInput('!');
+
+    expect(editor.inputMode).toBe('bash');
+    expect(editor.getText()).toBe('');
+  });
+
+  it('a veto keeps a pasted !cmd literal instead of switching modes', () => {
+    const editor = makeEditor();
+    editor.onBashModeAttempt = vi.fn(() => true);
+
+    editor.handleInput('[200~!ls[201~');
+
+    expect(editor.inputMode).toBe('prompt');
+    expect(editor.getText()).toBe('!ls');
+  });
+});
+
 describe('CustomEditor bash mode file completion', () => {
   it('triggers file completion (force:true) for a leading / in bash mode, not the slash menu', async () => {
     const editor = makeEditor();

@@ -879,8 +879,15 @@ export class KimiTUI {
     // decline must leave the TUI exactly as it was. The guard is only wired
     // for embedded servers: attached ones keep running after disconnect, and
     // the normal TUI never sets it (zero behavior change outside agents
-    // mode, double-gated on the agents-view startup marker).
-    if (this.state.startupState === 'agents-view' && this.agentsViewExitGuard !== undefined) {
+    // mode, double-gated on the agents-view startup marker). Signal-driven
+    // stops (143 = SIGTERM) skip the dialog: there is no user to answer an
+    // interactive confirm on the signal path — the graceful shutdown below
+    // settles sessions and state is on disk.
+    if (
+      exitCode !== 143 &&
+      this.state.startupState === 'agents-view' &&
+      this.agentsViewExitGuard !== undefined
+    ) {
       if (this.exitConfirmInFlight) return;
       this.exitConfirmInFlight = true;
       let proceed = false;

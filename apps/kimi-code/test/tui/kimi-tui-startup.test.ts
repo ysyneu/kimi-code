@@ -2297,6 +2297,23 @@ describe('KimiTUI agents-view exit confirmation', () => {
     expect(driver.onExit).toHaveBeenCalledWith(0);
   });
 
+  it('signal-driven stop (SIGTERM, exit 143) skips the dialog and shuts down straight away', async () => {
+    // Folded review item: there is no user to answer an interactive confirm
+    // on the signal path — stop(143) must not mount one, and the graceful
+    // shutdown below settles sessions (state is on disk). User quit in the
+    // same state (stop(0) above) still shows the dialog.
+    const guard = vi.fn(async () => 3);
+    const { harness, driver } = await bootAgentsView(guard);
+
+    // A mounted dialog would await key input forever — resolving proves none.
+    await driver.stop(143);
+
+    expect(guard).not.toHaveBeenCalled();
+    expect(findConfirm(driver)).toBeUndefined();
+    expect(harness.close).toHaveBeenCalledOnce();
+    expect(driver.onExit).toHaveBeenCalledWith(143);
+  });
+
   it('a failed session count never traps the user — shutdown proceeds without the dialog', async () => {
     const guard = vi.fn(async (): Promise<number> => {
       throw new Error('server unreachable');

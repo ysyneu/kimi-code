@@ -41,6 +41,7 @@ export interface EditorKeyboardHost {
   }): boolean;
   recallLastQueued(): QueuedMessage | undefined;
   showError(msg: string): void;
+  showStatus(msg: string): void;
   track(event: string, props?: Record<string, unknown>): void;
   updateEditorBorderHighlight(text?: string): void;
   updateQueueDisplay(): void;
@@ -361,6 +362,15 @@ export class EditorKeyboardController {
     editor.onDownArrowEmpty = () => host.btwPanelController.scroll('down');
 
     editor.onLeftArrowEmpty = () => host.returnToAgentsView();
+
+    // Agents view (M4): the wire surface has no one-shot shell route (M1),
+    // so the `!` bash-input mode is unavailable — veto the switch and say
+    // why. Outside agents mode the gate passes through (zero change).
+    editor.onBashModeAttempt = () => {
+      if (host.state.startupState !== 'agents-view') return false;
+      host.showStatus('Shell commands (!) are not available in agents view.');
+      return true;
+    };
 
     editor.onPasteImage = async () => this.handleClipboardImagePaste();
   }

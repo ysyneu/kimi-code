@@ -16,6 +16,7 @@ interface Harness {
   readonly btwCancelRunning: ReturnType<typeof vi.fn>;
   readonly btwCloseOrCancel: ReturnType<typeof vi.fn>;
   readonly returnToAgentsView: ReturnType<typeof vi.fn>;
+  readonly showStatus: ReturnType<typeof vi.fn>;
 }
 
 function createHarness(options: { streamingPhase?: string; isCompacting?: boolean } = {}): Harness {
@@ -31,6 +32,7 @@ function createHarness(options: { streamingPhase?: string; isCompacting?: boolea
   const btwCancelRunning = vi.fn(() => false);
   const btwCloseOrCancel = vi.fn(() => false);
   const returnToAgentsView = vi.fn(() => false);
+  const showStatus = vi.fn();
   const session = { cancel: vi.fn(async () => {}), cancelCompaction };
 
   const host = {
@@ -49,6 +51,7 @@ function createHarness(options: { streamingPhase?: string; isCompacting?: boolea
     openUndoSelector,
     cancelRunningShellCommand,
     returnToAgentsView,
+    showStatus,
   } as unknown as EditorKeyboardHost;
 
   const controller = new EditorKeyboardController(
@@ -66,6 +69,7 @@ function createHarness(options: { streamingPhase?: string; isCompacting?: boolea
     btwCancelRunning,
     btwCloseOrCancel,
     returnToAgentsView,
+    showStatus,
   };
 }
 
@@ -311,5 +315,30 @@ describe('EditorKeyboardController onLeftArrowEmpty', () => {
 
     expect(handler()).toBe(false);
     expect(returnToAgentsView).toHaveBeenCalledOnce();
+  });
+});
+
+
+// ── M4 Task 6: `!` bash-input mode is hidden in the agents view ──
+
+describe('EditorKeyboardController bash mode gate', () => {
+  it('vetoes bash mode with a status hint while the agents view is active', () => {
+    const { host, editor, showStatus } = createHarness();
+    (host.state as unknown as { startupState: string }).startupState = 'agents-view';
+    const gate = editor['onBashModeAttempt'] as unknown as () => boolean;
+    expect(gate).toBeDefined();
+
+    expect(gate()).toBe(true);
+    expect(showStatus).toHaveBeenCalledWith(
+      'Shell commands (!) are not available in agents view.',
+    );
+  });
+
+  it('passes through outside the agents view (zero behavior change, no hint)', () => {
+    const { editor, showStatus } = createHarness();
+    const gate = editor['onBashModeAttempt'] as unknown as () => boolean;
+
+    expect(gate()).toBe(false);
+    expect(showStatus).not.toHaveBeenCalled();
   });
 });
