@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { ErrorCodes } from '@moonshot-ai/agent-core';
+import { ISessionMetadata, getLiveSessionById } from '@moonshot-ai/agent-core-v2';
 import {
   startServer,
   type RunningServer,
@@ -592,6 +593,26 @@ describe('SDKRpcClientWire lifecycle', () => {
 
     // session.meta.updated (from the rename) flowed through supervisor + translator:
     await waitFor(() => events.some((t) => t.endsWith(':session.meta.updated')));
+    await rpc.close();
+  });
+
+  it('maps lastAssistantText onto SessionSummary through listSessions (wireSessionToSummary)', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+
+    // lastAssistantText is engine-derived (written reactively off turn.ended
+    // by AgentConversationUndoService) — there is no public RPC to set it
+    // directly, so seed it through the running server's own session scope
+    // and assert the public listSessions() surface, which is what exercises
+    // the private wireSessionToSummary mapping.
+    const live = getLiveSessionById(server.core.accessor, created.id);
+    expect(live).toBeDefined();
+    await live!.accessor.get(ISessionMetadata).update({ lastAssistantText: 'the answer is 42' });
+
+    const list = await rpc.listSessions({});
+    expect(list.find((s) => s.id === created.id)?.lastAssistantText).toBe('the answer is 42');
+
     await rpc.close();
   });
 
