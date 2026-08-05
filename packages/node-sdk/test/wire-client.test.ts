@@ -654,6 +654,30 @@ describe('SDKRpcClientWire lifecycle', () => {
     await rpc.close();
   });
 
+  it('listSessionRows returns the full wire rows that SessionSummary drops', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    const rows = await rpc.listSessionRows();
+    const row = rows.find((r) => r.id === created.id);
+    expect(row).toBeDefined();
+    expect(row?.busy).toBe(false);
+    expect(row?.workspace_id).toBeTruthy();
+    expect(row?.metadata.cwd).toBe(cwd);
+    await rpc.close();
+  });
+
+  it('onConnectionState forwards supervisor connection transitions', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const states: boolean[] = [];
+    const off = rpc.onConnectionState((connected) => states.push(connected));
+    await rpc.start();
+    // Registered before start(): the initial connect's transition reaches it.
+    expect(states).toEqual([true]);
+    off();
+    await rpc.close();
+  });
+
   it('rejects a non-loopback serverUrl', () => {
     expect(() => new SDKRpcClientWire({ serverUrl: 'http://192.168.1.10:58627', token: 't' })).toThrow();
   });

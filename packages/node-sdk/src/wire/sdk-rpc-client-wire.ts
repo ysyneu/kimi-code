@@ -555,6 +555,32 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
   }
 
   // -----------------------------------------------------------------------
+  // Session rows + connection state (wire-only — the base surface drops both)
+  // -----------------------------------------------------------------------
+
+  /**
+   * The full wire rows behind {@link listSessions}: `SessionSummary` drops
+   * `busy` / `pending_interaction` / `last_turn_reason`, and the global
+   * `work_changed` fan-out is change-driven only (no connect-time snapshot),
+   * so a cold-open roster or a post-reconnect reconciliation seeds from
+   * these rows instead.
+   */
+  async listSessionRows(): Promise<readonly WireSession[]> {
+    const page = await this.http.listSessions({ workspace_id: undefined });
+    return page.items;
+  }
+
+  /**
+   * Observe the WS connection state; `true` fires on every successful
+   * (re)connect. Global fan-out events have no journal, so whatever they
+   * carried during a drop is lost — consumers re-seed on the reconnect edge.
+   * Returns an unsubscribe handle.
+   */
+  onConnectionState(handler: (connected: boolean) => void): () => void {
+    return this.supervisor.connectionState(handler);
+  }
+
+  // -----------------------------------------------------------------------
   // Degrade surface
   //
   // The TUI reads these unconditionally on startup/attach; kap-server has no

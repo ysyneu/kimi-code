@@ -1,4 +1,4 @@
-import type { Event, KimiHarness, Session, SessionSummary, Unsubscribe } from '@moonshot-ai/kimi-code-sdk';
+import type { Event, KimiHarness, Session, Unsubscribe, WireSession } from '@moonshot-ai/kimi-code-sdk';
 import { SDKRpcClientWire } from '@moonshot-ai/kimi-code-sdk';
 import type { Component, ProcessTerminal, TUI } from '@moonshot-ai/pi-tui';
 
@@ -80,6 +80,9 @@ export interface AgentsViewState {
   collapsedGroups: Set<AgentsGroupId>;
   completedExpanded: boolean;
   eventUnsubscribe: Unsubscribe;
+  /** WS connection-state subscription (wire transport only) — drives the
+   *  post-reconnect roster reconciliation. Dies with the view on close(). */
+  connectionUnsubscribe: Unsubscribe | undefined;
 }
 
 /** How many projected text lines a peek keeps from the context tail. */
@@ -175,12 +178,18 @@ export class AgentsViewController {
       return;
     }
 
+    // The wire transport seeds from the full session rows — busy /
+    // pending_interaction survive the mapping (I1). Any other transport
+    // falls back to the plain SessionSummary list.
+    const rpc = wireRpcOf(this.host.harness);
     let pins: Set<string>;
-    let summaries: Awaited<ReturnType<KimiHarness['listSessions']>>;
+    let summaries: Awaited<ReturnType<KimiHarness['listSessions']>> | undefined;
+    let wireRows: readonly WireSession[] | undefined;
     try {
-      [pins, summaries] = await Promise.all([
+      [pins, summaries, wireRows] = await Promise.all([
         loadPins(this.host.harness.homeDir),
-        this.host.harness.listSessions({}),
+        rpc === undefined ? this.host.harness.listSessions({}) : Promise.resolve(undefined),
+        rpc?.listSessionRows() ?? Promise.resolve(undefined),
       ]);
     } catch (error) {
       this.host.showError(
@@ -191,7 +200,8 @@ export class AgentsViewController {
     if (state.agentsView !== undefined) return;
 
     const roster = new AgentsRoster(pins);
-    roster.setAll(summaries);
+    if (wireRows !== undefined) roster.setAllRows(wireRows);
+    else if (summaries !== undefined) roster.setAll(summaries);
 
     // The dispatch editor is built before the component: it renders into the
     // component's bottom box, so the initial props already reference it.
@@ -255,11 +265,17 @@ export class AgentsViewController {
       eventUnsubscribe: this.host.harness.onEvent((event) => {
         this.handleGlobalEvent(event);
       }),
+      connectionUnsubscribe: rpc?.onConnectionState((connected) => {
+        // Global fan-out events have no journal: whatever changed during a
+        // drop is lost, so a reconnect re-seeds the whole roster (I2). The
+        // initial connect predates this handler — only reconnects fire it.
+        if (connected) void this.refreshRoster();
+      }),
     });
 
     // Trust badges load after mount: the roster is already useful without
     // them, and the per-row reads must never block or break show().
-    void this.loadTrust(summaries);
+    void this.loadTrust((wireRows ?? summaries ?? []).map((row) => row.id));
   }
 
   close(): void {
@@ -272,6 +288,7 @@ export class AgentsViewController {
       return;
     }
     view.eventUnsubscribe();
+    view.connectionUnsubscribe?.();
     if (view.flashTimer !== undefined) clearTimeout(view.flashTimer);
     this.host.setAttachBadge(undefined);
 
@@ -354,28 +371,60 @@ export class AgentsViewController {
    * badge, no error surface; non-wire transports have no trust route and are
    * skipped by the narrowing.
    */
-  private async loadTrust(summaries: readonly SessionSummary[]): Promise<void> {
+  private async loadTrust(ids: readonly string[]): Promise<void> {
     const view = this.host.state.agentsView;
     if (view === undefined) return;
     const rpc = wireRpcOf(this.host.harness);
     if (rpc === undefined) return;
     let changed = false;
     await Promise.all(
-      summaries.map(async (summary) => {
+      ids.map(async (id) => {
         // Archived sessions never entered the roster; setTrusted would no-op.
-        if (view.roster.get(summary.id) === undefined) return;
+        if (view.roster.get(id) === undefined) return;
         let trusted: boolean | undefined;
         try {
-          trusted = await rpc.getWorkspaceTrustForSession(summary.id);
+          trusted = await rpc.getWorkspaceTrustForSession(id);
         } catch {
           return;
         }
         if (this.host.state.agentsView !== view) return;
-        view.roster.setTrusted(summary.id, trusted);
+        view.roster.setTrusted(id, trusted);
         changed = true;
       }),
     );
     if (changed && this.host.state.agentsView === view) this.pushProps();
+  }
+
+  /**
+   * WS reconnect reconciliation (I2): global fan-out events have no journal,
+   * so whatever changed during the drop is re-seeded from a fresh session
+   * list. A failed re-list keeps the last known roster — the next reconnect
+   * retries.
+   */
+  private async refreshRoster(): Promise<void> {
+    const view = this.host.state.agentsView;
+    if (view === undefined) return;
+    const rpc = wireRpcOf(this.host.harness);
+    if (rpc === undefined) return;
+    let rows: readonly WireSession[];
+    try {
+      rows = await rpc.listSessionRows();
+    } catch {
+      return;
+    }
+    if (this.host.state.agentsView !== view) return;
+    view.roster.setAllRows(rows);
+    // A session that vanished during the drop must not leave a dangling
+    // selection or peek behind.
+    if (view.selectedId !== undefined && view.roster.get(view.selectedId) === undefined) {
+      view.selectedId = undefined;
+    }
+    if (view.peek !== undefined && view.roster.get(view.peek.sessionId) === undefined) {
+      view.peek = undefined;
+    }
+    this.pushProps();
+    // The attach badge reads the same roster while detached — keep it honest.
+    if (view.detached) this.pushAttachBadge(view, this.host.getCurrentSessionId());
   }
 
   /**

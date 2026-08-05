@@ -2,10 +2,39 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import type { Event, SessionSummary } from '@moonshot-ai/kimi-code-sdk';
+import type { Event, SessionSummary, WireSession } from '@moonshot-ai/kimi-code-sdk';
 
 import { AgentsRoster } from '#/tui/agents/roster';
 import { loadPins, savePins } from '#/tui/agents/roster-persistence';
+
+/** A full wire session row (what `SDKRpcClientWire.listSessionRows` serves). */
+function wireRow(id: string, overrides: Partial<WireSession> = {}): WireSession {
+  return {
+    id,
+    workspace_id: 'ws_1',
+    title: `session ${id}`,
+    created_at: '2026-07-30T00:00:00.000Z',
+    updated_at: '2026-07-30T01:00:00.000Z',
+    busy: false,
+    pending_interaction: 'none',
+    metadata: { cwd: `/work/${id}` },
+    agent_config: { model: 'k2' },
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_tokens: 0,
+      cache_creation_tokens: 0,
+      total_cost_usd: 0,
+      context_tokens: 0,
+      context_limit: 0,
+      turn_count: 0,
+    },
+    permission_rules: [],
+    message_count: 0,
+    last_seq: 0,
+    ...overrides,
+  };
+}
 
 function summary(id: string, overrides: Partial<SessionSummary> = {}): SessionSummary {
   return {
@@ -243,6 +272,30 @@ describe('AgentsRoster', () => {
     expect(roster.get('a')?.trusted).toBe(false);
     roster.setTrusted('a', undefined);
     expect(roster.get('a')?.trusted).toBeUndefined();
+  });
+
+  it('setAllRows seeds busy/awaiting state from wire rows and preserves trusted badges', () => {
+    // Final review I1: the cold-open (and post-reconnect) roster must not
+    // default live sessions to Completed — the rich wire rows carry the facts.
+    const roster = new AgentsRoster(new Set());
+    roster.setAll([summary('a'), summary('b')]);
+    roster.setTrusted('b', false);
+
+    roster.setAllRows([
+      wireRow('a', { busy: true }),
+      wireRow('b', { busy: false, pending_interaction: 'approval', last_turn_reason: 'failed' }),
+      wireRow('c', { archived: true }),
+    ]);
+
+    expect(roster.get('c')).toBeUndefined();
+    expect(roster.get('a')?.busy).toBe(true);
+    const b = roster.get('b');
+    expect(b?.pendingInteraction).toBe('approval');
+    expect(b?.lastTurnReason).toBe('failed');
+    // The wire rows carry no trust info — the badge survives the re-seed.
+    expect(b?.trusted).toBe(false);
+    expect(groupIds(roster)).toEqual(['awaiting', 'working']);
+    expect(roster.counts()).toEqual({ awaiting: 1, working: 1, completed: 0 });
   });
 });
 

@@ -1,4 +1,4 @@
-import type { Event, SessionSummary } from '@moonshot-ai/kimi-code-sdk';
+import type { Event, SessionSummary, WireSession } from '@moonshot-ai/kimi-code-sdk';
 
 export interface AgentsRosterRow {
   readonly id: string;
@@ -79,6 +79,37 @@ export class AgentsRoster {
         busy: false,
         pendingInteraction: 'none',
         pinned: this.pins.has(session.id),
+      });
+    }
+  }
+
+  /**
+   * Rich seed from the wire session rows (`SDKRpcClientWire.listSessionRows`):
+   * `GET /sessions` carries `busy` / `pending_interaction` / `last_turn_reason`
+   * that `SessionSummary` drops, and the global `work_changed` fan-out has no
+   * connect-time snapshot — without this a cold-open (or post-reconnect)
+   * roster shows live sessions as Completed. Existing `trusted` badges survive:
+   * the wire rows carry no trust info, so a refresh must not erase them.
+   */
+  setAllRows(rows: readonly WireSession[]): void {
+    const trusted = new Map<string, boolean>();
+    for (const [id, row] of this.rows) {
+      if (row.trusted !== undefined) trusted.set(id, row.trusted);
+    }
+    this.rows.clear();
+    for (const session of rows) {
+      if (session.archived === true) continue;
+      this.rows.set(session.id, {
+        id: session.id,
+        title: session.title,
+        lastPrompt: session.last_prompt,
+        workDir: session.metadata.cwd,
+        updatedAt: Date.parse(session.updated_at),
+        busy: session.busy,
+        pendingInteraction: session.pending_interaction ?? 'none',
+        lastTurnReason: session.last_turn_reason,
+        pinned: this.pins.has(session.id),
+        trusted: trusted.get(session.id),
       });
     }
   }

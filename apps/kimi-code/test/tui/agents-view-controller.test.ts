@@ -2,7 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { Event, KimiHarness, Session, SessionSummary } from '@moonshot-ai/kimi-code-sdk';
+import type { Event, KimiHarness, Session, SessionSummary, WireSession } from '@moonshot-ai/kimi-code-sdk';
 import { SDKRpcClientWire } from '@moonshot-ai/kimi-code-sdk';
 import type { Component, ProcessTerminal, Terminal, TUI } from '@moonshot-ai/pi-tui';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -77,6 +77,35 @@ function summary(id: string, overrides: Partial<SessionSummary> = {}): SessionSu
   };
 }
 
+/** A full wire session row (what `SDKRpcClientWire.listSessionRows` serves). */
+function wireRow(id: string, overrides: Partial<WireSession> = {}): WireSession {
+  return {
+    id,
+    workspace_id: 'ws_1',
+    title: `${id} title`,
+    created_at: new Date(1).toISOString(),
+    updated_at: new Date(1_000).toISOString(),
+    busy: false,
+    pending_interaction: 'none',
+    metadata: { cwd: '/home/user/project' },
+    agent_config: { model: 'k2' },
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_tokens: 0,
+      cache_creation_tokens: 0,
+      total_cost_usd: 0,
+      context_tokens: 0,
+      context_limit: 0,
+      turn_count: 0,
+    },
+    permission_rules: [],
+    message_count: 0,
+    last_seq: 0,
+    ...overrides,
+  };
+}
+
 interface FakeHarness {
   harness: KimiHarness;
   listSessions: ReturnType<typeof vi.fn>;
@@ -88,15 +117,22 @@ interface FakeHarness {
   createdSession: { id: string; prompt: ReturnType<typeof vi.fn> };
   wirePrompt: ReturnType<typeof vi.fn> | undefined;
   wireTrust: ReturnType<typeof vi.fn> | undefined;
+  wireRows: ReturnType<typeof vi.fn> | undefined;
   emit(event: unknown): void;
+  emitConnection(connected: boolean): void;
 }
 
 function makeHarness(
   homeDir: string,
   summaries: readonly SessionSummary[],
-  opts: { wire?: boolean; trust?: (id: string) => Promise<boolean | undefined> } = {},
+  opts: {
+    wire?: boolean;
+    trust?: (id: string) => Promise<boolean | undefined>;
+    rows?: readonly WireSession[];
+  } = {},
 ): FakeHarness {
   const listeners = new Set<(event: Event) => void>();
+  const connectionListeners = new Set<(connected: boolean) => void>();
   const session = {
     getContext: vi.fn(async () => ({ history: [], tokenCount: 0 })),
     steer: vi.fn(async () => {}),
@@ -105,14 +141,25 @@ function makeHarness(
   const createdSession = { id: 'new-session', prompt: vi.fn(async () => {}) };
   const wirePrompt = opts.wire === true ? vi.fn(async () => {}) : undefined;
   const wireTrust = opts.wire === true ? vi.fn(opts.trust ?? (async () => true)) : undefined;
+  const wireRows =
+    opts.wire === true
+      ? vi.fn(async () => opts.rows ?? summaries.map((s) => wireRow(s.id, { title: s.title })))
+      : undefined;
   // A bare prototype instance satisfies the controller's instanceof narrowing
   // without booting a real wire client.
   const wireRpc =
-    wirePrompt === undefined || wireTrust === undefined
+    wirePrompt === undefined || wireTrust === undefined || wireRows === undefined
       ? undefined
       : (Object.assign(Object.create(SDKRpcClientWire.prototype) as SDKRpcClientWire, {
           prompt: wirePrompt,
           getWorkspaceTrustForSession: wireTrust,
+          listSessionRows: wireRows,
+          onConnectionState: (listener: (connected: boolean) => void) => {
+            connectionListeners.add(listener);
+            return () => {
+              connectionListeners.delete(listener);
+            };
+          },
         }));
   const listSessions = vi.fn(async () => summaries);
   const resumeSession = vi.fn(async () => session as unknown as Session);
@@ -145,8 +192,12 @@ function makeHarness(
     createdSession,
     wirePrompt,
     wireTrust,
+    wireRows,
     emit: (event: unknown) => {
       for (const listener of listeners) listener(event as Event);
+    },
+    emitConnection: (connected: boolean) => {
+      for (const listener of connectionListeners) listener(connected);
     },
   };
 }
@@ -174,11 +225,12 @@ async function boot(
     onOpenSession?: (id: string) => void;
     wire?: boolean;
     trust?: (id: string) => Promise<boolean | undefined>;
+    rows?: readonly WireSession[];
     currentSessionId?: string;
   } = {},
 ): Promise<Boot> {
   const homeDir = await mkdtemp(join(tmpdir(), 'agents-view-controller-'));
-  const fake = makeHarness(homeDir, summaries, { wire: opts.wire, trust: opts.trust });
+  const fake = makeHarness(homeDir, summaries, { wire: opts.wire, trust: opts.trust, rows: opts.rows });
   const ui: FakeUI = {
     children: [SENTINEL_A, SENTINEL_B],
     clear() {
@@ -1277,5 +1329,114 @@ describe('hintDeferredPermissionOnce', () => {
     hintDeferredPermissionOnce(b.host);
 
     expect(b.showStatus).not.toHaveBeenCalled();
+  });
+});
+
+
+// ── Final review I1: cold-open seeds busy/awaiting from the rich wire rows ──
+
+describe('AgentsViewController — wire row seeding (I1)', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    dir = undefined;
+  });
+
+  it('cold-open on the wire seeds busy/awaiting state from the rich session rows', async () => {
+    const b = await boot([summary('s1'), summary('s2')], {
+      wire: true,
+      rows: [wireRow('s1', { busy: true }), wireRow('s2', { pending_interaction: 'approval' })],
+    });
+    dir = b.homeDir;
+    // The wire path replaces listSessions entirely — one GET, no dropped facts.
+    expect(b.fake.wireRows).toHaveBeenCalled();
+    expect(b.fake.listSessions).not.toHaveBeenCalled();
+    expect(b.view().roster.get('s1')?.busy).toBe(true);
+    expect(b.view().roster.get('s2')?.pendingInteraction).toBe('approval');
+    const out = b.render();
+    expect(out).toContain('Awaiting input');
+    expect(out).toContain('Working');
+    expect(out).toContain('1 awaiting input');
+    expect(out).toContain('1 working');
+  });
+
+  it('non-wire transports fall back to SessionSummary seeding (idle defaults)', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    expect(b.fake.listSessions).toHaveBeenCalled();
+    const row = b.view().roster.get('s1');
+    expect(row?.busy).toBe(false);
+    expect(row?.pendingInteraction).toBe('none');
+    expect(b.render()).toContain('Completed');
+  });
+});
+
+// ── Final review I2: roster reconciliation after a WS reconnect ──
+
+describe('AgentsViewController — reconnect reconciliation (I2)', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    dir = undefined;
+  });
+
+  it('a WS reconnect re-seeds the roster from a fresh session list', async () => {
+    const b = await boot([summary('s1')], { wire: true, rows: [wireRow('s1', { busy: true })] });
+    dir = b.homeDir;
+    await flush(); // the one-shot trust load settles
+    expect(b.view().roster.get('s1')?.busy).toBe(true);
+    expect(b.view().roster.get('s1')?.trusted).toBe(true);
+
+    // During the drop s1's turn finished and a new session appeared — both
+    // global events were lost (no journal), so the reconnect re-list must
+    // surface them.
+    b.fake.wireRows?.mockResolvedValueOnce([
+      wireRow('s1', { last_turn_reason: 'completed' }),
+      wireRow('s2', { pending_interaction: 'question' }),
+    ]);
+    b.fake.emitConnection(true);
+    await flush();
+
+    const row = b.view().roster.get('s1');
+    expect(row?.busy).toBe(false);
+    expect(row?.lastTurnReason).toBe('completed');
+    // The trust badge survives the re-seed (the wire rows carry no trust info).
+    expect(row?.trusted).toBe(true);
+    expect(b.view().roster.get('s2')?.pendingInteraction).toBe('question');
+    const out = b.render();
+    expect(out).toContain('s2 title');
+    expect(out).toContain('Completed');
+  });
+
+  it('a disconnect does not re-list; a row vanished during the drop drops its selection/peek', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    b.component().handleInput(DOWN); // select s1
+    b.component().handleInput(' '); // peek s1
+    await flush();
+    expect(b.view().peek?.sessionId).toBe('s1');
+    b.fake.wireRows?.mockClear();
+
+    b.fake.emitConnection(false);
+    await flush();
+    expect(b.fake.wireRows).not.toHaveBeenCalled();
+
+    // s1 was archived elsewhere during the drop.
+    b.fake.wireRows?.mockResolvedValueOnce([]);
+    b.fake.emitConnection(true);
+    await flush();
+    expect(b.view().roster.get('s1')).toBeUndefined();
+    expect(b.view().selectedId).toBeUndefined();
+    expect(b.view().peek).toBeUndefined();
+  });
+
+  it('close unsubscribes the connection-state feed', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    b.controller.close();
+    b.fake.wireRows?.mockClear();
+    b.fake.emitConnection(true);
+    await flush();
+    expect(b.fake.wireRows).not.toHaveBeenCalled();
   });
 });
