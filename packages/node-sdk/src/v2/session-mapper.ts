@@ -49,6 +49,7 @@ export function v2SummaryToSessionSummary(
     id: summary.id,
     title: summary.title,
     lastPrompt: summary.lastPrompt,
+    lastAssistantText: summary.lastAssistantText,
     workDir: facts.workDir,
     sessionDir: facts.sessionDir,
     createdAt: summary.createdAt,

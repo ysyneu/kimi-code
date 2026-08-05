@@ -1087,6 +1087,7 @@ export interface SessionWireFields {
   readonly workspaceId: string;
   readonly title?: string;
   readonly lastPrompt?: string;
+  readonly lastAssistantText?: string;
   readonly createdAt: number;
   readonly updatedAt: number;
   readonly archived: boolean;
@@ -1110,6 +1111,7 @@ export function toWireSession(
     last_turn_reason: facts.lastTurnReason,
     archived: fields.archived,
     last_prompt: fields.lastPrompt,
+    last_assistant_text: fields.lastAssistantText,
     metadata: buildWireMetadata(fields.custom, cwd),
     agent_config: { model: '' },
     usage: emptySessionUsage(),

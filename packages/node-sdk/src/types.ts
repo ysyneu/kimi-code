@@ -263,6 +263,7 @@ export interface SessionSummary {
   readonly id: string;
   readonly title?: string | undefined;
   readonly lastPrompt?: string;
+  readonly lastAssistantText?: string;
   readonly workDir: string;
   readonly sessionDir: string;
   readonly createdAt: number;

@@ -106,6 +106,7 @@ export class SessionLegacyService implements ISessionLegacyService {
       root: ctx.cwd,
       title: meta.title,
       lastPrompt: meta.lastPrompt,
+      lastAssistantText: meta.lastAssistantText,
       createdAt: meta.createdAt,
       updatedAt: meta.updatedAt,
       archived: meta.archived,

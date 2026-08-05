@@ -4,6 +4,7 @@ export interface AgentsRosterRow {
   readonly id: string;
   readonly title: string;
   readonly lastPrompt?: string;
+  readonly lastAssistantText?: string;
   readonly workDir: string;
   readonly updatedAt: number;
   readonly busy: boolean;
@@ -51,7 +52,8 @@ function groupOf(row: AgentsRosterRow): AgentsGroupId {
  * Pure state container for the agents view: rows arrive via `setAll` plus the
  * three global SDK events (`session.meta.updated`, `event.session.work_changed`,
  * `event.session.created` — their payloads keep the wire field names, e.g.
- * `pending_interaction` / `last_turn_reason` / `last_prompt`), and the view
+ * `pending_interaction` / `last_turn_reason` / `last_prompt` / `last_assistant_text`),
+ * and the view
  * derives groups/counts from `groups()` / `counts()`. Zero pi-tui dependencies.
  *
  * The roster mutates the pins set handed to the constructor (it is the same
@@ -74,6 +76,7 @@ export class AgentsRoster {
         id: session.id,
         title: session.title ?? '',
         lastPrompt: session.lastPrompt,
+        lastAssistantText: session.lastAssistantText,
         workDir: session.workDir,
         updatedAt: session.updatedAt,
         busy: false,
@@ -103,6 +106,7 @@ export class AgentsRoster {
         id: session.id,
         title: session.title,
         lastPrompt: session.last_prompt,
+        lastAssistantText: session.last_assistant_text,
         workDir: session.metadata.cwd,
         updatedAt: Date.parse(session.updated_at),
         busy: session.busy,
@@ -124,6 +128,9 @@ export class AgentsRoster {
         if (patch !== undefined && typeof patch['lastPrompt'] === 'string') {
           row.lastPrompt = patch['lastPrompt'];
         }
+        if (patch !== undefined && typeof patch['lastAssistantText'] === 'string') {
+          row.lastAssistantText = patch['lastAssistantText'];
+        }
         row.updatedAt = Date.now();
         return;
       }
@@ -142,6 +149,7 @@ export class AgentsRoster {
           id: session.id,
           title: session.title,
           lastPrompt: session.last_prompt,
+          lastAssistantText: session.last_assistant_text,
           workDir: session.metadata.cwd,
           updatedAt: Date.parse(session.updated_at),
           busy: session.busy,

@@ -70,6 +70,7 @@ function sessionCreated(
     busy?: boolean;
     pending_interaction?: 'none' | 'approval' | 'question';
     last_prompt?: string;
+    last_assistant_text?: string;
     cwd?: string;
   } = {},
 ): Event {
@@ -101,6 +102,7 @@ function sessionCreated(
       message_count: 0,
       last_seq: 0,
       last_prompt: overrides.last_prompt,
+      last_assistant_text: overrides.last_assistant_text,
     },
   };
 }
@@ -188,6 +190,7 @@ describe('AgentsRoster', () => {
         title: 'fresh',
         cwd: '/work/fresh',
         last_prompt: 'hello',
+        last_assistant_text: 'hi there',
         updated_at: '2026-07-30T02:00:00.000Z',
       }),
     );
@@ -196,9 +199,28 @@ describe('AgentsRoster', () => {
     expect(row?.title).toBe('fresh');
     expect(row?.workDir).toBe('/work/fresh');
     expect(row?.lastPrompt).toBe('hello');
+    expect(row?.lastAssistantText).toBe('hi there');
     expect(row?.updatedAt).toBe(Date.parse('2026-07-30T02:00:00.000Z'));
     expect(row?.pinned).toBe(false);
     expect(roster.counts()).toEqual({ awaiting: 0, working: 0, completed: 2 });
+  });
+
+  it('session.meta.updated updates lastAssistantText from the patch', () => {
+    const roster = new AgentsRoster(new Set());
+    roster.setAll([summary('a')]);
+
+    roster.applyEvent(metaUpdated('a', { patch: { lastAssistantText: 'the assistant said this' } }));
+
+    expect(roster.get('a')?.lastAssistantText).toBe('the assistant said this');
+  });
+
+  it('setAll and setAllRows carry lastAssistantText through from the seed', () => {
+    const roster = new AgentsRoster(new Set());
+    roster.setAll([summary('a', { lastAssistantText: 'from summary' })]);
+    expect(roster.get('a')?.lastAssistantText).toBe('from summary');
+
+    roster.setAllRows([wireRow('a', { last_assistant_text: 'from wire row' })]);
+    expect(roster.get('a')?.lastAssistantText).toBe('from wire row');
   });
 
   it('ignores events for unknown sessions and unrelated event types', () => {

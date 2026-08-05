@@ -106,7 +106,7 @@ describe('wire protocol schemas', () => {
       id: 'sess_1', workspace_id: 'wd_x_0123456789ab', title: 'demo',
       created_at: '2026-07-30T00:00:00.000Z', updated_at: '2026-07-30T01:00:00.000Z',
       busy: true, main_turn_active: true, pending_interaction: 'approval',
-      last_turn_reason: 'completed', last_prompt: 'hello',
+      last_turn_reason: 'completed', last_prompt: 'hello', last_assistant_text: 'hi there',
       metadata: { cwd: '/tmp/demo' },
       agent_config: { model: '' },
       usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, total_cost_usd: 0, context_tokens: 0, context_limit: 0, turn_count: 0 },
@@ -115,6 +115,7 @@ describe('wire protocol schemas', () => {
     const s = wireSessionSchema.parse(row);
     expect(s.pending_interaction).toBe('approval');
     expect(s.metadata.cwd).toBe('/tmp/demo');
+    expect(s.last_assistant_text).toBe('hi there');
   });
 
   it('parses an event frame and rejects frames without a numeric seq', () => {

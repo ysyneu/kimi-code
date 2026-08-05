@@ -83,6 +83,7 @@ export const wireSessionSchema = z.object({
   archived: z.boolean().optional(),
   current_prompt_id: z.string().min(1).optional(),
   last_prompt: z.string().optional(),
+  last_assistant_text: z.string().optional(),
   metadata: wireSessionMetadataSchema,
   agent_config: z
     .object({

@@ -154,6 +154,7 @@ function wireSessionToSummary(session: WireSession): SessionSummary {
     id: session.id,
     title: session.title,
     lastPrompt: session.last_prompt,
+    lastAssistantText: session.last_assistant_text,
     workDir: session.metadata.cwd,
     sessionDir: '',
     createdAt: Date.parse(session.created_at),

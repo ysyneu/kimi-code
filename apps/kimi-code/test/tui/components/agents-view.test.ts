@@ -174,7 +174,7 @@ describe('AgentsViewApp — full-screen rendering', () => {
     expect(lines[awaitingHeaderIdx - 1]).toContain('KIMI AGENTS');
   });
 
-  it('renders the awaiting marker, cwd basename and untrusted badge on rows', () => {
+  it('renders the awaiting marker and untrusted badge on rows, without the cwd', () => {
     const out = render(
       makeApp({
         groups: [
@@ -185,8 +185,21 @@ describe('AgentsViewApp — full-screen rendering', () => {
       }),
     );
     expect(out).toContain('!');
-    expect(out).toContain('secretproj');
+    expect(out).not.toContain('secretproj');
     expect(out).toContain('untrusted');
+  });
+
+  it('renders the assistant reply summary next to the name', () => {
+    const out = render(
+      makeApp({
+        groups: [
+          group('completed', [
+            row('s1', { title: 's1 title', lastAssistantText: 'the answer is 42' }),
+          ]),
+        ],
+      }),
+    );
+    expect(out).toContain('the answer is 42');
   });
 
   it('shows the empty-state copy when there are no groups', () => {

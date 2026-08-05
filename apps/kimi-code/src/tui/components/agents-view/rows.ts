@@ -34,12 +34,6 @@ function singleLine(text: string): string {
   return text.replaceAll(/\s+/g, ' ').trim();
 }
 
-function basename(path: string): string {
-  const trimmed = path.replaceAll(/\/+$/g, '');
-  const idx = trimmed.lastIndexOf('/');
-  return idx === -1 ? trimmed : trimmed.slice(idx + 1);
-}
-
 export function formatRelativeTime(ts: number): string {
   if (!Number.isFinite(ts) || ts <= 0) return '';
   const diffSec = Math.floor(Math.max(0, Date.now() - ts) / 1000);
@@ -72,11 +66,27 @@ function statusSymbol(row: AgentsRosterRow): { glyph: string; color: StatusColor
 }
 
 /**
- * `<ptr><symbol> <name> <相对时间> <cwd 基名> [untrusted]`.
+ * The summary snippet shown next to the name: the main agent's most recent
+ * assistant reply. Older sessions without `lastAssistantText` fall back to
+ * `lastPrompt` — except when that would just repeat the name already shown
+ * (a single-turn session whose title was auto-derived from that same
+ * prompt, or an untitled row whose name itself fell back to the prompt),
+ * where the summary is left blank instead.
+ */
+function summaryText(row: AgentsRosterRow, name: string): string {
+  if (row.lastAssistantText !== undefined) return singleLine(row.lastAssistantText);
+  if (row.lastPrompt === undefined) return '';
+  const prompt = singleLine(row.lastPrompt);
+  return prompt === name ? '' : prompt;
+}
+
+/**
+ * `<ptr><symbol> <name> <助手摘要> <相对时间> [untrusted]`.
  *
  * One name per row: the server auto-titles a session with its first prompt
  * verbatim, so rendering `lastPrompt` next to the title reads as the same
  * message twice. The title wins; the prompt is only the untitled fallback.
+ * No cwd — the row's elements are name, assistant summary, and time.
  */
 export function renderRosterRow(row: AgentsRosterRow, selected: boolean, width: number): string {
   const symbol = statusSymbol(row);
@@ -87,15 +97,16 @@ export function renderRosterRow(row: AgentsRosterRow, selected: boolean, width: 
     ' ' +
     (selected ? currentTheme.boldFg('textStrong', name) : currentTheme.fg('text', name));
 
+  const summary = summaryText(row, name);
+  const summarySuffix = summary.length > 0 ? currentTheme.fg('textMuted', ` ${summary}`) : '';
+
   const metaParts: string[] = [];
   const rel = formatRelativeTime(row.updatedAt);
   if (rel.length > 0) metaParts.push(rel);
-  const dir = basename(row.workDir);
-  if (dir.length > 0) metaParts.push(dir);
   if (row.trusted === false) metaParts.push('untrusted');
-  const suffix = metaParts.length > 0 ? currentTheme.fg('textMuted', ` ${metaParts.join(' · ')}`) : '';
+  const metaSuffix = metaParts.length > 0 ? currentTheme.fg('textMuted', ` ${metaParts.join(' · ')}`) : '';
 
-  return fitExactly(prefix + suffix, width);
+  return fitExactly(prefix + summarySuffix + metaSuffix, width);
 }
 
 /** Group header line: `<ptr><label> (N)`. */
