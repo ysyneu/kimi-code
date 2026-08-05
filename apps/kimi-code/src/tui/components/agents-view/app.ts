@@ -9,7 +9,7 @@
  * Zero SDK access: the controller owns the roster, peek content, delete /
  * rename / pin side effects and re-pushes props after every action.
  *
- * Behaviour notes for the controller (design §4.3 state machine):
+ * Behaviour notes for the controller:
  * - Delete confirm: while `confirmDeleteId` is set the component still
  *   routes keys normally (Ctrl+X confirms, everything else fires its usual
  *   callback); the controller must clear `confirmDeleteId` on ANY action
@@ -191,7 +191,7 @@ export class AgentsViewApp extends Container implements Focusable {
     if (this.selectedIndex >= items.length) this.selectedIndex = items.length - 1;
   }
 
-  // ── key routing (design §4.3 state machine) ──────────────────────────
+  // ── key routing ─────────────────────────────────────────────────────
 
   handleInput(data: string): void {
     const k = printableChar(data);

@@ -711,7 +711,7 @@ describe('AgentsViewController — open', () => {
     dir = b.homeDir;
     b.component().handleInput(DOWN);
     b.component().handleInput(ENTER);
-    expect(b.showStatus).toHaveBeenCalledWith('Attach lands in M4');
+    expect(b.showStatus).toHaveBeenCalledWith('Attach is not available from this host');
   });
 
   it('Enter on a row delegates to onOpenSession when the host provides one', async () => {
@@ -750,7 +750,7 @@ describe('AgentsViewController — open', () => {
   });
 });
 
-// ── Task 4: dispatch editor + whitelist autocomplete + submission parsing ──
+// ── Dispatch editor + whitelist autocomplete + submission parsing ──
 
 describe('parseDispatchInput', () => {
   it('plain text passes through as-is (trimmed)', () => {
@@ -964,7 +964,7 @@ describe('AgentsViewController — dispatch', () => {
   });
 });
 
-// ── Task 5: workspace trust lookup on show() → roster badge ──
+// ── Workspace trust lookup on show() → roster badge ──
 
 describe('AgentsViewController — workspace trust', () => {
   let dir: string | undefined;
@@ -1013,7 +1013,7 @@ describe('AgentsViewController — workspace trust', () => {
   });
 });
 
-// ── Task 6: dispatch editor visual mount (focus split + key routing) ──
+// ── Dispatch editor visual mount (focus split + key routing) ──
 
 describe('AgentsViewController — dispatch editor mount', () => {
   let dir: string | undefined;
@@ -1069,7 +1069,7 @@ describe('AgentsViewController — dispatch editor mount', () => {
   });
 });
 
-// ── M4 Task 3: attach — component detach keeps the roster subscription alive ──
+// ── Attach — component detach keeps the roster subscription alive ──
 
 describe('AgentsViewController — detach for attach', () => {
   let dir: string | undefined;
@@ -1143,7 +1143,7 @@ describe('AgentsViewController — detach for attach', () => {
 });
 
 
-// ── M4 Task 4: attach footer badge feed + deferred-permission hint ──
+// ── Attach footer badge feed + deferred-permission hint ──
 
 describe('AgentsViewController — attach badge feed', () => {
   let dir: string | undefined;

@@ -10,7 +10,7 @@
  * are available on this transport; everything else falls through to
  * `getRpc()`, which fails loudly with `not_implemented`.
  *
- * Deliberate M1 semantics:
+ * Deliberate wire-transport semantics:
  * - `closeSession` is a LOCAL DETACH ONLY (unsubscribe + drop the registered
  *   handlers + drop the bridge's dedupe/queued state) — no HTTP call, the
  *   server-side session stays alive and resumable, and a later reattach
@@ -22,7 +22,7 @@
  *   surface: `steer` is submit-then-`prompts:steer`, `cancel` is `:abort`,
  *   `compact` / `undoHistory` are `:compact` / `:undo`, and `getContext`
  *   serves the newest message page only. `agent_id` is never sent — every
- *   turn override addresses the main agent (M1).
+ *   turn override addresses the main agent.
  * - `resumeSession` subscribes at the snapshot cursor and replays the
  *   snapshot's pending interactions into the bridge; replayed (and live)
  *   interactions queue until the consumer registers its handlers — consumers
@@ -202,7 +202,7 @@ function wireStatusToSessionStatus(status: WireSessionStatus): SessionStatus {
 
 /**
  * `WireSessionUsage` → the SDK `SessionUsage`. The wire row only carries
- * session totals — no per-model or current-turn split (M1).
+ * session totals — no per-model or current-turn split.
  */
 function wireUsageToSessionUsage(usage: WireSessionUsage): SessionUsage {
   return {
@@ -234,7 +234,7 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
   // bridge queues those interactions instead, and these sets are how it knows.
   private readonly approvalHandlerSessions = new Set<string>();
   private readonly questionHandlerSessions = new Set<string>();
-  // Deferred permission overrides (design §4.1): the wire has no standalone
+  // Deferred permission overrides: the wire has no standalone
   // setPermission verb, so the mode waits here and rides the NEXT prompt/steer
   // submission for that session as `permission_mode`, then clears.
   private readonly pendingPermissions = new Map<string, PermissionMode>();
@@ -359,8 +359,9 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
   override async listSessions(
     input: ListSessionsOptions = {},
   ): Promise<readonly SessionSummary[]> {
-    // The wire list filters by workspace id, not workDir; M1 lists everything
-    // and leaves bucket filtering to the caller (matching the daemon clients).
+    // The wire list filters by workspace id, not workDir; this transport lists
+    // everything and leaves bucket filtering to the caller (matching the daemon
+    // clients).
     void input;
     const page = await this.http.listSessions({ workspace_id: undefined });
     return page.items.map(wireSessionToSummary);
@@ -398,7 +399,7 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
     });
     this.bridge.replayPending(input.id, snapshot);
     // Read-only detail fetches happen after the subscribe + pending replay,
-    // keeping the M1 attach order intact. `includeSubagents` cannot be
+    // keeping the wire attach order intact. `includeSubagents` cannot be
     // honored: the messages surface serves the main agent only, so `agents`
     // always carries exactly `main`.
     const [status, messages] = await Promise.all([
@@ -455,7 +456,7 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
   // -----------------------------------------------------------------------
   // Turns and state
   //
-  // M1 scope note: the prompt route's `agent_id` is never sent, so every
+  // Wire scope note: the prompt route's `agent_id` is never sent, so every
   // override below addresses the session's main agent regardless of
   // `withInteractiveAgent` — subagent targeting arrives with the agents view.
   // -----------------------------------------------------------------------
@@ -504,9 +505,8 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
   }
 
   /**
-   * M1: the newest message page only (no `before_id` paging) with the live
-   * context token count from the status surface. The TUI's replay path (M4)
-   * will specify exactly what it needs; refine then.
+   * The newest message page only (no `before_id` paging) with the live
+   * context token count from the status surface.
    */
   override async getContext(input: SessionIdRpcInput): Promise<AgentContextData> {
     const [{ items }, status] = await Promise.all([
@@ -588,12 +588,12 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
   // not_implemented failures.
   // -----------------------------------------------------------------------
 
-  /** wire degrade: kap-server has no plugin routes (design §4.1). */
+  /** wire degrade: kap-server has no plugin routes. */
   override async listPlugins(): Promise<readonly PluginSummary[]> {
     return [];
   }
 
-  /** wire degrade: kap-server has no plugin routes (design §4.1). */
+  /** wire degrade: kap-server has no plugin routes. */
   override async listPluginCommands(
     input: SessionIdRpcInput,
   ): Promise<readonly PluginCommandDef[]> {
@@ -602,7 +602,7 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
   }
 
   /**
-   * wire degrade: kap-server has no plugin routes (design §4.1). Skills get a
+   * wire degrade: kap-server has no plugin routes. Skills get a
    * server-side route later; revisit when kap-server exposes one.
    */
   override async listSkills(input: SessionIdRpcInput): Promise<readonly SkillSummary[]> {
@@ -610,14 +610,14 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
     return [];
   }
 
-  /** wire degrade: kap-server has no plugin routes (design §4.1). */
+  /** wire degrade: kap-server has no plugin routes. */
   override async getMcpStartupMetrics(input: SessionIdRpcInput): Promise<McpStartupMetrics> {
     void input;
     return { durationMs: 0 };
   }
 
   /**
-   * The wire has no standalone setPermission verb (design §4.1): the mode is
+   * The wire has no standalone setPermission verb: the mode is
    * stored per session and rides the next prompt/steer submission as
    * `permission_mode`, then clears.
    */
@@ -646,7 +646,7 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
   }
 }
 
-/** Best-effort v1 `SessionMeta` from a wire snapshot (M1: no agent roster). */
+/** Best-effort v1 `SessionMeta` from a wire snapshot (no agent roster). */
 function snapshotToSessionMeta(snapshot: WireSnapshot): ResumedSessionSummary['sessionMetadata'] {
   const session = snapshot.session;
   return {

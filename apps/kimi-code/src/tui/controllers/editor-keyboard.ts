@@ -52,7 +52,7 @@ export interface EditorKeyboardHost {
   hideSessionPicker(): void;
   openUndoSelector(): void;
   /**
-   * Agents-view attach (M4): ← on an empty editor asks the host to return to
+   * Agents-view attach: ← on an empty editor asks the host to return to
    * the agents view. Return `true` when the return happened (agents mode +
    * view detached); `false` leaves the key to its normal cursor semantics.
    */
@@ -90,7 +90,7 @@ export class EditorKeyboardController {
     // recalls everything. The filter is locked to the mode captured when the
     // user first enters history browsing (see onHistoryDraftSave), so landing on
     // a shell entry mid-browse doesn't switch the filter to shell-only.
-    // Agents view (M4): bash mode is gated off, so `!` shell entries are hidden
+    // Agents view: bash mode is gated off, so `!` shell entries are hidden
     // from recall entirely — input history is global, and landing on one would
     // resurrect the hidden bash input mode via onRecall below.
     let browseMode: 'prompt' | 'bash' | null = null;
@@ -367,7 +367,7 @@ export class EditorKeyboardController {
 
     editor.onLeftArrowEmpty = () => host.returnToAgentsView();
 
-    // Agents view (M4): the wire surface has no one-shot shell route (M1),
+    // Agents view: the wire surface has no one-shot shell route,
     // so the `!` bash-input mode is unavailable — veto the switch and say
     // why. Outside agents mode the gate passes through (zero change).
     editor.onBashModeAttempt = () => {

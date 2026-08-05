@@ -129,7 +129,7 @@ export function normalizeServerOrigin(value: string): string {
  * Read the persistent bearer token for the server.
  *
  * The server writes `<homeDir>/server.token` (0600) on first boot and reuses
- * it across restarts (ROADMAP M5.1); CLI commands that hit a gated REST route
+ * it across restarts; CLI commands that hit a gated REST route
  * read it back here and send it as `Authorization: Bearer <token>`. `homeDir`
  * is the CLI's own KIMI_CODE_HOME resolution (`getDataDir()`).
  *

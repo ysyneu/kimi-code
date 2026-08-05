@@ -1880,7 +1880,7 @@ describe('KimiTUI startup', () => {
   });
 });
 
-// ── M4 Task 3: agents-view attach (Enter on a row → full chat UI) ──
+// ── Agents-view attach (Enter on a row → full chat UI) ──
 
 describe('KimiTUI agents-view attach', () => {
   interface AttachDriver extends StartupDriver {
@@ -2068,7 +2068,7 @@ describe('KimiTUI agents-view attach', () => {
     expect(driver.state.appState.sessionId).toBe('ses-1');
   });
 
-  // ── M4 Task 4: ← return-to-view + attach footer badge ──
+  // ── ← return-to-view + attach footer badge ──
 
   it('returnToAgentsView remounts the view over the live roster and clears the badge', async () => {
     const session = makeAttachSession('ses-attached');
@@ -2166,7 +2166,7 @@ function uiContainsFooter(driver: StartupDriver): boolean {
 }
 
 
-// ── M4 Task 5: agents-view exit confirmation (embedded server) ──
+// ── Agents-view exit confirmation (embedded server) ──
 
 describe('KimiTUI agents-view exit confirmation', () => {
   interface ExitConfirmDriver extends StartupDriver {

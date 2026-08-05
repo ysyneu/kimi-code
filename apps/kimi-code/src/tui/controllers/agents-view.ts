@@ -33,7 +33,7 @@ export interface AgentsViewHost {
   /** Dispatch target: every session created from the view opens in this cwd. */
   agentsViewWorkDir(): string;
   /**
-   * Attach-mode footer badge feed (Task 4): live roster counts while
+   * Attach-mode footer badge feed: live roster counts while
    * detached; `undefined` clears the badge (return / close).
    */
   setAttachBadge(counts: { agents: number; awaiting: number } | undefined): void;
@@ -42,7 +42,7 @@ export interface AgentsViewHost {
    * excludes it — the session on screen is not "other agents" news.
    */
   getCurrentSessionId(): string;
-  /** Attach seam (M4): KimiTUI implements it; without it Enter shows a placeholder. */
+  /** Attach seam: the host implements it; without it Enter shows a status hint. */
   onOpenSession?(id: string): void;
 }
 
@@ -56,12 +56,12 @@ export interface AgentsViewState {
   /**
    * True while the user is attached to a session: the component is unmounted
    * but the roster and its event subscription stay alive — the attached-mode
-   * footer badge (Task 4) reads live counts, and show() remounts the same
+   * footer badge reads live counts, and show() remounts the same
    * component without a reload.
    */
   detached: boolean;
   /**
-   * One-time-per-attach flag for the deferred-permission hint (Task 4): the
+   * One-time-per-attach flag for the deferred-permission hint: the
    * wire transport carries a stashed setPermission on the NEXT prompt, so the
    * first user-initiated mode change per attach earns a status hint. Reset by
    * detachForAttach. Read via {@link hintDeferredPermissionOnce}.
@@ -110,7 +110,7 @@ const DISPATCH_AGENT_COMMAND: KimiSlashCommand = {
   availability: 'always',
 };
 
-/** Builtin commands that make sense outside a session (design §4.5 whitelist). */
+/** Builtin commands that make sense outside a session. */
 const DISPATCH_BUILTIN_WHITELIST: ReadonlySet<string> = new Set(['model', 'help']);
 
 /**
@@ -129,8 +129,8 @@ type SessionContext = Awaited<ReturnType<Session['getContext']>>;
 
 /**
  * Projects the context history into plain peek lines: user and assistant text
- * only, newest `maxLines` kept. Tool calls / results are not text-projected
- * this milestone.
+ * only, newest `maxLines` kept. Tool calls / results are not
+ * text-projected.
  */
 export function projectPeekLines(
   history: SessionContext['history'],
@@ -316,7 +316,7 @@ export class AgentsViewController {
     const view = state.agentsView;
     if (view === undefined || view.detached) return;
     view.detached = true;
-    // Each attach re-arms the one-time deferred-permission hint (Task 4).
+    // Each attach re-arms the one-time deferred-permission hint.
     view.permissionHintShown = false;
     if (view.flashTimer !== undefined) {
       clearTimeout(view.flashTimer);
@@ -349,7 +349,7 @@ export class AgentsViewController {
   }
 
   /**
-   * Peek reply seam (M3): re-attaches, steers and detaches. The peek reply
+   * Peek reply seam: re-attaches, steers and detaches. The peek reply
    * box wires it: printable keys draft via the onPeekReplyChange callback,
    * Enter submits through {@link handlePeekReplySubmit}.
    */
@@ -365,7 +365,7 @@ export class AgentsViewController {
   // ---------------------------------------------------------------------------
 
   /**
-   * One-shot trust read at roster load (no live refresh this milestone): the
+   * One-shot trust read at roster load (no live refresh): the
    * wire transport resolves each row's workspace trust and the badge rides
    * `roster.setTrusted`. A per-row failure leaves `trusted` undefined — no
    * badge, no error surface; non-wire transports have no trust route and are
@@ -428,7 +428,7 @@ export class AgentsViewController {
   }
 
   /**
-   * Dispatch flow (design §4.5): create the session in the view's workDir,
+   * Dispatch flow: create the session in the view's workDir,
    * then send the first prompt. Staged model/profile overrides must ride that
    * first prompt's submission body — the wire create route drops per-session
    * agent config, so they never reach `createSession`. The new roster row
@@ -438,7 +438,7 @@ export class AgentsViewController {
     const view = this.host.state.agentsView;
     if (view === undefined) return;
     // Validate before mutate: `Session.prompt` carries no overrides — the
-    // extended rpc-level prompt (`WirePromptRpcInput`, M4-T1) does, reached
+    // extended rpc-level prompt (`WirePromptRpcInput`) does, reached
     // through the harness's rpc with an instanceof narrowing (never `any`).
     // A transport that can't carry the overrides is rejected HERE, before
     // createSession, so the failure can't orphan a server-side session.
@@ -581,7 +581,7 @@ export class AgentsViewController {
           return;
         }
         if (this.host.onOpenSession !== undefined) this.host.onOpenSession(id);
-        else this.host.showStatus('Attach lands in M4');
+        else this.host.showStatus('Attach is not available from this host');
       },
       onPeekToggle: (id) => {
         const view = this.host.state.agentsView;
@@ -675,7 +675,7 @@ export class AgentsViewController {
 
   /**
    * Peek reply submit: the draft clears immediately (the reply box resets for
-   * the next message), then the M3 seam steers the peeked session — resume →
+   * the next message), then the peek seam steers the peeked session — resume →
    * steer → detach. An empty draft is a no-op.
    */
   private async handlePeekReplySubmit(sessionId: string): Promise<void> {
@@ -824,12 +824,12 @@ function wireRpcOf(harness: KimiHarness): SDKRpcClientWire | undefined {
 }
 
 /**
- * Deferred-permission hint (Task 4): on the wire transport setPermission is
- * stashed and rides the NEXT prompt's submission body (M4-T1), so the first
+ * Deferred-permission hint: on the wire transport setPermission is
+ * stashed and rides the NEXT prompt's submission body, so the first
  * user-initiated permission-mode change per attach earns a one-time status
  * hint. The per-attach flag lives on {@link AgentsViewState.permissionHintShown}
  * (reset by detachForAttach). `detached` is the "attached to a session"
- * marker — `isOpen` stays true while detached (M3-T3 handoff), so mount
+ * marker — `isOpen` stays true while detached, so mount
  * checks must look at `detached`, not at the state's presence.
  */
 export function hintDeferredPermissionOnce(host: {

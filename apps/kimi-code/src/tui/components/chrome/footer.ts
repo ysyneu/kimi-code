@@ -208,7 +208,7 @@ export class FooterComponent implements Component {
   private backgroundBashTaskCount = 0;
   private backgroundAgentCount = 0;
   /**
-   * Agents-view attach badge (M4): live roster counts of the OTHER sessions
+   * Agents-view attach badge: live roster counts of the OTHER sessions
    * while the user is attached to one. Fed by the agents view controller
    * (its roster subscription survives the attach); both zero hides it.
    */

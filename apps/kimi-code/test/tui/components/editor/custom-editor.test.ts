@@ -776,7 +776,7 @@ describe('CustomEditor bash mode via paste', () => {
 });
 
 
-// ── M4 Task 6: bash (`!`) mode gate — the agents view has no shell route ──
+// ── Bash (`!`) mode gate — the agents view has no shell route ──
 
 describe('CustomEditor bash mode gate', () => {
   it('a veto swallows the typed ! keystroke: prompt mode kept, buffer untouched', () => {

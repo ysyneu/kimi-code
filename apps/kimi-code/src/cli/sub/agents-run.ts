@@ -115,7 +115,7 @@ export async function runAgents(): Promise<void> {
     await harness.close();
     await server.shutdown();
     // The view's sessions run the v2 engine on the kap-server — `kimi
-    // --resume` (v1 storage) can't reopen them (design §6.1), so the
+    // --resume` (v1 storage) can't reopen them, so the
     // re-entry point is the view itself.
     process.stderr.write(`\nTo resume your sessions: kimi agents\n`);
     process.exit(exitCode);

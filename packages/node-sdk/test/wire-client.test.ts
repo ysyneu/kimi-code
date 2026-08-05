@@ -784,8 +784,8 @@ describe('SDKRpcClientWire turns and state', () => {
 });
 
 // ---------------------------------------------------------------------------
-// SDKRpcClientWire degrade surface — the M4 degrade list (design §4.1):
-// empty collections for surfaces kap-server has no routes for, deferred
+// SDKRpcClientWire degrade surface: empty collections for surfaces kap-server
+// has no routes for, deferred
 // setPermission riding the next prompt/steer, and model/profile passthrough.
 // Body assertions stub at the WireHttpClient.submitPrompt boundary — the body
 // object it receives is stringified verbatim into the HTTP request
@@ -947,7 +947,7 @@ describe('toWireContent', () => {
 });
 
 // ---------------------------------------------------------------------------
-// SDKRpcClientWire resume replay — the M4 replay-fidelity contract: the wire
+// SDKRpcClientWire resume replay — the replay-fidelity contract: the wire
 // resume state must carry what the TUI's hydrateFromReplay consumes
 // (apps/kimi-code session-replay.ts): agents.main.{replay, context, config,
 // permission, plan, swarmMode, background, tools}. The stub provider makes

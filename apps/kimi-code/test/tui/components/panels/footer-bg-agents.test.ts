@@ -106,7 +106,7 @@ describe('FooterComponent — background task / agent badges', () => {
 });
 
 
-// ── M4 Task 4: attach-mode badge `← N agents · M awaiting input` ──
+// ── Attach-mode badge `← N agents · M awaiting input` ──
 
 describe('FooterComponent — attach agents badge', () => {
   it('is hidden while both counts are zero', () => {

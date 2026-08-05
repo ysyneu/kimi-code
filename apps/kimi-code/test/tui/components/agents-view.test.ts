@@ -230,8 +230,8 @@ describe('AgentsViewApp — full-screen rendering', () => {
   });
 
   it('renders flash messages in the footer', () => {
-    const out = render(makeApp({ flashMessage: 'Attach lands in M4' }));
-    expect(out).toContain('Attach lands in M4');
+    const out = render(makeApp({ flashMessage: 'Attach is not available from this host' }));
+    expect(out).toContain('Attach is not available from this host');
   });
 });
 
@@ -625,7 +625,7 @@ describe('AgentsViewApp — dispatch editor mount', () => {
   });
 });
 
-// ── M4 Task 5: shutdown-time exit confirmation (embedded server) ──
+// ── Shutdown-time exit confirmation (embedded server) ──
 
 describe('AgentsExitConfirmComponent', () => {
   it('renders the interruption copy with the running count', () => {

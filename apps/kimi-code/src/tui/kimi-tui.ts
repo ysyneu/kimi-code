@@ -1618,7 +1618,7 @@ export class KimiTUI {
   }
 
   /**
-   * Agents-view return (EditorKeyboardHost, Task 4): ← on an empty editor in
+   * Agents-view return (EditorKeyboardHost): ← on an empty editor in
    * agents mode re-mounts the detached view over the still-attached session —
    * a pure view operation; the server-side turn keeps running. Returns false
    * outside agents mode or when the view is not detached, so the key falls
@@ -1633,7 +1633,7 @@ export class KimiTUI {
     return true;
   }
 
-  /** AgentsViewHost (Task 4): attach-mode footer badge feed; undefined clears it. */
+  /** AgentsViewHost: attach-mode footer badge feed; undefined clears it. */
   setAttachBadge(counts: { agents: number; awaiting: number } | undefined): void {
     this.state.footer.setAttachCounts(counts ?? { agents: 0, awaiting: 0 });
     this.state.ui.requestRender();

@@ -6,7 +6,7 @@
  * The whitelist itself is built controller-side (see `dispatchSlashCommands`
  * in `./agents-view`); this module only accepts the final command array.
  * Model/profile selections are staged on the parsed submission and ride the
- * first prompt's submission body (design §4.5 — the wire create route drops
+ * first prompt's submission body (the wire create route drops
  * per-session agent config, so createSession never sees them).
  */
 

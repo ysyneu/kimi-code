@@ -273,7 +273,7 @@ describe('EditorKeyboardController shell history recall', () => {
     expect(editor['setInputMode'] as unknown as Mock).toHaveBeenCalledWith('prompt');
   });
 
-  it('agents view: the recall filter hides `!` shell entries entirely (M4 fix)', () => {
+  it('agents view: the recall filter hides `!` shell entries entirely', () => {
     // Input history is global/persistent: without this gate, ↑ on an empty
     // buffer in the agents view could land on a `!` entry and resurrect the
     // hidden bash input mode (which then submits via runShellCommandFromInput).
@@ -308,7 +308,7 @@ describe('EditorKeyboardController shell history recall', () => {
 });
 
 
-// ── M4 Task 4: ← on an empty editor returns to the agents view ──
+// ── ← on an empty editor returns to the agents view ──
 
 describe('EditorKeyboardController onLeftArrowEmpty', () => {
   it('delegates to the host and consumes the key when the host returns true', () => {
@@ -332,7 +332,7 @@ describe('EditorKeyboardController onLeftArrowEmpty', () => {
 });
 
 
-// ── M4 Task 6: `!` bash-input mode is hidden in the agents view ──
+// ── `!` bash-input mode is hidden in the agents view ──
 
 describe('EditorKeyboardController bash mode gate', () => {
   it('vetoes bash mode with a status hint while the agents view is active', () => {
