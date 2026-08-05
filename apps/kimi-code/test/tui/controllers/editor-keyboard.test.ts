@@ -273,6 +273,19 @@ describe('EditorKeyboardController shell history recall', () => {
     expect(editor['setInputMode'] as unknown as Mock).toHaveBeenCalledWith('prompt');
   });
 
+  it('agents view: the recall filter hides `!` shell entries entirely (M4 fix)', () => {
+    // Input history is global/persistent: without this gate, ↑ on an empty
+    // buffer in the agents view could land on a `!` entry and resurrect the
+    // hidden bash input mode (which then submits via runShellCommandFromInput).
+    const { host, editor } = createHarness();
+    (host.state as unknown as { startupState: string }).startupState = 'agents-view';
+    const setHistoryFilter = editor['setHistoryFilter'] as unknown as Mock;
+    const [filter] = setHistoryFilter.mock.calls[0] as [(entry: string) => boolean];
+
+    expect(filter('!cmd')).toBe(false);
+    expect(filter('hello')).toBe(true);
+  });
+
   it('saves the current input mode as the history draft host state', () => {
     const { editor } = createHarness();
     const save = editor['onHistoryDraftSave'] as unknown as () => unknown;

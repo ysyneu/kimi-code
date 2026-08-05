@@ -90,8 +90,12 @@ export class EditorKeyboardController {
     // recalls everything. The filter is locked to the mode captured when the
     // user first enters history browsing (see onHistoryDraftSave), so landing on
     // a shell entry mid-browse doesn't switch the filter to shell-only.
+    // Agents view (M4): bash mode is gated off, so `!` shell entries are hidden
+    // from recall entirely — input history is global, and landing on one would
+    // resurrect the hidden bash input mode via onRecall below.
     let browseMode: 'prompt' | 'bash' | null = null;
     editor.setHistoryFilter((entry: string) => {
+      if (host.state.startupState === 'agents-view') return !entry.startsWith('!');
       const mode = browseMode ?? editor.inputMode;
       return mode === 'bash' ? entry.startsWith('!') : true;
     });
