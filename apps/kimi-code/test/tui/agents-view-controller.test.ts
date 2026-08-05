@@ -7,7 +7,7 @@ import { SDKRpcClientWire } from '@moonshot-ai/kimi-code-sdk';
 import type { Component, Container, ProcessTerminal, Terminal, TUI } from '@moonshot-ai/pi-tui';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { loadPins } from '@/tui/agents/roster-persistence';
+import { loadAgentsViewState, saveAgentsViewState } from '@/tui/agents/roster-persistence';
 import type { AgentsViewApp } from '@/tui/components/agents-view/app';
 import type { CustomEditor } from '@/tui/components/editor/custom-editor';
 import {
@@ -227,6 +227,13 @@ async function boot(
     trust?: (id: string) => Promise<boolean | undefined>;
     rows?: readonly WireSession[];
     currentSessionId?: string;
+    /**
+     * Pre-seeded view registry (the sessions this view "owns"). Defaults to
+     * every boot summary, mirroring a view that dispatched them all — the
+     * roster only lists registered sessions, so an empty registry boots an
+     * empty view.
+     */
+    registered?: readonly string[];
   } = {},
 ): Promise<Boot> {
   const homeDir = await mkdtemp(join(tmpdir(), 'agents-view-controller-'));
@@ -271,6 +278,12 @@ async function boot(
     onOpenSession: opts.onOpenSession,
   };
   const controller = new AgentsViewController(host);
+  // Pre-seed the view registry BEFORE show(): the roster only lists sessions
+  // the view owns, so the persisted file must already name the boot sessions.
+  await saveAgentsViewState(homeDir, {
+    pins: new Set(),
+    sessions: new Set(opts.registered ?? summaries.map((s) => s.id)),
+  });
   await controller.show();
   return {
     homeDir,
@@ -300,11 +313,16 @@ async function flush(): Promise<void> {
   await new Promise((resolve) => setImmediate(resolve));
 }
 
-/** savePins does real fs I/O (mkdir + write + rename), which needs several
- *  event-loop turns — poll the file instead of guessing a delay. */
-async function waitForPins(homeDir: string, expected: Set<string>): Promise<void> {
+/** saveAgentsViewState does real fs I/O (mkdir + write + rename), which needs
+ *  several event-loop turns — poll the file instead of guessing a delay. */
+async function waitForViewState(
+  homeDir: string,
+  expected: { pins: Set<string>; sessions: Set<string> },
+): Promise<void> {
   await vi.waitFor(async () => {
-    expect(await loadPins(homeDir)).toEqual(expected);
+    const state = await loadAgentsViewState(homeDir);
+    expect(state.pins).toEqual(expected.pins);
+    expect(state.sessions).toEqual(expected.sessions);
   });
 }
 
@@ -313,12 +331,18 @@ const CTRL_X = '\u0018';
 const CTRL_R = '\u0012';
 const CTRL_T = '\u0014';
 const DOWN = '\u001B[B';
+const LEFT = '\u001B[D';
+const RIGHT = '\u001B[C';
 const ENTER = '\r';
 
 describe('AgentsViewController — mount / unmount', () => {
   let dir: string | undefined;
   afterEach(async () => {
-    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    if (dir !== undefined) {
+      // maxRetries: a fire-and-forget persistState can still be mid-write
+      // (ENOTEMPTY on rmdir) when the test body returns.
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
     dir = undefined;
   });
 
@@ -338,6 +362,17 @@ describe('AgentsViewController — mount / unmount', () => {
     expect(out).toContain('s1 title');
     expect(out).toContain('s2 title');
     expect(out).toContain('test-server');
+  });
+
+  it('show lists only sessions in the view registry', async () => {
+    // s2 exists on the server but this view never dispatched or attached it —
+    // the server-wide list must stay out of the roster.
+    const b = await boot([summary('s1'), summary('s2')], { registered: ['s1'] });
+    dir = b.homeDir;
+    const out = b.render();
+    expect(out).toContain('s1 title');
+    expect(out).not.toContain('s2 title');
+    expect(b.view().roster.get('s2')).toBeUndefined();
   });
 
   it('show failure reports the error and does not mount', async () => {
@@ -380,7 +415,11 @@ describe('AgentsViewController — mount / unmount', () => {
 describe('AgentsViewController — live roster events', () => {
   let dir: string | undefined;
   afterEach(async () => {
-    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    if (dir !== undefined) {
+      // maxRetries: a fire-and-forget persistState can still be mid-write
+      // (ENOTEMPTY on rmdir) when the test body returns.
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
     dir = undefined;
   });
 
@@ -401,13 +440,32 @@ describe('AgentsViewController — live roster events', () => {
     expect(b.render()).toContain('renamed by server');
   });
 
-  it('session.created inserts a new row', async () => {
+  it('event.session.created only lands for sessions the view registered', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
+    // A session created by another client (kimi-web, another terminal) never
+    // enters the view — the registry gate drops the server-wide fan-out.
     b.fake.emit({
       type: 'event.session.created',
       session: {
         id: 's9',
+        title: 'foreign session',
+        last_prompt: 'do things',
+        metadata: { cwd: '/home/user/fresh' },
+        updated_at: new Date().toISOString(),
+        busy: false,
+        pending_interaction: 'none',
+      },
+    });
+    expect(b.render()).not.toContain('foreign session');
+
+    // Registered first (as dispatch does before the first prompt), the
+    // created echo lands as a row.
+    b.view().viewSessions.add('s8');
+    b.fake.emit({
+      type: 'event.session.created',
+      session: {
+        id: 's8',
         title: 'fresh session',
         last_prompt: 'do things',
         metadata: { cwd: '/home/user/fresh' },
@@ -426,12 +484,26 @@ describe('AgentsViewController — live roster events', () => {
     b.fake.emit({ type: 'turn.started', sessionId: 's1' });
     expect(b.ui.requestRender).not.toHaveBeenCalled();
   });
+
+  it('a busy row starts the spinner ticker; an idle roster stops it', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    expect(b.view().busyTicker).toBeUndefined();
+    b.fake.emit({ type: 'event.session.work_changed', sessionId: 's1', busy: true, pending_interaction: 'none' });
+    expect(b.view().busyTicker).toBeDefined();
+    b.fake.emit({ type: 'event.session.work_changed', sessionId: 's1', busy: false, pending_interaction: 'none' });
+    expect(b.view().busyTicker).toBeUndefined();
+  });
 });
 
 describe('AgentsViewController — delete', () => {
   let dir: string | undefined;
   afterEach(async () => {
-    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    if (dir !== undefined) {
+      // maxRetries: a fire-and-forget persistState can still be mid-write
+      // (ENOTEMPTY on rmdir) when the test body returns.
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
     dir = undefined;
   });
 
@@ -448,6 +520,8 @@ describe('AgentsViewController — delete', () => {
     expect(b.view().confirmDeleteId).toBeUndefined();
     expect(b.render()).not.toContain('s1 title');
     expect(b.render()).toContain('s2 title');
+    // Archiving also drops the session from the persisted view registry.
+    await waitForViewState(b.homeDir, { pins: new Set(), sessions: new Set(['s2']) });
   });
 
   it('Esc during delete-confirm cancels the confirm instead of quitting', async () => {
@@ -473,7 +547,7 @@ describe('AgentsViewController — delete', () => {
     await flush();
     expect(b.view().confirmDeleteId).toBeUndefined();
     expect(b.fake.deleteSession).not.toHaveBeenCalled();
-    await waitForPins(b.homeDir, new Set(['s1']));
+    await waitForViewState(b.homeDir, { pins: new Set(['s1']), sessions: new Set(['s1']) });
   });
 
   it('Ctrl+X on a group header archives every row in the group', async () => {
@@ -487,13 +561,19 @@ describe('AgentsViewController — delete', () => {
     await flush();
     expect(b.fake.deleteSession).toHaveBeenCalledWith('s1');
     expect(b.fake.deleteSession).toHaveBeenCalledWith('s2');
+    // Both rows leave the persisted view registry too.
+    await waitForViewState(b.homeDir, { pins: new Set(), sessions: new Set() });
   });
 });
 
 describe('AgentsViewController — pin', () => {
   let dir: string | undefined;
   afterEach(async () => {
-    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    if (dir !== undefined) {
+      // maxRetries: a fire-and-forget persistState can still be mid-write
+      // (ENOTEMPTY on rmdir) when the test body returns.
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
     dir = undefined;
   });
 
@@ -502,7 +582,7 @@ describe('AgentsViewController — pin', () => {
     dir = b.homeDir;
     b.component().handleInput(DOWN);
     b.component().handleInput(CTRL_T);
-    await waitForPins(b.homeDir, new Set(['s1']));
+    await waitForViewState(b.homeDir, { pins: new Set(['s1']), sessions: new Set(['s1']) });
     expect(b.render()).toContain('Pinned');
   });
 
@@ -511,9 +591,9 @@ describe('AgentsViewController — pin', () => {
     dir = b.homeDir;
     b.component().handleInput(DOWN);
     b.component().handleInput(CTRL_T);
-    await waitForPins(b.homeDir, new Set(['s1']));
+    await waitForViewState(b.homeDir, { pins: new Set(['s1']), sessions: new Set(['s1']) });
     b.component().handleInput(CTRL_T);
-    await waitForPins(b.homeDir, new Set());
+    await waitForViewState(b.homeDir, { pins: new Set(), sessions: new Set(['s1']) });
     expect(b.render()).not.toContain('Pinned');
   });
 });
@@ -521,7 +601,11 @@ describe('AgentsViewController — pin', () => {
 describe('AgentsViewController — rename', () => {
   let dir: string | undefined;
   afterEach(async () => {
-    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    if (dir !== undefined) {
+      // maxRetries: a fire-and-forget persistState can still be mid-write
+      // (ENOTEMPTY on rmdir) when the test body returns.
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
     dir = undefined;
   });
 
@@ -568,7 +652,11 @@ describe('AgentsViewController — rename', () => {
 describe('AgentsViewController — peek', () => {
   let dir: string | undefined;
   afterEach(async () => {
-    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    if (dir !== undefined) {
+      // maxRetries: a fire-and-forget persistState can still be mid-write
+      // (ENOTEMPTY on rmdir) when the test body returns.
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
     dir = undefined;
   });
 
@@ -701,10 +789,63 @@ describe('AgentsViewController — peek', () => {
   });
 });
 
+describe('AgentsViewController — list/detail arrow split', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) {
+      // maxRetries: a fire-and-forget persistState can still be mid-write
+      // (ENOTEMPTY on rmdir) when the test body returns.
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
+    dir = undefined;
+  });
+
+  it('→ on a row opens the peek detail, ← closes it back to the list', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN); // onto row s1
+    b.component().handleInput(RIGHT);
+    await flush();
+    expect(b.view().peek?.sessionId).toBe('s1');
+    expect(b.render()).toContain('Peek:');
+    b.component().handleInput(LEFT);
+    expect(b.view().peek).toBeUndefined();
+    expect(b.render()).not.toContain('Peek:');
+    expect(b.controller.isOpen).toBe(true);
+  });
+
+  it('→ expands a collapsed group header, ← collapses an expanded one', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    // Selection starts on the Completed group header; Enter collapses it.
+    b.component().handleInput(ENTER);
+    expect(b.render()).not.toContain('s1 title');
+    b.component().handleInput(RIGHT);
+    expect(b.render()).toContain('s1 title');
+    b.component().handleInput(LEFT);
+    expect(b.render()).not.toContain('s1 title');
+    expect(b.controller.isOpen).toBe(true);
+  });
+
+  it('← on a plain row is a no-op (nothing to go back from)', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN); // onto row s1
+    b.component().handleInput(LEFT);
+    expect(b.view().peek).toBeUndefined();
+    expect(b.render()).toContain('s1 title');
+    expect(b.controller.isOpen).toBe(true);
+  });
+});
+
 describe('AgentsViewController — open', () => {
   let dir: string | undefined;
   afterEach(async () => {
-    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    if (dir !== undefined) {
+      // maxRetries: a fire-and-forget persistState can still be mid-write
+      // (ENOTEMPTY on rmdir) when the test body returns.
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
     dir = undefined;
   });
 
@@ -880,7 +1021,11 @@ describe('AgentsViewDispatch — editor wiring', () => {
 describe('AgentsViewController — dispatch', () => {
   let dir: string | undefined;
   afterEach(async () => {
-    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    if (dir !== undefined) {
+      // maxRetries: a fire-and-forget persistState can still be mid-write
+      // (ENOTEMPTY on rmdir) when the test body returns.
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
     dir = undefined;
   });
 
@@ -891,6 +1036,38 @@ describe('AgentsViewController — dispatch', () => {
     await flush();
     expect(b.fake.createSession).toHaveBeenCalledWith({ workDir: '/home/user/project' });
     expect(b.fake.createdSession.prompt).toHaveBeenCalledWith('fix the flaky test');
+    // The new session is registered, persisted and pre-selected, so its
+    // `event.session.created` echo passes the registry gate.
+    expect(b.view().viewSessions.has('new-session')).toBe(true);
+    expect(b.view().selectedId).toBe('new-session');
+    await waitForViewState(b.homeDir, {
+      pins: new Set(),
+      sessions: new Set(['s1', 'new-session']),
+    });
+  });
+
+  it('the created echo of a dispatched session lands as a selected working row', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.view().dispatch.editor.onSubmit?.('fix the flaky test');
+    await flush();
+    // The server's echo: the session exists, the first turn is running.
+    b.fake.emit({
+      type: 'event.session.created',
+      session: {
+        id: 'new-session',
+        title: 'fix the flaky test',
+        last_prompt: 'fix the flaky test',
+        metadata: { cwd: '/home/user/project' },
+        updated_at: new Date().toISOString(),
+        busy: true,
+        pending_interaction: 'none',
+      },
+    });
+    const out = b.render();
+    expect(out).toContain('fix the flaky test');
+    expect(out).toContain('Working');
+    expect(b.view().selectedId).toBe('new-session');
   });
 
   it('model/profile overrides ride the wire rpc prompt, not Session.prompt', async () => {
@@ -971,7 +1148,11 @@ describe('AgentsViewController — dispatch', () => {
 describe('AgentsViewController — workspace trust', () => {
   let dir: string | undefined;
   afterEach(async () => {
-    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    if (dir !== undefined) {
+      // maxRetries: a fire-and-forget persistState can still be mid-write
+      // (ENOTEMPTY on rmdir) when the test body returns.
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
     dir = undefined;
   });
 
@@ -1020,7 +1201,11 @@ describe('AgentsViewController — workspace trust', () => {
 describe('AgentsViewController — dispatch editor mount', () => {
   let dir: string | undefined;
   afterEach(async () => {
-    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    if (dir !== undefined) {
+      // maxRetries: a fire-and-forget persistState can still be mid-write
+      // (ENOTEMPTY on rmdir) when the test body returns.
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
     dir = undefined;
   });
 
@@ -1076,7 +1261,11 @@ describe('AgentsViewController — dispatch editor mount', () => {
 describe('AgentsViewController — detach for attach', () => {
   let dir: string | undefined;
   afterEach(async () => {
-    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    if (dir !== undefined) {
+      // maxRetries: a fire-and-forget persistState can still be mid-write
+      // (ENOTEMPTY on rmdir) when the test body returns.
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
     dir = undefined;
   });
 
@@ -1150,7 +1339,11 @@ describe('AgentsViewController — detach for attach', () => {
 describe('AgentsViewController — attach badge feed', () => {
   let dir: string | undefined;
   afterEach(async () => {
-    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    if (dir !== undefined) {
+      // maxRetries: a fire-and-forget persistState can still be mid-write
+      // (ENOTEMPTY on rmdir) when the test body returns.
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
     dir = undefined;
   });
 
@@ -1283,7 +1476,11 @@ describe('AgentsViewController — attach badge feed', () => {
 describe('hintDeferredPermissionOnce', () => {
   let dir: string | undefined;
   afterEach(async () => {
-    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    if (dir !== undefined) {
+      // maxRetries: a fire-and-forget persistState can still be mid-write
+      // (ENOTEMPTY on rmdir) when the test body returns.
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
     dir = undefined;
   });
 
@@ -1340,7 +1537,11 @@ describe('hintDeferredPermissionOnce', () => {
 describe('AgentsViewController — wire row seeding (I1)', () => {
   let dir: string | undefined;
   afterEach(async () => {
-    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    if (dir !== undefined) {
+      // maxRetries: a fire-and-forget persistState can still be mid-write
+      // (ENOTEMPTY on rmdir) when the test body returns.
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
     dir = undefined;
   });
 
@@ -1378,7 +1579,11 @@ describe('AgentsViewController — wire row seeding (I1)', () => {
 describe('AgentsViewController — reconnect reconciliation (I2)', () => {
   let dir: string | undefined;
   afterEach(async () => {
-    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    if (dir !== undefined) {
+      // maxRetries: a fire-and-forget persistState can still be mid-write
+      // (ENOTEMPTY on rmdir) when the test body returns.
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
     dir = undefined;
   });
 
@@ -1389,9 +1594,10 @@ describe('AgentsViewController — reconnect reconciliation (I2)', () => {
     expect(b.view().roster.get('s1')?.busy).toBe(true);
     expect(b.view().roster.get('s1')?.trusted).toBe(true);
 
-    // During the drop s1's turn finished and a new session appeared — both
-    // global events were lost (no journal), so the reconnect re-list must
-    // surface them.
+    // During the drop s1's turn finished — the global event was lost (no
+    // journal), so the reconnect re-list must surface it. s2 was created by
+    // ANOTHER client during the drop: it is not in this view's registry and
+    // must stay out of the roster.
     b.fake.wireRows?.mockResolvedValueOnce([
       wireRow('s1', { last_turn_reason: 'completed' }),
       wireRow('s2', { pending_interaction: 'question' }),
@@ -1404,9 +1610,9 @@ describe('AgentsViewController — reconnect reconciliation (I2)', () => {
     expect(row?.lastTurnReason).toBe('completed');
     // The trust badge survives the re-seed (the wire rows carry no trust info).
     expect(row?.trusted).toBe(true);
-    expect(b.view().roster.get('s2')?.pendingInteraction).toBe('question');
+    expect(b.view().roster.get('s2')).toBeUndefined();
     const out = b.render();
-    expect(out).toContain('s2 title');
+    expect(out).not.toContain('s2 title');
     expect(out).toContain('Completed');
   });
 

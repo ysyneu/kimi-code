@@ -161,6 +161,37 @@ describe('resolveAgentsServer', () => {
     await first.shutdown();
   });
 
+  it('falls back to embedded when the registered pid is alive but the port is dead', async () => {
+    // An orphaned server can hold a live pid while its HTTP surface is gone
+    // (half-shutdown host). Attaching there crashes with ECONNREFUSED — the
+    // probe must send the view down the embedded path instead.
+    const instancesDir = join(home, 'server', 'instances');
+    await mkdir(instancesDir, { recursive: true });
+    await writeFile(
+      join(instancesDir, 'stale.json'),
+      JSON.stringify({
+        server_id: 'stale',
+        pid: process.pid, // alive, but nothing listens on port 1
+        host: '127.0.0.1',
+        port: 1,
+        started_at: Date.now(),
+        heartbeat_at: Date.now(),
+        host_version: IDENTITY.version,
+      }),
+    );
+    await writeFile(join(home, 'server.token'), 'stale-token', { mode: 0o600 });
+
+    const server = await resolveAgentsServer({
+      homeDir: home,
+      identity: IDENTITY,
+      cliVersion: IDENTITY.version,
+    });
+    expect(server.mode).toBe('embedded');
+    const res = await fetch(`${server.baseUrl}/api/v1/healthz`);
+    expect(res.ok).toBe(true);
+    await server.shutdown();
+  });
+
   it('refuses a versionless (pre-version-gate) running server', async () => {
     const instancesDir = join(home, 'server', 'instances');
     await mkdir(instancesDir, { recursive: true });

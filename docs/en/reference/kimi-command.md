@@ -197,7 +197,7 @@ Generate a new persistent bearer token (written to `~/.kimi-code/server.token`);
 
 ### `kimi agents`
 
-Open the agents view — a full-screen terminal dashboard over the local Kimi server. It lists every session on the server grouped by live status (Awaiting input / Working / Pinned / Completed), updates as sessions make progress or ask for input, and dispatches new sessions from an input box at the bottom, so you can run and supervise many sessions at once without leaving the terminal.
+Open the agents view — a full-screen terminal dashboard over the local Kimi server. It lists the sessions the view owns — every session dispatched from or attached through it — grouped by live status (Awaiting input / Working / Pinned / Completed), updates as sessions make progress or ask for input, and dispatches new sessions from an input box at the bottom, so you can run and supervise many sessions at once without leaving the terminal.
 
 ```sh
 kimi agents
@@ -209,7 +209,8 @@ This subcommand has no flags.
 | --- | --- |
 | `↑` / `↓` or `j` / `k` | Move the selection |
 | `Enter` | Attach the full chat UI for the selected session; on a group header, collapse or expand the group |
-| `←` | Return to the agents view (from an attached chat, with an empty editor) |
+| `→` | Peek at the selected session's latest output; expand a collapsed group |
+| `←` | Close the peek or collapse a group; from an attached chat (with an empty editor), return to the agents view |
 | `Space` | Peek at the session's latest output; while peeking, type to draft an inline reply and press `Enter` to send it; `Esc` closes the peek |
 | `Ctrl-X` | Archive the selected session (press twice to confirm); on a group header, archive the whole group. A session's running turn is cancelled first |
 | `Ctrl-R` | Rename the session |
@@ -223,13 +224,13 @@ The bottom input box dispatches a new session in the current working directory: 
 
 The agents view talks to a local Kimi server on this machine only:
 
-- **Attach**: when a server is already running for the same home directory (for example one started by `kimi web`), the view connects to it. The server must run the same version as this CLI; a mismatch is refused with a restart hint. Quitting only disconnects — the server and its sessions keep running.
+- **Attach**: when a server is already running for the same home directory (for example one started by `kimi web`), the view connects to it — after a quick connectivity check, so a stale registration that no longer answers is treated as "no server" and falls back to Embed. The server must run the same version as this CLI; a mismatch is refused with a restart hint. Quitting only disconnects — the server and its sessions keep running.
 - **Embed**: when no server is running, `kimi agents` starts one in-process. Quitting shuts that server down, so if sessions are still running a confirmation appears (`y` confirms, any other key cancels, and the prompt cancels itself after a timeout). Interrupted sessions are saved and can be resumed by running `kimi agents` again.
 
 #### Limitations
 
 - Sessions created or attached from the agents view run on the server's engine; they cannot be reopened with `kimi --resume` — re-enter them through `kimi agents`.
-- The list only shows sessions on the local Kimi server; sessions started with the plain `kimi` command do not appear.
+- The list only shows sessions the view itself created or attached on the local Kimi server; sessions started with the plain `kimi` command or created by other clients (for example `kimi web`) do not appear.
 - Inside the view, `!` shell commands are disabled, and skill and plugin slash commands are unavailable.
 
 ### `kimi doctor`

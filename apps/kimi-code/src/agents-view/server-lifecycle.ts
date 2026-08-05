@@ -105,6 +105,12 @@ export interface ResolveAgentsServerOptions {
  * Version gate: an attached server must run the same version as this CLI —
  * the wire protocol and home-dir state are version-coupled, so a mismatched
  * (or versionless, i.e. too-old) server is refused with a restart hint.
+ *
+ * Liveness gate: a registered pid is not proof of service — an orphaned
+ * server can hold a live pid while its HTTP surface is already gone (e.g. a
+ * half-shutdown TUI host). Attaching to that used to crash the CLI with a
+ * raw ECONNREFUSED, so the instance must answer a probe request before we
+ * attach; an unreachable one falls through to the embedded path.
  */
 export async function resolveAgentsServer(
   options: ResolveAgentsServerOptions,
@@ -123,13 +129,16 @@ export async function resolveAgentsServer(
     // Same-machine premise: always talk to the server over loopback, whatever
     // host the instance file advertises.
     const baseUrl = `http://127.0.0.1:${live.port}`;
-    return {
-      mode: 'attached',
-      baseUrl,
-      token: readServerToken(homeDir),
-      serverPid: live.pid,
-      shutdown: async () => {},
-    };
+    const token = readServerToken(homeDir);
+    if (await probeServer(baseUrl, token)) {
+      return {
+        mode: 'attached',
+        baseUrl,
+        token,
+        serverPid: live.pid,
+        shutdown: async () => {},
+      };
+    }
   }
 
   const running = await startServer({
@@ -150,6 +159,23 @@ export async function resolveAgentsServer(
     running,
     shutdown: () => running.close(),
   };
+}
+
+/**
+ * Cheap attach-worthiness probe: the session list endpoint answers with an
+ * auth'd `fetch`. Any refusal — connection error, timeout, non-OK status —
+ * means "do not attach", never a thrown error.
+ */
+async function probeServer(baseUrl: string, token: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${baseUrl}/api/v1/sessions?busy=true`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(2000),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
 }
 
 /**

@@ -229,9 +229,58 @@ describe('AgentsViewApp — full-screen rendering', () => {
     expect(out).not.toContain('old title');
   });
 
+  it('renders the title once — the last prompt is not repeated next to it', () => {
+    // The server auto-titles a session with its first prompt verbatim, so a
+    // row that showed both read as the same message twice.
+    const out = render(
+      makeApp({
+        groups: [
+          group('completed', [
+            row('s1', { title: 'fix the flaky test', lastPrompt: 'fix the flaky test' }),
+          ]),
+        ],
+      }),
+    );
+    expect(out.indexOf('fix the flaky test')).toBe(out.lastIndexOf('fix the flaky test'));
+  });
+
+  it('an untitled row falls back to its last prompt as the name', () => {
+    const out = render(
+      makeApp({
+        groups: [
+          group('completed', [row('s1', { title: '', lastPrompt: 'summarize   the\nlogs' })]),
+        ],
+      }),
+    );
+    expect(out).toContain('summarize the logs');
+  });
+
+  it('a failed last turn renders the ✗ marker', () => {
+    const out = render(
+      makeApp({
+        groups: [group('completed', [row('s1', { lastTurnReason: 'failed' })])],
+      }),
+    );
+    expect(out).toContain('✗');
+  });
+
   it('renders flash messages in the footer', () => {
     const out = render(makeApp({ flashMessage: 'Attach is not available from this host' }));
     expect(out).toContain('Attach is not available from this host');
+  });
+
+  it('a flash truncates the static hints instead of being dropped', () => {
+    // Selection on a group header makes the hint bar long; hints + this flash
+    // do not both fit at 120 columns — the flash (the action's outcome) wins.
+    const out = render(
+      makeApp({
+        groups: [group('completed', [row('s1')])],
+        counts: { awaiting: 0, working: 0, completed: 1 },
+        selectedId: 'group:completed',
+        flashMessage: 'Dispatch failed: workspace rejected',
+      }),
+    );
+    expect(out).toContain('Dispatch failed: workspace rejected');
   });
 });
 
@@ -435,6 +484,77 @@ describe('AgentsViewApp — open / peek', () => {
     app.handleInput('q');
     expect(onQuit).not.toHaveBeenCalled();
     expect(onPeekReplyChange).toHaveBeenCalledWith('q');
+  });
+});
+
+describe('AgentsViewApp — left/right list-detail split', () => {
+  it('→ on a session row invokes onPeekToggle', () => {
+    const onPeekToggle = vi.fn();
+    const app = makeApp({
+      groups: [group('working', [row('s1', { busy: true })])],
+      selectedId: 's1',
+      onPeekToggle,
+    });
+    app.handleInput('\u001B[C');
+    expect(onPeekToggle).toHaveBeenCalledWith('s1');
+  });
+
+  it('→ with an open peek does not re-open or stack peeks', () => {
+    const onPeekToggle = vi.fn();
+    const app = makeApp({
+      groups: [group('working', [row('s1', { busy: true }), row('s2', { busy: true })])],
+      selectedId: 's2',
+      peek: { sessionId: 's1', lines: [], replyDraft: '' },
+      onPeekToggle,
+    });
+    app.handleInput('\u001B[C');
+    expect(onPeekToggle).not.toHaveBeenCalled();
+  });
+
+  it('← with an open peek closes it via onPeekToggle', () => {
+    const onPeekToggle = vi.fn();
+    const app = makeApp({
+      groups: [group('working', [row('s1', { busy: true })])],
+      selectedId: 's1',
+      peek: { sessionId: 's1', lines: [], replyDraft: '' },
+      onPeekToggle,
+    });
+    app.handleInput('\u001B[D');
+    expect(onPeekToggle).toHaveBeenCalledWith('s1');
+  });
+
+  it('→ expands a collapsed group header, ← collapses an expanded one', () => {
+    const onOpen = vi.fn();
+    const collapsed = makeApp({
+      groups: [group('completed', [])],
+      selectedId: 'group:completed',
+      onOpen,
+    });
+    collapsed.handleInput('\u001B[C');
+    expect(onOpen).toHaveBeenCalledWith('group:completed');
+
+    onOpen.mockClear();
+    const expanded = makeApp({
+      groups: [group('completed', [row('s1')])],
+      selectedId: 'group:completed',
+      onOpen,
+    });
+    expanded.handleInput('\u001B[D');
+    expect(onOpen).toHaveBeenCalledWith('group:completed');
+  });
+
+  it('← on a plain row is a no-op (nothing to go back from)', () => {
+    const onOpen = vi.fn();
+    const onPeekToggle = vi.fn();
+    const app = makeApp({
+      groups: [group('working', [row('s1', { busy: true })])],
+      selectedId: 's1',
+      onOpen,
+      onPeekToggle,
+    });
+    app.handleInput('\u001B[D');
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(onPeekToggle).not.toHaveBeenCalled();
   });
 });
 

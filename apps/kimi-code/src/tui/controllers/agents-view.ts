@@ -3,7 +3,7 @@ import { SDKRpcClientWire } from '@moonshot-ai/kimi-code-sdk';
 import type { Component, Container, ProcessTerminal, TUI } from '@moonshot-ai/pi-tui';
 
 import { AgentsRoster, type AgentsGroup, type AgentsGroupId } from '../agents/roster';
-import { loadPins, savePins } from '../agents/roster-persistence';
+import { loadAgentsViewState, saveAgentsViewState } from '../agents/roster-persistence';
 import { BUILTIN_SLASH_COMMANDS } from '../commands/registry';
 import type { KimiSlashCommand } from '../commands/types';
 import {
@@ -61,6 +61,14 @@ export interface AgentsViewState {
   roster: AgentsRoster;
   /** The same Set the roster mutates in place; persisted after every setPinned. */
   pins: Set<string>;
+  /**
+   * The view's roster scope: only sessions the view created (dispatch) or
+   * attached to (Enter on a row) are listed — the server-wide session list
+   * from other clients (kimi-web, other terminals) is filtered out at seed,
+   * refresh and `event.session.created`. Persisted with the pins after
+   * every mutation.
+   */
+  viewSessions: Set<string>;
   dispatch: AgentsViewDispatch;
   /**
    * True while the user is attached to a session: the component is unmounted
@@ -86,6 +94,13 @@ export interface AgentsViewState {
   renameDraft: { sessionId: string; text: string } | undefined;
   flashMessage: string | undefined;
   flashTimer: NodeJS.Timeout | undefined;
+  /**
+   * Render ticker while any row is busy: roster events are rare (busy on /
+   * busy off), so without a periodic re-render the working spinner freezes
+   * on one frame for the whole turn. Runs only while the component is
+   * mounted (stopped on detach / close / when nothing is busy).
+   */
+  busyTicker: NodeJS.Timeout | undefined;
   collapsedGroups: Set<AgentsGroupId>;
   completedExpanded: boolean;
   eventUnsubscribe: Unsubscribe;
@@ -189,14 +204,16 @@ export class AgentsViewController {
 
     // The wire transport seeds from the full session rows — busy /
     // pending_interaction survive the mapping (I1). Any other transport
-    // falls back to the plain SessionSummary list.
+    // falls back to the plain SessionSummary list. Both are then narrowed to
+    // the view's own registry: sessions dispatched from or attached through
+    // this view, never the whole server-wide list.
     const rpc = wireRpcOf(this.host.harness);
-    let pins: Set<string>;
+    let persisted: Awaited<ReturnType<typeof loadAgentsViewState>>;
     let summaries: Awaited<ReturnType<KimiHarness['listSessions']>> | undefined;
     let wireRows: readonly WireSession[] | undefined;
     try {
-      [pins, summaries, wireRows] = await Promise.all([
-        loadPins(this.host.harness.homeDir),
+      [persisted, summaries, wireRows] = await Promise.all([
+        loadAgentsViewState(this.host.harness.homeDir),
         rpc === undefined ? this.host.harness.listSessions({}) : Promise.resolve(undefined),
         rpc?.listSessionRows() ?? Promise.resolve(undefined),
       ]);
@@ -207,10 +224,11 @@ export class AgentsViewController {
       return;
     }
     if (state.agentsView !== undefined) return;
+    const { pins, sessions: viewSessions } = persisted;
 
     const roster = new AgentsRoster(pins);
-    if (wireRows !== undefined) roster.setAllRows(wireRows);
-    else if (summaries !== undefined) roster.setAll(summaries);
+    if (wireRows !== undefined) roster.setAllRows(wireRows.filter((row) => viewSessions.has(row.id)));
+    else if (summaries !== undefined) roster.setAll(summaries.filter((row) => viewSessions.has(row.id)));
 
     // The dispatch editor is built before the component: it renders into the
     // component's bottom box, so the initial props already reference it.
@@ -258,6 +276,7 @@ export class AgentsViewController {
       savedChildren,
       roster,
       pins,
+      viewSessions,
       dispatch,
       detached: false,
       permissionHintShown: false,
@@ -269,6 +288,7 @@ export class AgentsViewController {
       renameDraft: undefined,
       flashMessage: undefined,
       flashTimer: undefined,
+      busyTicker: undefined,
       collapsedGroups: new Set(),
       completedExpanded: false,
       eventUnsubscribe: this.host.harness.onEvent((event) => {
@@ -285,6 +305,8 @@ export class AgentsViewController {
     // Trust badges load after mount: the roster is already useful without
     // them, and the per-row reads must never block or break show().
     void this.loadTrust((wireRows ?? summaries ?? []).map((row) => row.id));
+    // A seeded busy row must start the spinner ticker without waiting for an event.
+    this.syncBusyTicker();
   }
 
   close(): void {
@@ -299,6 +321,7 @@ export class AgentsViewController {
     view.eventUnsubscribe();
     view.connectionUnsubscribe?.();
     if (view.flashTimer !== undefined) clearTimeout(view.flashTimer);
+    if (view.busyTicker !== undefined) clearInterval(view.busyTicker);
     this.host.setAttachBadge(undefined);
 
     state.ui.clear();
@@ -335,6 +358,12 @@ export class AgentsViewController {
       view.flashTimer = undefined;
       view.flashMessage = undefined;
     }
+    // The spinner only animates on screen — the attach badge shows counts,
+    // not frames, so the ticker stops until remount.
+    if (view.busyTicker !== undefined) {
+      clearInterval(view.busyTicker);
+      view.busyTicker = undefined;
+    }
 
     state.ui.clear();
     for (const child of view.savedChildren) {
@@ -367,6 +396,8 @@ export class AgentsViewController {
     this.pushProps();
     // Back on the view: its own rows show the counts — the badge goes away.
     this.host.setAttachBadge(undefined);
+    // Busy rows kept working while attached — resume the spinner heartbeat.
+    this.syncBusyTicker();
     state.ui.requestRender(true);
   }
 
@@ -435,7 +466,7 @@ export class AgentsViewController {
       return;
     }
     if (this.host.state.agentsView !== view) return;
-    view.roster.setAllRows(rows);
+    view.roster.setAllRows(rows.filter((row) => view.viewSessions.has(row.id)));
     // A session that vanished during the drop must not leave a dangling
     // selection or peek behind.
     if (view.selectedId !== undefined && view.roster.get(view.selectedId) === undefined) {
@@ -444,6 +475,7 @@ export class AgentsViewController {
     if (view.peek !== undefined && view.roster.get(view.peek.sessionId) === undefined) {
       view.peek = undefined;
     }
+    this.syncBusyTicker();
     this.pushProps();
     // The attach badge reads the same roster while detached — keep it honest.
     if (view.detached) this.pushAttachBadge(view, this.host.getCurrentSessionId());
@@ -474,6 +506,14 @@ export class AgentsViewController {
       const session = await this.host.harness.createSession({
         workDir: this.host.agentsViewWorkDir(),
       });
+      // Register BEFORE the first prompt: the server's
+      // `event.session.created` echo only enters the roster when the id is
+      // already in the view's registry. The new row is pre-selected so the
+      // dispatch is visibly confirmed the moment it lands.
+      view.viewSessions.add(session.id);
+      void this.persistState(view);
+      view.selectedId = session.id;
+      this.pushProps();
       if (rpc !== undefined) {
         await rpc.prompt({
           sessionId: session.id,
@@ -494,7 +534,14 @@ export class AgentsViewController {
     const view = this.host.state.agentsView;
     if (view === undefined) return;
     if (!GLOBAL_EVENT_TYPES.has(event.type)) return;
+    // A session the view never touched never enters the roster: server-wide
+    // `event.session.created` fan-outs from other clients (kimi-web, other
+    // terminals) are dropped at the registry gate.
+    if (event.type === 'event.session.created' && !view.viewSessions.has(event.session.id)) {
+      return;
+    }
     view.roster.applyEvent(event);
+    this.syncBusyTicker();
     this.pushProps();
     // While attached the component is unmounted, but the footer badge still
     // reads live roster counts (the subscription survived the detach).
@@ -602,8 +649,15 @@ export class AgentsViewController {
           this.pushProps();
           return;
         }
-        if (this.host.onOpenSession !== undefined) this.host.onOpenSession(id);
-        else this.host.showStatus('Attach is not available from this host');
+        if (this.host.onOpenSession !== undefined) {
+          // Attaching a row reaffirms its registry membership (in practice it
+          // is already registered — the roster only lists registry rows).
+          view.viewSessions.add(id);
+          void this.persistState(view);
+          this.host.onOpenSession(id);
+        } else {
+          this.host.showStatus('Attach is not available from this host');
+        }
       },
       onPeekToggle: (id) => {
         const view = this.host.state.agentsView;
@@ -762,10 +816,13 @@ export class AgentsViewController {
     if (ids.length === 0) return;
 
     let failed = 0;
+    let removed = 0;
     for (const sessionId of ids) {
       try {
         await this.host.harness.deleteSession(sessionId);
         view.roster.remove(sessionId);
+        view.viewSessions.delete(sessionId);
+        removed += 1;
         if (view.selectedId === sessionId) view.selectedId = undefined;
         if (view.peek?.sessionId === sessionId) view.peek = undefined;
       } catch {
@@ -774,6 +831,7 @@ export class AgentsViewController {
       if (this.host.state.agentsView !== view) return;
       this.pushProps();
     }
+    if (removed > 0) void this.persistState(view);
     if (failed > 0) {
       this.flash(`Failed to archive ${String(failed)} of ${String(ids.length)} session(s)`);
     } else if (ids.length > 1) {
@@ -805,14 +863,63 @@ export class AgentsViewController {
     if (row === undefined) return;
     view.roster.setPinned(id, !row.pinned);
     this.pushProps();
-    try {
-      // The roster mutates this same Set in place; persist it as-is.
-      await savePins(this.host.harness.homeDir, view.pins);
-    } catch (error) {
-      if (this.host.state.agentsView !== view) return;
-      this.flash(
-        `Failed to persist pins: ${error instanceof Error ? error.message : String(error)}`,
-      );
+    // The roster mutates the pins Set in place; persist the whole view state.
+    await this.persistState(view);
+  }
+
+  /**
+   * Serializes state writes: tmp-write + rename must land in call order and
+   * never overlap — a slow earlier write renaming after a later one would
+   * persist stale pins/registry. The chain also coalesces bursts: each write
+   * snapshots the (mutated-in-place) sets when it runs, not when it was
+   * scheduled.
+   */
+  private persistChain: Promise<void> = Promise.resolve();
+
+  /** Persist pins + registry atomically; failures flash, never throw. */
+  private persistState(view: AgentsViewState): Promise<void> {
+    this.persistChain = this.persistChain.then(async () => {
+      try {
+        await saveAgentsViewState(this.host.harness.homeDir, {
+          pins: view.pins,
+          sessions: view.viewSessions,
+        });
+      } catch (error) {
+        if (this.host.state.agentsView !== view) return;
+        this.flash(
+          `Failed to persist agents view state: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    });
+    return this.persistChain;
+  }
+
+  /**
+   * Spinner heartbeat: roster events are rare (busy on / busy off), so while
+   * any row is working a 400 ms re-render keeps the spinner animating. Runs
+   * only while the component is mounted; detach / close / an idle roster
+   * stops it.
+   */
+  private syncBusyTicker(): void {
+    const view = this.host.state.agentsView;
+    if (view === undefined) return;
+    const anyBusy = view.roster.counts().working > 0;
+    if (anyBusy && !view.detached && view.busyTicker === undefined) {
+      view.busyTicker = setInterval(() => {
+        const current = this.host.state.agentsView;
+        // close() cleared the interval alongside the state — nothing to do.
+        if (current !== view) return;
+        if (view.detached || view.roster.counts().working === 0) {
+          this.syncBusyTicker();
+          return;
+        }
+        this.pushProps();
+      }, 400);
+      // A render heartbeat must never hold the event loop open on its own.
+      view.busyTicker.unref();
+    } else if ((!anyBusy || view.detached) && view.busyTicker !== undefined) {
+      clearInterval(view.busyTicker);
+      view.busyTicker = undefined;
     }
   }
 

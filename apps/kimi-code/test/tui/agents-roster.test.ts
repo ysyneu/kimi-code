@@ -1,11 +1,11 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Event, SessionSummary, WireSession } from '@moonshot-ai/kimi-code-sdk';
 
 import { AgentsRoster } from '#/tui/agents/roster';
-import { loadPins, savePins } from '#/tui/agents/roster-persistence';
+import { loadAgentsViewState, saveAgentsViewState } from '#/tui/agents/roster-persistence';
 
 /** A full wire session row (what `SDKRpcClientWire.listSessionRows` serves). */
 function wireRow(id: string, overrides: Partial<WireSession> = {}): WireSession {
@@ -299,7 +299,7 @@ describe('AgentsRoster', () => {
   });
 });
 
-describe('roster pin persistence', () => {
+describe('agents view state persistence', () => {
   let dir: string;
 
   beforeEach(async () => {
@@ -310,32 +310,49 @@ describe('roster pin persistence', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('savePins / loadPins round-trips a pin set through { "pins": string[] }', async () => {
-    await savePins(dir, new Set(['a', 'b']));
+  it('saveAgentsViewState / loadAgentsViewState round-trips pins and the view-session registry', async () => {
+    await saveAgentsViewState(dir, { pins: new Set(['a', 'b']), sessions: new Set(['s1']) });
 
     const raw = JSON.parse(await readFile(join(dir, 'agents-view.json'), 'utf-8')) as unknown;
-    expect(raw).toEqual({ pins: expect.arrayContaining(['a', 'b']) });
+    expect(raw).toEqual({
+      pins: expect.arrayContaining(['a', 'b']),
+      sessions: expect.arrayContaining(['s1']),
+    });
 
-    const loaded = await loadPins(dir);
-    expect([...loaded].toSorted()).toEqual(['a', 'b']);
+    const loaded = await loadAgentsViewState(dir);
+    expect([...loaded.pins].toSorted()).toEqual(['a', 'b']);
+    expect([...loaded.sessions].toSorted()).toEqual(['s1']);
   });
 
-  it('loadPins returns an empty set when the file is missing', async () => {
-    expect(await loadPins(dir)).toEqual(new Set());
+  it('loadAgentsViewState returns empty sets when the file is missing', async () => {
+    const loaded = await loadAgentsViewState(dir);
+    expect(loaded.pins).toEqual(new Set());
+    expect(loaded.sessions).toEqual(new Set());
   });
 
-  it('loadPins returns an empty set for corrupt JSON or a wrong shape', async () => {
+  it('loadAgentsViewState returns empty sets for corrupt JSON or a wrong shape', async () => {
     await writeFile(join(dir, 'agents-view.json'), '{ not json', 'utf-8');
-    expect(await loadPins(dir)).toEqual(new Set());
+    expect(await loadAgentsViewState(dir)).toEqual({ pins: new Set(), sessions: new Set() });
 
-    await writeFile(join(dir, 'agents-view.json'), JSON.stringify({ pins: 'a' }), 'utf-8');
-    expect(await loadPins(dir)).toEqual(new Set());
+    await writeFile(join(dir, 'agents-view.json'), JSON.stringify({ pins: 'a', sessions: 1 }), 'utf-8');
+    expect(await loadAgentsViewState(dir)).toEqual({ pins: new Set(), sessions: new Set() });
   });
 
-  it('savePins leaves no tmp files behind', async () => {
-    await savePins(dir, new Set(['a']));
-    await savePins(dir, new Set(['a', 'b']));
-    expect(await loadPins(dir)).toEqual(new Set(['a', 'b']));
+  it('loadAgentsViewState reads a legacy pins-only file with an empty registry', async () => {
+    await writeFile(join(dir, 'agents-view.json'), JSON.stringify({ pins: ['a'] }), 'utf-8');
+    const loaded = await loadAgentsViewState(dir);
+    expect([...loaded.pins]).toEqual(['a']);
+    expect(loaded.sessions).toEqual(new Set());
+  });
+
+  it('saveAgentsViewState leaves no tmp files behind', async () => {
+    await saveAgentsViewState(dir, { pins: new Set(['a']), sessions: new Set() });
+    await saveAgentsViewState(dir, { pins: new Set(['a', 'b']), sessions: new Set(['s1']) });
+    const loaded = await loadAgentsViewState(dir);
+    expect(loaded.pins).toEqual(new Set(['a', 'b']));
+    expect(loaded.sessions).toEqual(new Set(['s1']));
+    const files = await readdir(dir);
+    expect(files).toEqual(['agents-view.json']);
   });
 });
 

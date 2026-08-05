@@ -65,23 +65,27 @@ function statusSymbol(row: AgentsRosterRow): { glyph: string; color: StatusColor
     return { glyph: SPINNER_FRAMES[frame] ?? '⠋', color: 'success' };
   }
   if (row.lastTurnReason === 'failed' || row.lastTurnReason === 'cancelled') {
-    return { glyph: '∙', color: 'error' };
+    return { glyph: '✗', color: 'error' };
   }
   if (row.lastTurnReason === 'completed') return { glyph: '✻', color: 'textMuted' };
   return { glyph: '∙', color: 'textMuted' };
 }
 
 /**
- * `<ptr><symbol> <title> <prompt 摘要> <相对时间> <cwd 基名> [untrusted]`.
- * The prompt summary absorbs truncation; meta (time/cwd/badge) stays visible.
+ * `<ptr><symbol> <name> <相对时间> <cwd 基名> [untrusted]`.
+ *
+ * One name per row: the server auto-titles a session with its first prompt
+ * verbatim, so rendering `lastPrompt` next to the title reads as the same
+ * message twice. The title wins; the prompt is only the untitled fallback.
  */
 export function renderRosterRow(row: AgentsRosterRow, selected: boolean, width: number): string {
   const symbol = statusSymbol(row);
+  const name = row.title || singleLine(row.lastPrompt ?? '') || '(untitled)';
   const prefix =
     pointer(selected) +
     currentTheme.fg(symbol.color, symbol.glyph) +
     ' ' +
-    (selected ? currentTheme.boldFg('textStrong', row.title || '(untitled)') : currentTheme.fg('text', row.title || '(untitled)'));
+    (selected ? currentTheme.boldFg('textStrong', name) : currentTheme.fg('text', name));
 
   const metaParts: string[] = [];
   const rel = formatRelativeTime(row.updatedAt);
@@ -91,13 +95,7 @@ export function renderRosterRow(row: AgentsRosterRow, selected: boolean, width: 
   if (row.trusted === false) metaParts.push('untrusted');
   const suffix = metaParts.length > 0 ? currentTheme.fg('textMuted', ` ${metaParts.join(' · ')}`) : '';
 
-  const promptText = singleLine(row.lastPrompt ?? '');
-  const budget = width - visibleWidth(prefix) - visibleWidth(suffix) - 1;
-  const middle =
-    promptText.length > 0 && budget > 2
-      ? ' ' + currentTheme.fg('textDim', truncateToWidth(promptText, budget, ELLIPSIS))
-      : '';
-  return fitExactly(prefix + middle + suffix, width);
+  return fitExactly(prefix + suffix, width);
 }
 
 /** Group header line: `<ptr><label> (N)`. */

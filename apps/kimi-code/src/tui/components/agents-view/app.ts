@@ -1,10 +1,11 @@
 /**
- * AgentsViewApp — full-screen alt-screen takeover listing every kap-server
- * session as a grouped roster (Awaiting input / Working / Pinned /
- * Completed). Mirrors the TasksBrowserApp mount/render contract: mounted by
- * a controller via container swap, `render(width)` returns exactly
- * `terminal.rows` lines (header 1 + body rows-2 + footer 1), data flows in
- * via `setProps`, user actions fire the `on*` callbacks.
+ * AgentsViewApp — full-screen alt-screen takeover listing the view's OWN
+ * sessions (dispatched from or attached through this view — the server-wide
+ * list is filtered controller-side) as a grouped roster (Awaiting input /
+ * Working / Pinned / Completed). Mirrors the TasksBrowserApp mount/render
+ * contract: mounted by a controller via container swap, `render(width)`
+ * returns exactly `terminal.rows` lines (header 1 + body rows-2 + footer 1),
+ * data flows in via `setProps`, user actions fire the `on*` callbacks.
  *
  * Zero SDK access: the controller owns the roster, peek content, delete /
  * rename / pin side effects and re-pushes props after every action.
@@ -110,9 +111,10 @@ const HELP_LINES: readonly string[] = [
   'Shortcuts',
   '',
   '  ↑/↓ or j/k   move selection (j/k type into a non-empty dispatch box)',
+  '  → / Space    open peek detail · type to draft a reply · Enter sends',
+  '  ←            close peek · collapse group (→ expands a collapsed one)',
   '  type         focus the dispatch editor · Enter dispatches · Esc back',
   '  Enter        open session · collapse/expand group · expand completed',
-  '  Space        peek latest output · type to draft a reply · Enter sends',
   '  Ctrl+X       delete session (press twice to confirm)',
   '  Ctrl+R       rename session',
   '  Ctrl+T       pin / unpin',
@@ -309,6 +311,30 @@ export class AgentsViewApp extends Container implements Focusable {
       return;
     }
 
+    // ← / → : the list ↔ detail split. → on a row opens its peek detail,
+    // ← closes an open peek (back to the list); on group headers → expands
+    // a collapsed group and ← collapses an expanded one. A collapsed header
+    // is recognizable by its emptied rows (the controller zeroes them).
+    if (matchesKey(data, Key.right)) {
+      const item = this.deriveItems()[this.selectedIndex];
+      if (item !== undefined && this.props.peek === undefined) {
+        if (item.kind === 'row') this.props.onPeekToggle(item.id);
+        else if (item.kind === 'header' && item.group.rows.length === 0) this.props.onOpen(item.id);
+      }
+      return;
+    }
+    if (matchesKey(data, Key.left)) {
+      if (this.props.peek !== undefined) {
+        this.props.onPeekToggle(this.props.peek.sessionId);
+        return;
+      }
+      const item = this.deriveItems()[this.selectedIndex];
+      if (item !== undefined && item.kind === 'header' && item.group.rows.length > 0) {
+        this.props.onOpen(item.id);
+      }
+      return;
+    }
+
     const item = this.deriveItems()[this.selectedIndex];
     if (item !== undefined) {
       if (matchesKey(data, Key.enter)) {
@@ -501,19 +527,25 @@ export class AgentsViewApp extends Container implements Focusable {
       if (item === undefined) {
         left = ` ${key('?')} ${dim('shortcuts')}  ${key('q')} ${dim('quit')} `;
       } else if (item.kind === 'header') {
-        left = ` ${key('↑↓')} ${dim('select')}  ${key('Enter')} ${dim('collapse')}  ${key('^X')} ${dim('delete group')}  ${key('?')} ${dim('shortcuts')}  ${key('q')} ${dim('quit')} `;
+        left = ` ${key('↑↓')} ${dim('select')}  ${key('Enter')} ${dim('collapse')}  ${key('←→')} ${dim('expand/collapse')}  ${key('^X')} ${dim('delete group')}  ${key('?')} ${dim('shortcuts')}  ${key('q')} ${dim('quit')} `;
       } else if (item.kind === 'more') {
         left = ` ${key('↑↓')} ${dim('select')}  ${key('Enter')} ${dim('expand')}  ${key('q')} ${dim('quit')} `;
       } else {
-        left = ` ${key('↑↓')} ${dim('select')}  ${key('Enter')} ${dim('open')}  ${key('Space')} ${dim('peek')}  ${key('^X')} ${dim('delete')}  ${key('^R')} ${dim('rename')}  ${key('^T')} ${dim('pin')}  ${key('?')} ${dim('shortcuts')}  ${key('q')} ${dim('quit')} `;
+        left = ` ${key('↑↓')} ${dim('select')}  ${key('Enter')} ${dim('open')}  ${key('→')} ${dim('peek')}  ${key('^X')} ${dim('delete')}  ${key('^R')} ${dim('rename')}  ${key('^T')} ${dim('pin')}  ${key('?')} ${dim('shortcuts')}  ${key('q')} ${dim('quit')} `;
       }
     }
 
     const flash = this.props.flashMessage;
     if (flash !== undefined && flash.length > 0) {
       const flashStyled = currentTheme.fg('warning', ` ${flash} `);
-      const total = visibleWidth(left) + visibleWidth(flashStyled);
-      if (total <= width) return left + ' '.repeat(width - total) + flashStyled;
+      const flashWidth = visibleWidth(flashStyled);
+      if (flashWidth < width) {
+        // The flash is transient and carries the action's outcome (dispatch
+        // errors!) — the static key hints truncate to make room instead of
+        // the flash being dropped on narrower terminals.
+        return fitExactly(left, width - flashWidth) + flashStyled;
+      }
+      return fitExactly(flashStyled, width);
     }
     return fitExactly(left, width);
   }

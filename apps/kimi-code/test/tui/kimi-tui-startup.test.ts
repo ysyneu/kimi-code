@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -1927,6 +1927,13 @@ describe('KimiTUI agents-view attach', () => {
     const listeners = new Set<(event: Event) => void>();
     const homeDir = mkdtempSync(join(tmpdir(), 'kimi-agents-attach-'));
     dirs.push(homeDir);
+    // Pre-register the attach target (and a second view-owned session used by
+    // the badge test): the view's roster only lists sessions in its own
+    // registry (dispatched from / attached through the view).
+    writeFileSync(
+      join(homeDir, 'agents-view.json'),
+      JSON.stringify({ pins: [], sessions: [ATTACH_SUMMARY.id, 'ses-other'] }),
+    );
     const harness = makeHarness(session, {
       homeDir,
       listSessions: vi.fn(async () => [ATTACH_SUMMARY]),
@@ -2232,7 +2239,9 @@ describe('KimiTUI agents-view attach', () => {
     } as Event);
     expect(driver.state.footer.render(120)[0]).not.toContain('←');
 
-    // Another session working DOES reach the badge while attached.
+    // Another VIEW-OWNED session working DOES reach the badge while attached.
+    // (A session created by another client is not in the registry — its
+    // created event is gated out and never moves the badge.)
     emit({
       type: 'event.session.created',
       session: {
