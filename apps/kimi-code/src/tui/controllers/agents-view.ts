@@ -332,8 +332,9 @@ export class AgentsViewController {
   }
 
   /**
-   * Peek reply seam: re-attaches, steers and detaches. Nothing calls this yet —
-   * the Task-4 dispatch/reply editor wires the peek reply box to it.
+   * Peek reply seam (M3): re-attaches, steers and detaches. The peek reply
+   * box wires it: printable keys draft via the onPeekReplyChange callback,
+   * Enter submits through {@link handlePeekReplySubmit}.
    */
   async submitPeekReply(sessionId: string, text: string): Promise<void> {
     const session = await this.host.harness.resumeSession({ id: sessionId });
@@ -504,6 +505,8 @@ export class AgentsViewController {
     | 'onHelpToggle'
     | 'onQuit'
     | 'onDispatchFocusChange'
+    | 'onPeekReplyChange'
+    | 'onPeekReplySubmit'
   > {
     return {
       onSelect: (id) => {
@@ -607,7 +610,38 @@ export class AgentsViewController {
         view.dispatch.editor.focused = focused;
         this.pushProps();
       },
+      onPeekReplyChange: (text) => {
+        const view = this.host.state.agentsView;
+        if (view === undefined || view.peek === undefined) return;
+        view.peek = { ...view.peek, replyDraft: text };
+        this.pushProps();
+      },
+      onPeekReplySubmit: (sessionId) => {
+        const view = this.host.state.agentsView;
+        if (view === undefined) return;
+        void this.handlePeekReplySubmit(sessionId);
+      },
     };
+  }
+
+  /**
+   * Peek reply submit: the draft clears immediately (the reply box resets for
+   * the next message), then the M3 seam steers the peeked session — resume →
+   * steer → detach. An empty draft is a no-op.
+   */
+  private async handlePeekReplySubmit(sessionId: string): Promise<void> {
+    const view = this.host.state.agentsView;
+    if (view === undefined || view.peek?.sessionId !== sessionId) return;
+    const text = view.peek.replyDraft.trim();
+    if (text === '') return;
+    view.peek = { ...view.peek, replyDraft: '' };
+    this.pushProps();
+    try {
+      await this.submitPeekReply(sessionId, text);
+    } catch (error) {
+      if (this.host.state.agentsView !== view) return;
+      this.flash(`Reply failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   private async openPeek(id: string): Promise<void> {
@@ -638,7 +672,9 @@ export class AgentsViewController {
     const current = this.host.state.agentsView;
     if (current !== view || current.peekRequestId !== requestId) return;
     if (current.peek?.sessionId !== id) return;
-    current.peek = { sessionId: id, lines, replyDraft: '' };
+    // Keep whatever the user already typed into the reply box while the
+    // context was loading.
+    current.peek = { sessionId: id, lines, replyDraft: current.peek.replyDraft };
     this.pushProps();
   }
 

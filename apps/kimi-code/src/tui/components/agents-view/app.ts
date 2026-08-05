@@ -24,9 +24,11 @@
  *   List-focused, a printable char focuses the editor and feeds it the
  *   text; the printable shortcuts (j/k/q/Space/?) only act while the
  *   editor is EMPTY, once it holds text every printable char belongs to it.
- * - The peek reply box renders `peek.replyDraft` read-only; reply editing /
- *   steer submission is owned by the dispatch editor, so `q` while a peek
- *   is open is swallowed here rather than quitting.
+ * - Peek reply: while a peek is open, printable input edits the reply draft
+ *   via `onPeekReplyChange` (the controller owns the draft and the steer
+ *   side effect), Enter fires `onPeekReplySubmit`, and Esc clears a
+ *   non-empty draft before closing the peek. The dispatch editor never
+ *   sees these keys — a reply must not become a new-session dispatch.
  */
 
 import {
@@ -77,6 +79,10 @@ export interface AgentsViewProps {
   onHelpToggle(): void;
   onQuit(): void;
   onDispatchFocusChange(focused: boolean): void;
+  /** Peek reply draft edit (printable char / Backspace / Esc-clear). */
+  onPeekReplyChange(text: string): void;
+  /** Enter while peeked: submit the current draft as a steer to this session. */
+  onPeekReplySubmit(sessionId: string): void;
 }
 
 /** Minimum dimensions before we just print a "too small" message. */
@@ -106,12 +112,12 @@ const HELP_LINES: readonly string[] = [
   '  ↑/↓ or j/k   move selection (j/k type into a non-empty dispatch box)',
   '  type         focus the dispatch editor · Enter dispatches · Esc back',
   '  Enter        open session · collapse/expand group · expand completed',
-  '  Space        peek latest output',
+  '  Space        peek latest output · type to draft a reply · Enter sends',
   '  Ctrl+X       delete session (press twice to confirm)',
   '  Ctrl+R       rename session',
   '  Ctrl+T       pin / unpin',
   '  ?            toggle this help',
-  '  Esc / q      quit (Esc closes peek first)',
+  '  Esc / q      quit (Esc clears the reply draft, then closes peek)',
 ];
 
 export class AgentsViewApp extends Container implements Focusable {
@@ -247,9 +253,31 @@ export class AgentsViewApp extends Container implements Focusable {
 
     if (matchesKey(data, Key.escape)) {
       const peek = this.props.peek;
-      if (peek !== undefined) this.props.onPeekToggle(peek.sessionId);
+      // Esc clears a non-empty reply draft first; the next Esc closes the peek.
+      if (peek !== undefined && peek.replyDraft !== '') this.props.onPeekReplyChange('');
+      else if (peek !== undefined) this.props.onPeekToggle(peek.sessionId);
       else this.props.onQuit();
       return;
+    }
+
+    // Peek reply box: while a peek is open, printable input drafts the reply
+    // — NEVER the dispatch editor, or a reply would silently become a
+    // new-session dispatch. Enter submits, Backspace edits; navigation keys
+    // fall through to the list handling below.
+    const peek = this.props.peek;
+    if (peek !== undefined) {
+      if (matchesKey(data, Key.enter)) {
+        this.props.onPeekReplySubmit(peek.sessionId);
+        return;
+      }
+      if (matchesKey(data, Key.backspace)) {
+        this.props.onPeekReplyChange([...peek.replyDraft].slice(0, -1).join(''));
+        return;
+      }
+      if (isPrintableChar(k)) {
+        this.props.onPeekReplyChange(peek.replyDraft + k);
+        return;
+      }
     }
 
     // Once the dispatch editor holds text, printable chars belong to it —
@@ -268,8 +296,7 @@ export class AgentsViewApp extends Container implements Focusable {
     }
 
     if (k === 'q' || k === 'Q') {
-      // With a peek open, text input belongs to the reply box (Task 4).
-      if (this.props.peek === undefined) this.props.onQuit();
+      this.props.onQuit();
       return;
     }
 
@@ -467,6 +494,8 @@ export class AgentsViewApp extends Container implements Focusable {
       left = ` ${currentTheme.boldFg('warning', this.deleteConfirmCopy(this.props.confirmDeleteId))} ${key('^X')} ${dim('confirm')}  ${dim('any other key cancels')} `;
     } else if (this.helpVisible) {
       left = ` ${key('?')}${dim('/')}${key('Esc')} ${dim('close')} `;
+    } else if (this.props.peek !== undefined) {
+      left = ` ${key('Enter')} ${dim('send reply')}  ${key('Esc')} ${dim('clear draft / close peek')} `;
     } else {
       const item = this.deriveItems()[this.selectedIndex];
       if (item === undefined) {

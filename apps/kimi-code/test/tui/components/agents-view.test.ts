@@ -96,6 +96,8 @@ function makeProps(overrides: Partial<AgentsViewProps> = {}): AgentsViewProps {
     onHelpToggle: vi.fn(),
     onQuit: vi.fn(),
     onDispatchFocusChange: vi.fn(),
+    onPeekReplyChange: vi.fn(),
+    onPeekReplySubmit: vi.fn(),
     ...overrides,
   };
 }
@@ -372,16 +374,67 @@ describe('AgentsViewApp — open / peek', () => {
     expect(onQuit).not.toHaveBeenCalled();
   });
 
-  it('q does not quit while a peek is open (reply text seam)', () => {
+  it('Esc clears a non-empty reply draft first; the next Esc closes the peek', () => {
+    const onPeekReplyChange = vi.fn();
+    const onPeekToggle = vi.fn();
+    const app = makeApp({
+      groups: [group('working', [row('s1', { busy: true })])],
+      selectedId: 's1',
+      peek: { sessionId: 's1', lines: ['x'], replyDraft: 'draft' },
+      onPeekReplyChange,
+      onPeekToggle,
+    });
+    app.handleInput('\u001B');
+    expect(onPeekReplyChange).toHaveBeenCalledWith('');
+    expect(onPeekToggle).not.toHaveBeenCalled();
+  });
+
+  it('printable input while peeked edits the reply draft, never the dispatch editor', () => {
+    const onPeekReplyChange = vi.fn();
+    const dispatchEditor = makeDispatchEditor();
+    const app = makeApp({
+      groups: [group('working', [row('s1', { busy: true })])],
+      selectedId: 's1',
+      peek: { sessionId: 's1', lines: ['x'], replyDraft: 'hel' },
+      dispatchEditor,
+      onPeekReplyChange,
+    });
+    app.handleInput('l');
+    expect(onPeekReplyChange).toHaveBeenCalledWith('hell');
+    expect(dispatchEditor.getText()).toBe('');
+    // Backspace edits the draft too.
+    app.handleInput('\u007F');
+    expect(onPeekReplyChange).toHaveBeenLastCalledWith('he');
+  });
+
+  it('Enter while peeked submits the reply, not the selected row', () => {
+    const onPeekReplySubmit = vi.fn();
+    const onOpen = vi.fn();
+    const app = makeApp({
+      groups: [group('working', [row('s1', { busy: true })])],
+      selectedId: 's1',
+      peek: { sessionId: 's1', lines: ['x'], replyDraft: 'go on' },
+      onPeekReplySubmit,
+      onOpen,
+    });
+    app.handleInput('\r');
+    expect(onPeekReplySubmit).toHaveBeenCalledWith('s1');
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it('q does not quit while a peek is open (it drafts the reply)', () => {
     const onQuit = vi.fn();
+    const onPeekReplyChange = vi.fn();
     const app = makeApp({
       groups: [group('working', [row('s1', { busy: true })])],
       selectedId: 's1',
       peek: { sessionId: 's1', lines: ['x'], replyDraft: '' },
       onQuit,
+      onPeekReplyChange,
     });
     app.handleInput('q');
     expect(onQuit).not.toHaveBeenCalled();
+    expect(onPeekReplyChange).toHaveBeenCalledWith('q');
   });
 });
 

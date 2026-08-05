@@ -564,7 +564,7 @@ describe('AgentsViewController — peek', () => {
     b.controller.close(); // clear the pending flash timer
   });
 
-  it('submitPeekReply steers the session (Task 4 wires the reply editor to it)', async () => {
+  it('submitPeekReply resumes, steers and detaches the session', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
     await b.controller.submitPeekReply('s1', 'please continue');
@@ -572,6 +572,78 @@ describe('AgentsViewController — peek', () => {
     expect(b.fake.session.steer).toHaveBeenCalledWith('please continue');
     expect(b.fake.session.close).toHaveBeenCalled();
     b.controller.close();
+  });
+
+  it('typing while peeked drafts the reply and never touches the dispatch editor', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(' ');
+    await flush();
+    expect(b.view().peek?.sessionId).toBe('s1');
+
+    b.component().handleInput('h');
+    b.component().handleInput('i');
+
+    expect(b.view().peek?.replyDraft).toBe('hi');
+    // The dangerous misroute (final review C2): a reply must NOT become a
+    // new-session dispatch.
+    expect(b.view().dispatch.editor.getText()).toBe('');
+    expect(b.view().dispatchFocused).toBe(false);
+    expect(b.render()).toContain('reply › hi');
+  });
+
+  it('Enter while peeked steers the peeked session and clears the draft', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(' ');
+    await flush();
+    b.component().handleInput('g');
+    b.component().handleInput('o');
+    b.component().handleInput(ENTER);
+    await flush();
+
+    expect(b.fake.resumeSession).toHaveBeenCalledWith({ id: 's1' });
+    expect(b.fake.session.steer).toHaveBeenCalledWith('go');
+    expect(b.fake.session.close).toHaveBeenCalled();
+    expect(b.view().peek?.replyDraft).toBe('');
+    expect(b.fake.createSession).not.toHaveBeenCalled();
+  });
+
+  it('Esc clears the reply draft first, a second Esc closes the peek', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(' ');
+    await flush();
+    b.component().handleInput('x');
+    expect(b.view().peek?.replyDraft).toBe('x');
+
+    b.component().handleInput(ESC);
+    expect(b.view().peek?.replyDraft).toBe('');
+    expect(b.view().peek).toBeDefined();
+
+    b.component().handleInput(ESC);
+    expect(b.view().peek).toBeUndefined();
+    expect(b.controller.isOpen).toBe(true);
+  });
+
+  it('a failed reply flashes the error and keeps the peek open', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(' ');
+    await flush();
+    b.component().handleInput('g');
+    b.component().handleInput('o');
+    b.fake.session.steer.mockRejectedValueOnce(new Error('steer exploded'));
+    b.component().handleInput(ENTER);
+    await flush();
+
+    expect(b.view().peek?.sessionId).toBe('s1');
+    expect(b.render()).toContain('Reply failed: steer exploded');
+    b.controller.close(); // clear the pending flash timer
   });
 });
 

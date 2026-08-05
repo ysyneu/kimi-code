@@ -1999,7 +1999,11 @@ describe('KimiTUI agents-view attach', () => {
     expect(driver.state.appState.sessionId).toBe('');
   });
 
-  it('re-attaching the current session short-circuits without resuming again', async () => {
+  it('re-entering the current session resurfaces its chat without resuming again', async () => {
+    // Regression (final review C1): attach → ← → Enter on the SAME row must
+    // re-enter the still-live chat — the T3-era "Already on this session."
+    // guard made the core loop work exactly once and stranded approvals that
+    // arrived for the attached session while the roster was up.
     const session = makeAttachSession('ses-attached');
     const { harness } = makeAgentsHarness(session);
     const driver = await bootAgentsView(harness);
@@ -2009,12 +2013,22 @@ describe('KimiTUI agents-view attach', () => {
       expect(driver.state.appState.sessionId).toBe('ses-attached');
     });
 
+    // ← back to the roster, then Enter on the same session's row.
+    expect(driver.returnToAgentsView()).toBe(true);
+    await vi.waitFor(() => {
+      expect(driver.state.agentsView?.detached).toBe(false);
+    });
     driver.onOpenSession('ses-attached');
 
+    // The view unmounts again (the chat resurfaces) with no second resume and
+    // no same-session guard error.
     await vi.waitFor(() => {
-      expect(showStatus).toHaveBeenCalledWith('Already on this session.');
+      expect(driver.state.agentsView?.detached).toBe(true);
     });
     expect(harness.resumeSession).toHaveBeenCalledTimes(1);
+    expect(showStatus).not.toHaveBeenCalledWith('Already on this session.');
+    expect(driver.state.appState.sessionId).toBe('ses-attached');
+    expect(driver.state.ui.children).not.toContain(driver.state.agentsView?.component);
   });
 
   it('agents mode relaxes the streaming switch guard (wire detach never kills a turn)', async () => {

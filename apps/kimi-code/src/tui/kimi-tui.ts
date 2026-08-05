@@ -1946,10 +1946,14 @@ export class KimiTUI {
    * session's chat UI. The streaming/replay guards of {@link resumeSession}
    * are intentionally absent: on the wire transport the switch is a local
    * detach, so an in-flight turn on either session keeps running.
+   *
+   * Enter on the CURRENT session's row (attach → ← → Enter on the same row)
+   * is a re-enter, not an attach: the chat is still live underneath, so the
+   * view simply unmounts — no resume call, no guard error.
    */
   private async attachAgentsViewSession(targetSessionId: string): Promise<void> {
     if (targetSessionId === this.state.appState.sessionId) {
-      this.showStatus('Already on this session.');
+      this.agentsViewController.detachForAttach(targetSessionId);
       return;
     }
     let session: Session;
