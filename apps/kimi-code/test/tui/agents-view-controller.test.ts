@@ -174,6 +174,7 @@ async function boot(
     onOpenSession?: (id: string) => void;
     wire?: boolean;
     trust?: (id: string) => Promise<boolean | undefined>;
+    currentSessionId?: string;
   } = {},
 ): Promise<Boot> {
   const homeDir = await mkdtemp(join(tmpdir(), 'agents-view-controller-'));
@@ -212,6 +213,7 @@ async function boot(
     agentsViewServerLabel: () => 'test-server',
     agentsViewWorkDir: () => '/home/user/project',
     setAttachBadge,
+    getCurrentSessionId: () => opts.currentSessionId ?? '',
     onOpenSession: opts.onOpenSession,
   };
   const controller = new AgentsViewController(host);
@@ -1056,6 +1058,40 @@ describe('AgentsViewController — attach badge feed', () => {
       pending_interaction: 'approval',
     });
 
+    expect(b.setAttachBadge).toHaveBeenLastCalledWith({ agents: 0, awaiting: 1 });
+  });
+
+  it('excludes the attached session itself from the badge counts', async () => {
+    const b = await boot([summary('s1'), summary('s2')], { currentSessionId: 's1' });
+    dir = b.homeDir;
+    // s1 (the attached session) is working, s2 awaits input.
+    b.fake.emit({
+      type: 'event.session.work_changed',
+      sessionId: 's1',
+      busy: true,
+      pending_interaction: 'none',
+    });
+    b.fake.emit({
+      type: 'event.session.work_changed',
+      sessionId: 's2',
+      busy: false,
+      pending_interaction: 'approval',
+    });
+    b.setAttachBadge.mockClear();
+
+    b.controller.detachForAttach();
+
+    // Only s2 counts — the attached s1 is on screen, not badge-worthy.
+    expect(b.setAttachBadge).toHaveBeenLastCalledWith({ agents: 0, awaiting: 1 });
+
+    // s1's own state changes never move the badge at all.
+    b.setAttachBadge.mockClear();
+    b.fake.emit({
+      type: 'event.session.work_changed',
+      sessionId: 's1',
+      busy: false,
+      pending_interaction: 'approval',
+    });
     expect(b.setAttachBadge).toHaveBeenLastCalledWith({ agents: 0, awaiting: 1 });
   });
 

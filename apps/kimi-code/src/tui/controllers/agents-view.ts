@@ -37,6 +37,11 @@ export interface AgentsViewHost {
    * detached; `undefined` clears the badge (return / close).
    */
   setAttachBadge(counts: { agents: number; awaiting: number } | undefined): void;
+  /**
+   * The currently attached session id ('' when none). The attach badge
+   * excludes it — the session on screen is not "other agents" news.
+   */
+  getCurrentSessionId(): string;
   /** Attach seam (M4): KimiTUI implements it; without it Enter shows a placeholder. */
   onOpenSession?(id: string): void;
 }
@@ -421,7 +426,7 @@ export class AgentsViewController {
 
   /** Pushes the live roster counts to the attach-mode footer badge. */
   private pushAttachBadge(view: AgentsViewState): void {
-    const counts = view.roster.counts();
+    const counts = view.roster.counts(this.host.getCurrentSessionId());
     this.host.setAttachBadge({ agents: counts.working, awaiting: counts.awaiting });
   }
 

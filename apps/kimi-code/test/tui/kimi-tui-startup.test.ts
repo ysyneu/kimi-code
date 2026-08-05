@@ -2067,12 +2067,27 @@ describe('KimiTUI agents-view attach', () => {
     const view = driver.state.agentsView;
     expect(view?.detached).toBe(true);
 
-    // Live counts reach the footer badge while attached.
+    // The attached session's own work never enters the badge — it is on
+    // screen, not "other agents" news.
     emit({
       type: 'event.session.work_changed',
       sessionId: 'ses-attached',
       busy: true,
       pending_interaction: 'none',
+    } as Event);
+    expect(driver.state.footer.render(120)[0]).not.toContain('←');
+
+    // Another session working DOES reach the badge while attached.
+    emit({
+      type: 'event.session.created',
+      session: {
+        id: 'ses-other',
+        title: 'other title',
+        metadata: { cwd: '/tmp/proj-b' },
+        updated_at: new Date(2_000).toISOString(),
+        busy: true,
+        pending_interaction: 'none',
+      },
     } as Event);
     expect(driver.state.footer.render(120)[0]).toContain('[← 1 agent]');
 
@@ -2081,7 +2096,7 @@ describe('KimiTUI agents-view attach', () => {
     // Same component remounted, roster state survived, badge cleared.
     expect(view?.detached).toBe(false);
     expect(driver.state.ui.children).toContain(view?.component);
-    expect(view?.roster.counts().working).toBe(1);
+    expect(view?.roster.counts().working).toBe(2);
     expect(driver.state.footer.render(120)[0]).not.toContain('←');
   });
 

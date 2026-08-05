@@ -112,6 +112,20 @@ describe('AgentsRoster', () => {
     expect(roster.counts()).toEqual({ awaiting: 1, working: 0, completed: 1 });
   });
 
+  it('counts(excludeId) drops the named row from the tally (attach badge)', () => {
+    const roster = new AgentsRoster(new Set());
+    roster.setAll([summary('a'), summary('b'), summary('c')]);
+    roster.applyEvent(workChanged('a', { busy: true }));
+    roster.applyEvent(workChanged('b', { busy: false, pending_interaction: 'approval' }));
+
+    expect(roster.counts()).toEqual({ awaiting: 1, working: 1, completed: 1 });
+    expect(roster.counts('a')).toEqual({ awaiting: 1, working: 0, completed: 1 });
+    expect(roster.counts('b')).toEqual({ awaiting: 0, working: 1, completed: 1 });
+    // Excluding a completed row or an unknown id changes nothing badge-facing.
+    expect(roster.counts('c')).toEqual({ awaiting: 1, working: 1, completed: 0 });
+    expect(roster.counts('nope')).toEqual({ awaiting: 1, working: 1, completed: 1 });
+  });
+
   it('work_changed with busy and no pending interaction lands in working and keeps last_turn_reason', () => {
     const roster = new AgentsRoster(new Set());
     roster.setAll([summary('a')]);

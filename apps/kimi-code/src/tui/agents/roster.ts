@@ -171,11 +171,17 @@ export class AgentsRoster {
     return groups;
   }
 
-  counts(): AgentsRosterCounts {
+  /**
+   * Aggregate counts per group. `excludeId` drops one row from the tally —
+   * the attach-mode footer badge counts only OTHER sessions (the attached
+   * one is on screen, not badge-worthy).
+   */
+  counts(excludeId?: string): AgentsRosterCounts {
     let awaiting = 0;
     let working = 0;
     let completed = 0;
     for (const row of this.rows.values()) {
+      if (row.id === excludeId) continue;
       const group = groupOf(row);
       if (group === 'awaiting') awaiting += 1;
       else if (group === 'working') working += 1;
