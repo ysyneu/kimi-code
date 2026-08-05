@@ -3,6 +3,7 @@ import { z } from 'zod';
 import {
   envelopeSchema,
   unwrapEnvelope,
+  wireGoalSnapshotSchema,
   wireMessageSchema,
   wirePromptSubmitResultSchema,
   wireSessionPageSchema,
@@ -12,6 +13,7 @@ import {
   wireSnapshotSchema,
   wireWorkspaceSchema,
   type WireApprovalResponse,
+  type WireGoalSnapshot,
   type WireMessage,
   type WirePromptSubmitResult,
   type WireQuestionResponse,
@@ -55,6 +57,11 @@ export class WireHttpClient {
     body: unknown,
     dataSchema: z.ZodType<T>,
     tolerateCodes: readonly number[] = [],
+    // Most routes treat a success envelope carrying `data: null` as a server
+    // bug (`unwrapEnvelope` throws 50001) — but a few, like the goal read,
+    // legitimately report null on success (no active goal). Those pass true
+    // to return the envelope's data as-is on code 0 instead of throwing.
+    allowNullData = false,
   ): Promise<T> {
     const headers: Record<string, string> = {
       accept: 'application/json',
@@ -75,6 +82,9 @@ export class WireHttpClient {
     }
     const envelope = envelopeSchema(dataSchema).parse(parsed);
     if (tolerateCodes.includes(envelope.code)) {
+      return envelope.data as T;
+    }
+    if (allowNullData && envelope.code === 0) {
       return envelope.data as T;
     }
     return unwrapEnvelope(envelope);
@@ -136,6 +146,18 @@ export class WireHttpClient {
       z.object({ warnings: z.array(wireSessionWarningSchema) }),
     );
     return data.warnings;
+  }
+
+  /** Null when the session has no active goal (server contract, not an error). */
+  getSessionGoal(id: string): Promise<WireGoalSnapshot | null> {
+    return this.request(
+      'GET',
+      `/sessions/${id}/goal`,
+      undefined,
+      wireGoalSnapshotSchema.nullable(),
+      [],
+      true,
+    );
   }
 
   forkSession(

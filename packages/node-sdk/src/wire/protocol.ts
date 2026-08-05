@@ -135,6 +135,40 @@ export const wireSessionWarningSchema = z.object({
 export type WireSessionWarning = z.infer<typeof wireSessionWarningSchema>;
 
 // ---------------------------------------------------------------------------
+// Goal
+// ---------------------------------------------------------------------------
+
+export const wireGoalStatusSchema = z.enum(['active', 'paused', 'blocked', 'complete']);
+export type WireGoalStatus = z.infer<typeof wireGoalStatusSchema>;
+
+export const wireGoalBudgetReportSchema = z.object({
+  tokenBudget: z.number().nullable(),
+  turnBudget: z.number().nullable(),
+  wallClockBudgetMs: z.number().nullable(),
+  remainingTokens: z.number().nullable(),
+  remainingTurns: z.number().nullable(),
+  remainingWallClockMs: z.number().nullable(),
+  tokenBudgetReached: z.boolean(),
+  turnBudgetReached: z.boolean(),
+  wallClockBudgetReached: z.boolean(),
+  overBudget: z.boolean(),
+});
+export type WireGoalBudgetReport = z.infer<typeof wireGoalBudgetReportSchema>;
+
+export const wireGoalSnapshotSchema = z.object({
+  goalId: z.string(),
+  objective: z.string(),
+  completionCriterion: z.string().optional(),
+  status: wireGoalStatusSchema,
+  turnsUsed: z.number(),
+  tokensUsed: z.number(),
+  wallClockMs: z.number(),
+  budget: wireGoalBudgetReportSchema,
+  terminalReason: z.string().optional(),
+});
+export type WireGoalSnapshot = z.infer<typeof wireGoalSnapshotSchema>;
+
+// ---------------------------------------------------------------------------
 // Prompts
 // ---------------------------------------------------------------------------
 

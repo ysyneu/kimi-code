@@ -55,9 +55,11 @@ import type {
   CompactOptions,
   CreateSessionOptions,
   ForkSessionInput,
+  GoalToolResult,
   JsonObject,
   KimiHostIdentity,
   ListSessionsOptions,
+  McpServerInfo,
   McpStartupMetrics,
   OAuthRefreshOutcome,
   PermissionMode,
@@ -533,6 +535,10 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
     return this.http.getSessionWarnings(input.sessionId);
   }
 
+  override async getGoal(input: SessionIdRpcInput): Promise<GoalToolResult> {
+    return { goal: await this.http.getSessionGoal(input.sessionId) };
+  }
+
   // -----------------------------------------------------------------------
   // Workspace trust (wire-only — the base surface has no trust concept)
   // -----------------------------------------------------------------------
@@ -607,6 +613,11 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
    */
   override async listSkills(input: SessionIdRpcInput): Promise<readonly SkillSummary[]> {
     void input;
+    return [];
+  }
+
+  /** wire degrade: kap-server has no session-scoped MCP route. */
+  override async listMcpServers(): Promise<readonly McpServerInfo[]> {
     return [];
   }
 

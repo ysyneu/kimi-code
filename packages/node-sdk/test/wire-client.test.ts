@@ -776,9 +776,54 @@ describe('SDKRpcClientWire turns and state', () => {
 
   it('unimplemented methods fail loudly with not_implemented', async () => {
     const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
-    await expect(rpc.listMcpServers({ sessionId: 's' })).rejects.toMatchObject({
+    await expect(rpc.getCronTasks({ sessionId: 's' })).rejects.toMatchObject({
       code: ErrorCodes.NOT_IMPLEMENTED,
     });
+    await rpc.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDKRpcClientWire getGoal — the root fix for the attach crash: the wire
+// transport previously had no override, so every attach's
+// `Promise.all([getStatus(), getGoal()])` rejected with not_implemented.
+// ---------------------------------------------------------------------------
+
+describe('SDKRpcClientWire getGoal', () => {
+  it('wraps the http read in the GoalToolResult { goal } shape', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const snapshot = {
+      goalId: 'g1',
+      objective: 'ship the fix',
+      status: 'active' as const,
+      turnsUsed: 2,
+      tokensUsed: 500,
+      wallClockMs: 1000,
+      budget: {
+        tokenBudget: null,
+        turnBudget: null,
+        wallClockBudgetMs: null,
+        remainingTokens: null,
+        remainingTurns: null,
+        remainingWallClockMs: null,
+        tokenBudgetReached: false,
+        turnBudgetReached: false,
+        wallClockBudgetReached: false,
+        overBudget: false,
+      },
+    };
+    const spy = vi.spyOn(WireHttpClient.prototype, 'getSessionGoal').mockResolvedValue(snapshot);
+    await expect(rpc.getGoal({ sessionId: 's1' })).resolves.toEqual({ goal: snapshot });
+    expect(spy).toHaveBeenCalledWith('s1');
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('resolves { goal: null } against the live server when no goal is active', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    await expect(rpc.getGoal({ sessionId: created.id })).resolves.toEqual({ goal: null });
     await rpc.close();
   });
 });
@@ -810,11 +855,12 @@ function stubSubmitPrompt(status: 'running' | 'queued' = 'running') {
 }
 
 describe('SDKRpcClientWire degrade surface', () => {
-  it('degrades plugin/skill/MCP-startup surfaces to empty collections', async () => {
+  it('degrades plugin/skill/MCP surfaces to empty collections', async () => {
     const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
     await expect(rpc.listPlugins()).resolves.toEqual([]);
     await expect(rpc.listPluginCommands({ sessionId: 's' })).resolves.toEqual([]);
     await expect(rpc.listSkills({ sessionId: 's' })).resolves.toEqual([]);
+    await expect(rpc.listMcpServers()).resolves.toEqual([]);
     await expect(rpc.getMcpStartupMetrics({ sessionId: 's' })).resolves.toEqual({
       durationMs: 0,
     });

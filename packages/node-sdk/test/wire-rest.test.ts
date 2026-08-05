@@ -199,4 +199,12 @@ describe('WireHttpClient against a real kap-server', () => {
     const messages = await http.getMessages(created.id);
     expect(messages.items.some((m) => m.role === 'user')).toBe(true);
   });
+
+  // A fresh session has no active goal — the route's success envelope carries
+  // `data: null` (not an error). This is the exact shape `unwrapEnvelope`
+  // otherwise rejects, so this exercises the `allowNullData` escape hatch.
+  it('reads the session goal, resolving null when none is active', async () => {
+    const created = await http.createSession({ metadata: { cwd } });
+    await expect(http.getSessionGoal(created.id)).resolves.toBeNull();
+  });
 });
