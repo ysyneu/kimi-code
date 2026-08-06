@@ -1,15 +1,21 @@
 import type { Terminal, TUI } from '@moonshot-ai/pi-tui';
-import { describe, expect, it, vi } from 'vitest';
+import chalk from 'chalk';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import type { AgentsGroup, AgentsGroupId, AgentsRosterRow } from '@/tui/agents/roster';
 import { AgentsViewApp, type AgentsViewProps } from '@/tui/components/agents-view/app';
 import { AgentsExitConfirmComponent } from '@/tui/components/agents-view/exit-confirm';
 import { CustomEditor } from '@/tui/components/editor/custom-editor';
+import { EXIT_CONFIRM_WINDOW_MS } from '#/tui/constant/kimi-tui';
+import { darkColors } from '@/tui/theme/colors';
 
 const ANSI_SGR = /\[[0-9;]*m/g;
 function strip(text: string): string {
   return text.replaceAll(ANSI_SGR, '');
 }
+
+const ESC = String.fromCodePoint(27);
+const CTRL_C = String.fromCodePoint(3);
 
 /** Minimal Terminal stub — only `rows` is read by the component. */
 function fakeTerminal(rows: number, columns = 120): Terminal {
@@ -85,6 +91,7 @@ function makeProps(overrides: Partial<AgentsViewProps> = {}): AgentsViewProps {
     groups: [],
     counts: { awaiting: 0, working: 0, completed: 0 },
     selectedId: undefined,
+    originId: undefined,
     serverLabel: 'embedded',
     modelLabel: 'kimi-k2',
     confirmDeleteId: undefined,
@@ -116,6 +123,67 @@ function makeApp(props: Partial<AgentsViewProps> = {}, rows = 30, columns = 120)
 function render(app: AgentsViewApp, width = 120): string {
   return strip(app.render(width).join('\n'));
 }
+
+/** Unstripped join, for bold-vs-plain SGR assertions `render()` can't make. */
+function renderRaw(app: AgentsViewApp, width = 120): string {
+  return app.render(width).join('\n');
+}
+
+describe('AgentsViewApp — originId threads into the row\'s bold "came from" styling', () => {
+  // R4 parity: `originId` (the session this roster-attach lifecycle was
+  // last backed out of via ←) is independent of `selectedId` — only the
+  // row matching `originId` bolds its name, and moving the cursor selection
+  // must not touch it.
+  //
+  // Bold-vs-plain assertions below need chalk actually emitting SGR codes —
+  // the test process is not a TTY, so chalk auto-detects level 0 without
+  // this. Scoped to just this describe block: this file's own `strip()`
+  // (used by every OTHER describe block here) doesn't strip the leading ESC
+  // byte, so forcing color file-wide would leave stray ESC characters in
+  // every stripped substring check outside this block.
+  const previousChalkLevel = chalk.level;
+  beforeAll(() => {
+    chalk.level = 3;
+  });
+  afterAll(() => {
+    chalk.level = previousChalkLevel;
+  });
+
+  it('the row matching originId renders its name bold; other rows do not', () => {
+    const groups = [group('working', [row('s1'), row('s2')])];
+    const out = renderRaw(makeApp({ groups, originId: 's1' }));
+    const lines = out.split('\n');
+    const s1Line = lines.find((l) => l.includes('s1 title'));
+    const s2Line = lines.find((l) => l.includes('s2 title'));
+    expect(s1Line).toContain(chalk.hex(darkColors.textStrong).bold('s1 title'));
+    expect(s2Line).not.toContain(chalk.hex(darkColors.textStrong).bold('s2 title'));
+  });
+
+  it('selecting a different row than originId does not bold the selected row nor un-bold the origin row', () => {
+    const groups = [group('working', [row('s1'), row('s2')])];
+    const out = renderRaw(makeApp({ groups, originId: 's1', selectedId: 's2' }));
+    const lines = out.split('\n');
+    const s1Line = lines.find((l) => l.includes('s1 title'));
+    const s2Line = lines.find((l) => l.includes('s2 title'));
+    expect(s1Line).toContain(chalk.hex(darkColors.textStrong).bold('s1 title'));
+    expect(s2Line).not.toContain(chalk.hex(darkColors.textStrong).bold('s2 title'));
+  });
+
+  it('originId undefined (fresh open, no prior attach): no row is bold', () => {
+    const groups = [group('working', [row('s1'), row('s2')])];
+    const out = renderRaw(makeApp({ groups, originId: undefined, selectedId: 's1' }));
+    const lines = out.split('\n');
+    const s1Line = lines.find((l) => l.includes('s1 title'));
+    expect(s1Line).not.toContain(chalk.hex(darkColors.textStrong).bold('s1 title'));
+  });
+
+  it('the same row as both selected and origin still bolds (the two flags compose)', () => {
+    const groups = [group('working', [row('s1')])];
+    const out = renderRaw(makeApp({ groups, originId: 's1', selectedId: 's1' }));
+    const line = out.split('\n').find((l) => l.includes('s1 title'));
+    expect(line).toContain(chalk.hex(darkColors.textStrong).bold('s1 title'));
+  });
+});
 
 describe('AgentsViewApp — full-screen rendering', () => {
   it('fills exactly terminal.rows lines (height takeover)', () => {
@@ -730,6 +798,61 @@ describe('AgentsViewApp — pin / help / quit', () => {
     expect(onQuit).toHaveBeenCalledTimes(1);
   });
 
+  // ── R4 parity: Esc is a dismiss-cascade, not a flat quit ──
+
+  it('Esc returns to the origin session instead of quitting when one is set', () => {
+    const onQuit = vi.fn();
+    const onOpen = vi.fn();
+    const app = makeApp({ onQuit, onOpen, originId: 'ses-origin' });
+    app.handleInput(ESC);
+    expect(onOpen).toHaveBeenCalledWith('ses-origin');
+    expect(onQuit).not.toHaveBeenCalled();
+  });
+
+  it('a delete confirm still absorbs Esc as a cancel first, even with an origin set', () => {
+    // The confirm is itself the innermost thing to dismiss — it must not be
+    // skipped just because there's an origin to fall back to.
+    const onQuit = vi.fn();
+    const onOpen = vi.fn();
+    const app = makeApp({
+      groups: [group('completed', [row('s1')])],
+      confirmDeleteId: 's1',
+      onQuit,
+      onOpen,
+      originId: 'ses-origin',
+    });
+    app.handleInput(ESC);
+    expect(onQuit).toHaveBeenCalledTimes(1);
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it('Esc while the ? grid is open just closes the grid, even with an origin set — no return, no quit', () => {
+    const onQuit = vi.fn();
+    const onOpen = vi.fn();
+    const app = makeApp({ onQuit, onOpen, originId: 'ses-origin' });
+    app.handleInput('?');
+    app.handleInput(ESC);
+    expect(onQuit).not.toHaveBeenCalled();
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(render(app)).not.toContain('? to close');
+  });
+
+  it("Esc in reply mode is the composer's own escape, not the origin-return/quit branch", () => {
+    const onQuit = vi.fn();
+    const onOpen = vi.fn();
+    const app = makeApp({
+      dispatchEditor: makeDispatchEditor(),
+      dispatchFocused: true,
+      replyTargetId: 's1',
+      onQuit,
+      onOpen,
+      originId: 'ses-origin',
+    });
+    app.handleInput(ESC);
+    expect(onQuit).not.toHaveBeenCalled();
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
   it('q types into the dispatch editor on an empty list — no quit', () => {
     const editor = makeDispatchEditor();
     const onQuit = vi.fn();
@@ -748,6 +871,66 @@ describe('AgentsViewApp — pin / help / quit', () => {
     app.handleInput('[113u');
     expect(onQuit).not.toHaveBeenCalled();
     expect(editor.getText()).toBe('q');
+  });
+});
+
+describe('AgentsViewApp — Ctrl+C two-stage exit confirm (R4 parity)', () => {
+  // Mirrors the main REPL's armPendingExit/CTRL_C_HINT pattern (see the
+  // class docstring): independent of Esc/origin — a first press only arms
+  // a footer hint, a second press inside EXIT_CONFIRM_WINDOW_MS quits, and
+  // the window elapsing disarms silently.
+
+  it('a first Ctrl+C arms the footer hint without quitting', () => {
+    const onQuit = vi.fn();
+    const app = makeApp({ onQuit, counts: { awaiting: 0, working: 3, completed: 0 } });
+    app.handleInput(CTRL_C);
+    expect(onQuit).not.toHaveBeenCalled();
+    const out = render(app);
+    expect(out).toContain('Press Ctrl+C again to exit');
+    expect(out).toContain('3 agents will keep running');
+  });
+
+  it('omits the running-agent suffix when nothing is working', () => {
+    const app = makeApp({ counts: { awaiting: 0, working: 0, completed: 0 } });
+    app.handleInput(CTRL_C);
+    const out = render(app);
+    expect(out).toContain('Press Ctrl+C again to exit');
+    expect(out).not.toContain('will keep running');
+  });
+
+  it('uses singular phrasing for exactly one working agent', () => {
+    const app = makeApp({ counts: { awaiting: 0, working: 1, completed: 0 } });
+    app.handleInput(CTRL_C);
+    const out = render(app);
+    expect(out).toContain('1 agent will keep running');
+    expect(out).not.toContain('1 agents');
+  });
+
+  it('a second Ctrl+C within the window quits', () => {
+    const onQuit = vi.fn();
+    const app = makeApp({ onQuit });
+    app.handleInput(CTRL_C);
+    app.handleInput(CTRL_C);
+    expect(onQuit).toHaveBeenCalledTimes(1);
+  });
+
+  it('auto-disarms after the window elapses — the hint clears and a later Ctrl+C re-arms instead of quitting', () => {
+    vi.useFakeTimers();
+    try {
+      const onQuit = vi.fn();
+      const app = makeApp({ onQuit });
+      app.handleInput(CTRL_C);
+      expect(render(app)).toContain('Press Ctrl+C again to exit');
+
+      vi.advanceTimersByTime(EXIT_CONFIRM_WINDOW_MS + 1);
+      expect(render(app)).not.toContain('Press Ctrl+C again to exit');
+
+      app.handleInput(CTRL_C);
+      expect(onQuit).not.toHaveBeenCalled(); // a fresh arm, not a confirming second press
+      expect(render(app)).toContain('Press Ctrl+C again to exit');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

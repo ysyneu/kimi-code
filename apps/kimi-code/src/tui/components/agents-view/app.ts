@@ -38,6 +38,16 @@
  * - Reorder: `shift+↑↓` fires `onReorderPinned` only for a PINNED row;
  *   the callback is a no-op signal for anything else, so the controller
  *   need not re-check `pinned` itself.
+ * - Esc is a dismiss-cascade, not a flat quit: rename/dispatch-focused/help
+ *   each already absorb it above the branch below. Past that, Esc returns to
+ *   `props.originId` (via the normal `onOpen` path — attaching back onto the
+ *   session you already left resolves as a re-enter, not a fresh resume) when
+ *   an origin is set, and only calls `onQuit` when there is none.
+ * - Ctrl+C is a genuine two-stage confirm-to-exit, independent of Esc/origin:
+ *   first press arms a footer hint (mirrors the main REPL's
+ *   `armPendingExit`/`CTRL_C_HINT` pattern) for `EXIT_CONFIRM_WINDOW_MS`; a
+ *   second press inside that window calls `onQuit`, same as Esc's no-origin
+ *   fallback; the window elapsing disarms silently.
  */
 
 import {
@@ -53,6 +63,7 @@ import type { AgentsGroup, AgentsGroupId, AgentsRosterRow } from '@/tui/agents/r
 import type { CustomEditor } from '@/tui/components/editor/custom-editor';
 import { getVersion } from '#/cli/version';
 import { PRODUCT_NAME } from '#/constant/app';
+import { CTRL_C_HINT, EXIT_CONFIRM_WINDOW_MS } from '#/tui/constant/kimi-tui';
 import { currentTheme } from '#/tui/theme';
 import { printableChar, isPrintableChar } from '@/tui/utils/printable-key';
 
@@ -63,6 +74,13 @@ export interface AgentsViewProps {
   readonly counts: { awaiting: number; working: number; completed: number };
   /** Selected item: a row id, `group:<id>`, or `more:completed`. */
   readonly selectedId: string | undefined;
+  /**
+   * The session id this roster-attach lifecycle was last backed out of via
+   * ← (see `returnToAgentsView`), or `undefined` on a fresh open with no
+   * prior attach. Independent of `selectedId` — drives the row's bold
+   * "came from" styling in `rows.ts`, not the cursor pointer.
+   */
+  readonly originId: string | undefined;
   /** "embedded" or host:port of the connected kap-server. Not currently shown
    *  by the header chrome (Claude Code's header has no server-label slot),
    *  but kept on the props contract for the host wiring that supplies it. */
@@ -155,7 +173,7 @@ const HELP_GRID: readonly (readonly (HelpCell | undefined)[])[] = [
     ['alt+1-9', 'to open'],
     ['space', 'to reply'],
     ['@', 'to mention'],
-    ['esc', 'to quit'],
+    ['esc', 'to go back/quit'],
   ],
   [
     ['ctrl+r', 'to rename'],
@@ -180,6 +198,9 @@ export class AgentsViewApp extends Container implements Focusable {
   private listScroll = 0;
   private helpVisible = false;
   private rename: RenameState | undefined = undefined;
+  /** Set while a first Ctrl+C is armed and waiting for a confirming second
+   *  press within `EXIT_CONFIRM_WINDOW_MS` — see `armPendingExit`. */
+  private pendingExitTimer: ReturnType<typeof setTimeout> | undefined = undefined;
 
   constructor(props: AgentsViewProps, terminal: Terminal) {
     super();
@@ -315,7 +336,30 @@ export class AgentsViewApp extends Container implements Focusable {
       return;
     }
 
+    // Ctrl+C: two-stage confirm-to-exit, independent of Esc/origin — see the
+    // class docstring. A first press only arms the footer hint; nothing
+    // quits until a second press lands inside the window.
+    if (matchesKey(data, Key.ctrl('c'))) {
+      if (this.pendingExitTimer !== undefined) {
+        this.clearPendingExit();
+        this.props.onQuit();
+        return;
+      }
+      this.armPendingExit();
+      return;
+    }
+
     if (matchesKey(data, Key.escape)) {
+      // A pending delete confirm is itself the innermost thing to dismiss —
+      // it keeps consuming Esc as a cancel (via onQuit; the controller
+      // clears confirmDeleteId instead of closing) ahead of the
+      // origin-return check below.
+      if (this.props.confirmDeleteId === undefined && this.props.originId !== undefined) {
+        // Nothing left to dismiss: return to the session this lifecycle was
+        // last backed out of — same effect as Enter on that row.
+        this.props.onOpen(this.props.originId);
+        return;
+      }
       this.props.onQuit();
       return;
     }
@@ -425,6 +469,26 @@ export class AgentsViewApp extends Container implements Focusable {
     this.props.dispatchEditor.handleInput(data);
     this.props.onDispatchFocusChange(true);
     this.invalidate();
+  }
+
+  /** Arms the Ctrl+C footer hint; auto-disarms after `EXIT_CONFIRM_WINDOW_MS`
+   *  if no confirming second press lands first. */
+  private armPendingExit(): void {
+    this.clearPendingExit();
+    const timer = setTimeout(() => {
+      if (this.pendingExitTimer === timer) {
+        this.pendingExitTimer = undefined;
+        this.invalidate();
+      }
+    }, EXIT_CONFIRM_WINDOW_MS);
+    this.pendingExitTimer = timer;
+    this.invalidate();
+  }
+
+  private clearPendingExit(): void {
+    if (this.pendingExitTimer === undefined) return;
+    clearTimeout(this.pendingExitTimer);
+    this.pendingExitTimer = undefined;
   }
 
   private moveSelection(delta: number): void {
@@ -567,7 +631,7 @@ export class AgentsViewApp extends Container implements Focusable {
         currentTheme.fg('textDim', '▌');
       return fitExactly(line, width);
     }
-    return renderRosterRow(row, selected, width);
+    return renderRosterRow(row, selected, row.id === this.props.originId, width);
   }
 
   private draftFor(id: string): string | undefined {
@@ -626,7 +690,15 @@ export class AgentsViewApp extends Container implements Focusable {
     const compose = (...parts: string[]): string => ` ${parts.join(dim(' · '))} `;
 
     let left: string;
-    if (this.draftFor(this.props.renameDraft?.sessionId ?? this.rename?.id ?? '') !== undefined) {
+    if (this.pendingExitTimer !== undefined) {
+      // Ctrl+C armed: replaces the whole footer, same as the main REPL's
+      // transient exit hint — the two-stage confirm is the most urgent
+      // signal on screen while it's live.
+      const working = this.props.counts.working;
+      const runningNote =
+        working > 0 ? ` · ${String(working)} agent${working === 1 ? '' : 's'} will keep running` : '';
+      left = compose(currentTheme.boldFg('warning', CTRL_C_HINT + runningNote));
+    } else if (this.draftFor(this.props.renameDraft?.sessionId ?? this.rename?.id ?? '') !== undefined) {
       left = compose(hint('enter', 'to submit'), hint('esc', 'to cancel'));
     } else if (this.props.dispatchFocused) {
       left =

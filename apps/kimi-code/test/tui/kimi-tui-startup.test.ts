@@ -2303,6 +2303,34 @@ describe('KimiTUI agents-view attach', () => {
     expect(plainDriver.returnToAgentsView()).toBe(false);
   });
 
+  // ── R4 parity: ← return sets the origin row ("session you came from") ──
+
+  it('returnToAgentsView passes the just-left session as the origin', async () => {
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+    driver.onOpenSession('ses-attached');
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(driver.state.agentsView?.originSessionId).toBeUndefined();
+
+    expect(driver.returnToAgentsView()).toBe(true);
+
+    await vi.waitFor(() => {
+      expect(driver.state.agentsView?.detached).toBe(false);
+    });
+    expect(driver.state.agentsView?.originSessionId).toBe('ses-attached');
+  });
+
+  it('cold open (never attached) has no origin', async () => {
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    expect(driver.state.agentsView?.originSessionId).toBeUndefined();
+  });
+
   it('seeds the badge excluding the session being attached (already-awaiting attach)', async () => {
     // Regression (review round 2): the seed runs before switchToSession sets
     // appState.sessionId, so it must exclude the TARGET id — an attach target

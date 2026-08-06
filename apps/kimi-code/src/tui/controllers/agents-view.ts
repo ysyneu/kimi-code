@@ -95,6 +95,15 @@ export interface AgentsViewState {
    */
   replyTargetId: string | undefined;
   selectedId: string | undefined;
+  /**
+   * The session id this SAME roster-attach lifecycle was last backed out of
+   * via ← (`returnToAgentsView`) — `undefined` until the first such return.
+   * Scoped to this `AgentsViewState` object's lifetime (reset only by a
+   * fresh `close()` + re-`show()`), not persisted across process restarts.
+   * Attaching TO a session (`detachForAttach`) never touches this — it only
+   * changes on the way back, mirroring Claude Code's own `isOrigin` flag.
+   */
+  originSessionId: string | undefined;
   confirmDeleteId: string | undefined;
   renameDraft: { sessionId: string; text: string } | undefined;
   flashMessage: string | undefined;
@@ -170,13 +179,23 @@ export class AgentsViewController {
     return this.host.state.agentsView !== undefined;
   }
 
-  async show(): Promise<void> {
+  /**
+   * `originSessionId`: passed only by the ← "return to roster" seam
+   * (`returnToAgentsView`) — the session id the caller is backing out of.
+   * Every other caller (cold open, post-quit-confirm remount, failed-attach
+   * recovery) omits it, leaving whatever origin the lifecycle already had
+   * untouched.
+   */
+  async show(originSessionId?: string): Promise<void> {
     const { state } = this.host;
     const existing = state.agentsView;
     if (existing !== undefined) {
       // Return from attach: remount the same component over the live roster —
       // the subscription kept it current, so there is nothing to reload.
-      if (existing.detached) this.remount(existing);
+      if (existing.detached) {
+        if (originSessionId !== undefined) existing.originSessionId = originSessionId;
+        this.remount(existing);
+      }
       return;
     }
 
@@ -220,6 +239,7 @@ export class AgentsViewController {
         dispatchFocused: false,
         replyTargetId: undefined,
         selectedId: undefined,
+        originSessionId: undefined,
         confirmDeleteId: undefined,
         renameDraft: undefined,
         flashMessage: undefined,
@@ -281,6 +301,7 @@ export class AgentsViewController {
       dispatchFocused: false,
       replyTargetId: undefined,
       selectedId: undefined,
+      originSessionId: undefined,
       confirmDeleteId: undefined,
       renameDraft: undefined,
       flashMessage: undefined,
@@ -578,6 +599,7 @@ export class AgentsViewController {
     dispatchFocused: boolean;
     replyTargetId: string | undefined;
     selectedId: string | undefined;
+    originSessionId: string | undefined;
     confirmDeleteId: string | undefined;
     renameDraft: { sessionId: string; text: string } | undefined;
     flashMessage: string | undefined;
@@ -594,6 +616,7 @@ export class AgentsViewController {
       groups,
       counts: view.roster.counts(),
       selectedId: view.selectedId,
+      originId: view.originSessionId,
       serverLabel: this.host.agentsViewServerLabel(),
       modelLabel: this.host.agentsViewModelLabel(),
       confirmDeleteId: view.confirmDeleteId,

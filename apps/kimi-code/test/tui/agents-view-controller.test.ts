@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import type { Event, KimiHarness, Session, SessionSummary, WireSession } from '@moonshot-ai/kimi-code-sdk';
 import { SDKRpcClientWire } from '@moonshot-ai/kimi-code-sdk';
 import type { Component, Container, ProcessTerminal, Terminal, TUI } from '@moonshot-ai/pi-tui';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import chalk from 'chalk';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { loadAgentsViewState, saveAgentsViewState } from '@/tui/agents/roster-persistence';
 import type { AgentsViewApp } from '@/tui/components/agents-view/app';
@@ -1643,6 +1644,105 @@ describe('AgentsViewController — detach for attach', () => {
   });
 });
 
+// ── R4 parity: origin row ("session you came from") ──
+
+describe('AgentsViewController — return-to-view origin (isOrigin)', () => {
+  // Bold-vs-plain assertions below need chalk actually emitting SGR codes —
+  // the test process is not a TTY, so chalk auto-detects level 0 without
+  // this. Scoped to just this describe block: this file's own `strip()`
+  // (used by `boot()`'s `render()` helper throughout the rest of the file)
+  // doesn't strip the leading ESC byte, so forcing color file-wide would
+  // leave stray ESC characters in every other describe block's substring
+  // checks.
+  const previousChalkLevel = chalk.level;
+  beforeAll(() => {
+    chalk.level = 3;
+  });
+  afterAll(() => {
+    chalk.level = previousChalkLevel;
+  });
+
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) {
+      // maxRetries: a fire-and-forget persistState can still be mid-write
+      // (ENOTEMPTY on rmdir) when the test body returns.
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
+    dir = undefined;
+  });
+
+  it('show(originSessionId) on a detached view remounts with that row bolded', async () => {
+    const b = await boot([summary('s1'), summary('s2')]);
+    dir = b.homeDir;
+    b.controller.detachForAttach('s1');
+
+    await b.controller.show('s1');
+
+    expect(b.view().detached).toBe(false);
+    expect(b.view().originSessionId).toBe('s1');
+    const raw = b.host.state.agentsView?.component.render(120).join('\n') ?? '';
+    expect(raw).toContain(chalk.hex(currentTheme.palette.textStrong).bold('s1 title'));
+    expect(raw).not.toContain(chalk.hex(currentTheme.palette.textStrong).bold('s2 title'));
+  });
+
+  it('a fresh show() with no origin argument bolds nothing (cold open, no prior attach)', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    expect(b.view().originSessionId).toBeUndefined();
+    const raw = b.component().render(120).join('\n');
+    expect(raw).not.toContain(chalk.hex(currentTheme.palette.textStrong).bold('s1 title'));
+  });
+
+  it('detachForAttach (attaching TO a session) never sets or clears the origin', async () => {
+    const b = await boot([summary('s1'), summary('s2')]);
+    dir = b.homeDir;
+    await b.controller.show('s1'); // no-op: view already mounted, not detached
+    expect(b.view().originSessionId).toBeUndefined();
+
+    b.controller.detachForAttach('s2');
+    expect(b.view().originSessionId).toBeUndefined();
+  });
+
+  it('a second return overwrites the origin with the newly backed-out-of session', async () => {
+    const b = await boot([summary('s1'), summary('s2')]);
+    dir = b.homeDir;
+    b.controller.detachForAttach('s1');
+    await b.controller.show('s1');
+    expect(b.view().originSessionId).toBe('s1');
+
+    b.controller.detachForAttach('s2');
+    await b.controller.show('s2');
+    expect(b.view().originSessionId).toBe('s2');
+  });
+
+  it('moving the roster selection (↑↓) leaves the origin untouched', async () => {
+    const b = await boot([summary('s1'), summary('s2')]);
+    dir = b.homeDir;
+    b.controller.detachForAttach('s1');
+    await b.controller.show('s1');
+    expect(b.view().originSessionId).toBe('s1');
+
+    b.component().handleInput(DOWN);
+    b.component().handleInput(DOWN);
+
+    expect(b.view().originSessionId).toBe('s1');
+  });
+
+  it('a remount recovery call without an origin argument (e.g. failed-attach retry) preserves the existing origin', async () => {
+    const b = await boot([summary('s1'), summary('s2')]);
+    dir = b.homeDir;
+    b.controller.detachForAttach('s1');
+    await b.controller.show('s1');
+    expect(b.view().originSessionId).toBe('s1');
+    b.controller.detachForAttach('s2');
+
+    await b.controller.show(); // no explicit origin, e.g. a failure-recovery remount
+
+    expect(b.view().detached).toBe(false);
+    expect(b.view().originSessionId).toBe('s1');
+  });
+});
 
 // ── Attach footer badge feed + deferred-permission hint ──
 

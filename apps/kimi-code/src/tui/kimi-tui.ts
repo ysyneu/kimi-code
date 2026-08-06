@@ -1652,7 +1652,11 @@ export class KimiTUI {
     if (this.state.startupState !== 'agents-view' || view === undefined || !view.detached) {
       return false;
     }
-    void this.agentsViewController.show();
+    // The session on screen right now is the one being backed out of — it
+    // becomes the roster's "came from" row (bold title in rows.ts) once the
+    // view remounts. Captured before show() runs; nothing switches sessions
+    // on this path, so appState.sessionId is stable across the call.
+    void this.agentsViewController.show(this.state.appState.sessionId);
     return true;
   }
 

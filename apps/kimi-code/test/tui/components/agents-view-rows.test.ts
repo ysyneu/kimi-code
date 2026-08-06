@@ -2,21 +2,41 @@
  * Scenario: agents-view roster row rendering.
  * Responsibilities: the fixed-width `glyph name summary meta` row layout,
  * the lastAssistantText → lastPrompt fallback, the no-cwd/no-duplicate
- * rules, the busy/unseen/seen status glyph, and the ping-pong spinner.
+ * rules, the busy/unseen/seen status glyph, the ping-pong spinner, and the
+ * selected/isOrigin styling split (background fill on selection is a
+ * separate, not-yet-landed mechanism — see rows.ts's doc comment).
  * Wiring: pure function, no TUI/component harness needed.
  * Run: pnpm exec vitest run test/tui/components/agents-view-rows.test.ts
  */
-import { describe, expect, it } from 'vitest';
+import chalk from 'chalk';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import type { AgentsRosterRow } from '@/tui/agents/roster';
 import { formatRelativeTime, renderGroupHeader, renderRosterRow, spinnerFrames } from '@/tui/components/agents-view/rows';
+import { darkColors } from '@/tui/theme/colors';
 
 // This file asserts exact lengths and column offsets, so (unlike the
 // sibling test files' substring-only checks) the ESC byte has to be
 // stripped too, not just the trailing `[...m`.
-const ANSI_SGR = /\u001B\[[0-9;]*m/g;
+const ANSI_SGR = /\[[0-9;]*m/g;
 function strip(text: string): string {
   return text.replaceAll(ANSI_SGR, '');
+}
+
+// Bold-vs-plain assertions need chalk actually emitting SGR codes — the
+// test process is not a TTY, so chalk auto-detects level 0 without this.
+const previousChalkLevel = chalk.level;
+beforeAll(() => {
+  chalk.level = 3;
+});
+afterAll(() => {
+  chalk.level = previousChalkLevel;
+});
+
+/** True when the raw (unstripped) line carries a bold SGR code anywhere. */
+const BOLD_SGR = /\[1m/;
+function isBold(rawLine: string): boolean {
+  return BOLD_SGR.test(rawLine);
 }
 
 /** pointer (2 cols) + glyph (1 col) + space (1 col) — constant either state. */
@@ -40,7 +60,7 @@ function row(overrides: Partial<AgentsRosterRow> = {}): AgentsRosterRow {
 describe('renderRosterRow', () => {
   it('renders name, assistant summary, and time in order, with no cwd', () => {
     const line = strip(
-      renderRosterRow(row({ lastAssistantText: 'the answer is 42', updatedAt: Date.now() }), false, 80),
+      renderRosterRow(row({ lastAssistantText: 'the answer is 42', updatedAt: Date.now() }), false, false, 80),
     );
 
     const nameIdx = line.indexOf('s1 title');
@@ -54,13 +74,13 @@ describe('renderRosterRow', () => {
   });
 
   it('falls back to lastPrompt when lastAssistantText is absent (older sessions)', () => {
-    const line = strip(renderRosterRow(row({ lastPrompt: 'do the thing' }), false, 80));
+    const line = strip(renderRosterRow(row({ lastPrompt: 'do the thing' }), false, false, 80));
     expect(line).toContain('do the thing');
   });
 
   it('prefers lastAssistantText over lastPrompt when both are present', () => {
     const line = strip(
-      renderRosterRow(row({ lastPrompt: 'the prompt', lastAssistantText: 'the reply' }), false, 80),
+      renderRosterRow(row({ lastPrompt: 'the prompt', lastAssistantText: 'the reply' }), false, false, 80),
     );
     expect(line).toContain('the reply');
     expect(line).not.toContain('the prompt');
@@ -68,7 +88,7 @@ describe('renderRosterRow', () => {
 
   it('leaves the summary blank when title === lastPrompt (single-turn auto-title)', () => {
     const line = strip(
-      renderRosterRow(row({ title: 'fix the flaky test', lastPrompt: 'fix the flaky test' }), false, 80),
+      renderRosterRow(row({ title: 'fix the flaky test', lastPrompt: 'fix the flaky test' }), false, false, 80),
     );
     expect(line.indexOf('fix the flaky test')).toBe(line.lastIndexOf('fix the flaky test'));
   });
@@ -77,7 +97,7 @@ describe('renderRosterRow', () => {
     // kap-server accepts multi-line titles; the row must still render as one
     // line, and the dedup below must still match a single-line lastPrompt.
     const line = strip(
-      renderRosterRow(row({ title: 'fix the\nflaky test', lastPrompt: 'fix the flaky test' }), false, 80),
+      renderRosterRow(row({ title: 'fix the\nflaky test', lastPrompt: 'fix the flaky test' }), false, false, 80),
     );
     expect(line).toContain('fix the flaky test');
     expect(line).not.toContain('\n');
@@ -87,12 +107,12 @@ describe('renderRosterRow', () => {
   it('leaves the summary blank when an untitled row already used lastPrompt as its name', () => {
     // The name itself falls back to lastPrompt when title is empty; the
     // summary must not re-show the same text as a second copy.
-    const line = strip(renderRosterRow(row({ title: '', lastPrompt: 'summarize the logs' }), false, 80));
+    const line = strip(renderRosterRow(row({ title: '', lastPrompt: 'summarize the logs' }), false, false, 80));
     expect(line.indexOf('summarize the logs')).toBe(line.lastIndexOf('summarize the logs'));
   });
 
   it('shows no summary segment when neither field is set', () => {
-    const line = strip(renderRosterRow(row(), false, 80));
+    const line = strip(renderRosterRow(row(), false, false, 80));
     expect(line).toContain('s1 title');
   });
 });
@@ -103,7 +123,7 @@ describe('renderRosterRow — fixed 42-col name slot', () => {
     ['a name of medium length here', 29],
     ['x'.repeat(40), 40],
   ])('left-pads "%s" (%i chars) so name + gap = 42', (name, length) => {
-    const line = strip(renderRosterRow(row({ title: name }), false, 120));
+    const line = strip(renderRosterRow(row({ title: name }), false, false, 120));
     const nameField = line.slice(PREFIX_WIDTH, PREFIX_WIDTH + NAME_WIDTH);
     expect(nameField).toHaveLength(NAME_WIDTH);
     expect(nameField.startsWith(name)).toBe(true);
@@ -114,7 +134,7 @@ describe('renderRosterRow — fixed 42-col name slot', () => {
 
   it('ellipsis-truncates a name longer than 42 columns to exactly 42, mid-word', () => {
     const longName = 'refactor the nightly report generation pipeline';
-    const line = strip(renderRosterRow(row({ title: longName }), false, 120));
+    const line = strip(renderRosterRow(row({ title: longName }), false, false, 120));
     const nameField = line.slice(PREFIX_WIDTH, PREFIX_WIDTH + NAME_WIDTH);
     expect(nameField).toHaveLength(NAME_WIDTH);
     expect(nameField.endsWith('…')).toBe(true);
@@ -122,8 +142,8 @@ describe('renderRosterRow — fixed 42-col name slot', () => {
   });
 
   it('the name slot starts at the same column whether the row is selected or not', () => {
-    const selectedLine = strip(renderRosterRow(row({ title: 'abc' }), true, 120));
-    const plainLine = strip(renderRosterRow(row({ title: 'abc' }), false, 120));
+    const selectedLine = strip(renderRosterRow(row({ title: 'abc' }), true, false, 120));
+    const plainLine = strip(renderRosterRow(row({ title: 'abc' }), false, false, 120));
     expect(selectedLine.indexOf('abc')).toBe(plainLine.indexOf('abc'));
     expect(plainLine.indexOf('abc')).toBe(PREFIX_WIDTH);
   });
@@ -134,7 +154,7 @@ describe('renderRosterRow — summary truncates, meta never does', () => {
     const longSummary =
       'Delivered five ready to paste prompts with detailed staging notes and a full changelog attached here';
     const updatedAt = Date.now() - 5 * 60 * 1000;
-    const line = strip(renderRosterRow(row({ lastAssistantText: longSummary, updatedAt }), false, 90));
+    const line = strip(renderRosterRow(row({ lastAssistantText: longSummary, updatedAt }), false, false, 90));
     expect(line).toHaveLength(90);
     expect(line.endsWith('5m ago')).toBe(true);
     // The summary itself got cut with an ellipsis well before the line end.
@@ -145,21 +165,21 @@ describe('renderRosterRow — summary truncates, meta never does', () => {
   it('regression: at a narrow width the trailing time is never chopped mid-string (was "9m ago …")', () => {
     const longSummary = 'hi nihao, 有什么可以帮你的吗? 比如修 bug、加功能、或者看看代码，直接说就行';
     const updatedAt = Date.now() - (9 * 60 * 1000 + 5_000); // comfortably inside the 9m bucket
-    const line = strip(renderRosterRow(row({ lastAssistantText: longSummary, updatedAt }), false, 60));
+    const line = strip(renderRosterRow(row({ lastAssistantText: longSummary, updatedAt }), false, false, 60));
     expect(line.endsWith('9m ago')).toBe(true);
     expect(line).not.toContain('ago …');
   });
 
   it('a short summary still leaves the time flush against the last column', () => {
     const updatedAt = Date.now() - 60 * 1000;
-    const line = strip(renderRosterRow(row({ lastAssistantText: 'ok', updatedAt }), false, 80));
+    const line = strip(renderRosterRow(row({ lastAssistantText: 'ok', updatedAt }), false, false, 80));
     expect(line).toHaveLength(80);
     expect(line.endsWith('1m ago')).toBe(true);
   });
 
   it('an empty summary still right-flushes the time to the last column', () => {
     const updatedAt = Date.now() - 2 * 60 * 60 * 1000;
-    const line = strip(renderRosterRow(row({ updatedAt }), false, 70));
+    const line = strip(renderRosterRow(row({ updatedAt }), false, false, 70));
     expect(line).toHaveLength(70);
     expect(line.endsWith('2h ago')).toBe(true);
   });
@@ -176,6 +196,7 @@ describe('renderRosterRow — untrusted badge in the meta zone', () => {
           updatedAt,
         }),
         false,
+        false,
         80,
       ),
     );
@@ -184,7 +205,7 @@ describe('renderRosterRow — untrusted badge in the meta zone', () => {
   });
 
   it('omits the badge entirely when the row is trusted', () => {
-    const line = strip(renderRosterRow(row({ trusted: true }), false, 80));
+    const line = strip(renderRosterRow(row({ trusted: true }), false, false, 80));
     expect(line).not.toContain('untrusted');
   });
 
@@ -193,14 +214,14 @@ describe('renderRosterRow — untrusted badge in the meta zone', () => {
     // not enough for "untrusted · 4m ago" (19), but enough for "4m ago" (7)
     // alone. The badge disappears; the time is never partially shown.
     const updatedAt = Date.now() - 4 * 60 * 1000;
-    const line = strip(renderRosterRow(row({ trusted: false, updatedAt }), false, 60));
+    const line = strip(renderRosterRow(row({ trusted: false, updatedAt }), false, false, 60));
     expect(line).not.toContain('untrusted');
     expect(line.endsWith('4m ago')).toBe(true);
   });
 
   it('below the width where even the time alone fits, it disappears whole — never a partial cut', () => {
     const updatedAt = Date.now() - 4 * 60 * 1000;
-    const line = strip(renderRosterRow(row({ trusted: false, updatedAt }), false, 48));
+    const line = strip(renderRosterRow(row({ trusted: false, updatedAt }), false, false, 48));
     expect(line).toHaveLength(48);
     expect(line).not.toContain('untrusted');
     expect(line).not.toContain('4m');
@@ -213,34 +234,73 @@ describe('renderRosterRow — status glyph (busy / unseen / seen)', () => {
   }
 
   it('a busy row shows a spinner frame, never the retired braille dial', () => {
-    const line = strip(renderRosterRow(row({ busy: true }), false, 80));
+    const line = strip(renderRosterRow(row({ busy: true }), false, false, 80));
     expect(spinnerFrames()).toContain(glyphAt(line));
     expect(line).not.toMatch(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/);
   });
 
   it('an idle unseen row shows the teardrop asterisk', () => {
-    const line = strip(renderRosterRow(row({ busy: false, unseen: true }), false, 80));
+    const line = strip(renderRosterRow(row({ busy: false, unseen: true }), false, false, 80));
     expect(glyphAt(line)).toBe('✻');
   });
 
   it('an idle seen row shows the bullet operator', () => {
-    const line = strip(renderRosterRow(row({ busy: false, unseen: false }), false, 80));
+    const line = strip(renderRosterRow(row({ busy: false, unseen: false }), false, false, 80));
     expect(glyphAt(line)).toBe('∙');
   });
 
   it('busy wins over unseen', () => {
-    const line = strip(renderRosterRow(row({ busy: true, unseen: true }), false, 80));
+    const line = strip(renderRosterRow(row({ busy: true, unseen: true }), false, false, 80));
     expect(spinnerFrames()).toContain(glyphAt(line));
   });
 
   it('never renders the retired ✗ (failed) or ! (pending-interaction) glyphs', () => {
-    const failed = strip(renderRosterRow(row({ lastTurnReason: 'failed', unseen: false }), false, 80));
+    const failed = strip(renderRosterRow(row({ lastTurnReason: 'failed', unseen: false }), false, false, 80));
     expect(failed).not.toContain('✗');
     expect(glyphAt(failed)).toBe('∙');
 
-    const pending = strip(renderRosterRow(row({ pendingInteraction: 'approval', unseen: true }), false, 80));
+    const pending = strip(renderRosterRow(row({ pendingInteraction: 'approval', unseen: true }), false, false, 80));
     expect(pending).not.toContain('!');
     expect(glyphAt(pending)).toBe('✻');
+  });
+});
+
+describe('renderRosterRow — selected vs isOrigin (independent styling flags)', () => {
+  // R4 parity: Claude Code's roster bolds the title on `isOrigin` ("the
+  // session you came from"), never on cursor `selected` — the two used to
+  // be conflated onto `selected` here. Selection's own full-row background
+  // fill is a separate mechanism (not yet landed — no equivalent theme
+  // token exists in `ColorPalette`; see rows.ts's doc comment), so these
+  // only cover the bold half of the split.
+
+  it('selected alone (isOrigin false) renders the name in the plain "text" token, not bold', () => {
+    const line = renderRosterRow(row({ title: 'abc' }), true, false, 120);
+    expect(isBold(line)).toBe(false);
+    expect(line).toContain(chalk.hex(darkColors.text)('abc'));
+  });
+
+  it('isOrigin alone (not selected) bolds the name in "textStrong"', () => {
+    const line = renderRosterRow(row({ title: 'abc' }), false, true, 120);
+    expect(isBold(line)).toBe(true);
+    expect(line).toContain(chalk.hex(darkColors.textStrong).bold('abc'));
+  });
+
+  it('neither selected nor isOrigin: plain, unbolded name', () => {
+    const line = renderRosterRow(row({ title: 'abc' }), false, false, 120);
+    expect(isBold(line)).toBe(false);
+  });
+
+  it('both selected and isOrigin on the same row: bold still applies (they compose)', () => {
+    const line = renderRosterRow(row({ title: 'abc' }), true, true, 120);
+    expect(isBold(line)).toBe(true);
+    expect(line).toContain(chalk.hex(darkColors.textStrong).bold('abc'));
+  });
+
+  it('the ❯ pointer still keys off `selected`, independently of `isOrigin`', () => {
+    const selectedNotOrigin = strip(renderRosterRow(row({ title: 'abc' }), true, false, 120));
+    const originNotSelected = strip(renderRosterRow(row({ title: 'abc' }), false, true, 120));
+    expect(selectedNotOrigin.trimStart().startsWith('❯')).toBe(true);
+    expect(originNotSelected.trimStart().startsWith('❯')).toBe(false);
   });
 });
 

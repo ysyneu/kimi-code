@@ -129,14 +129,26 @@ export function rosterRowName(row: AgentsRosterRow): string {
  * verbatim, so rendering `lastPrompt` next to the title reads as the same
  * message twice. The title wins; the prompt is only the untitled fallback.
  * No cwd — the row's elements are name, assistant summary, and meta.
+ *
+ * `selected` (cursor position) and `isOrigin` (the session this roster-attach
+ * lifecycle was last backed out of via ←) are independent flags that can
+ * both be true on the same row at once: `selected` only drives the `❯`
+ * pointer here (its full-row background fill lands separately once a
+ * theme token exists for it — see the r4 parity spec); `isOrigin` is what
+ * bolds the name. Selection alone no longer bolds anything.
  */
-export function renderRosterRow(row: AgentsRosterRow, selected: boolean, width: number): string {
+export function renderRosterRow(
+  row: AgentsRosterRow,
+  selected: boolean,
+  isOrigin: boolean,
+  width: number,
+): string {
   const symbol = statusSymbol(row);
   const name = rosterRowName(row);
   const prefix = pointer(selected) + currentTheme.fg(symbol.color, symbol.glyph) + ' ';
   const prefixWidth = visibleWidth(prefix);
 
-  const styledName = selected ? currentTheme.boldFg('textStrong', name) : currentTheme.fg('text', name);
+  const styledName = isOrigin ? currentTheme.boldFg('textStrong', name) : currentTheme.fg('text', name);
   const nameSlot = truncateToWidth(styledName, NAME_WIDTH, ELLIPSIS, true);
 
   const metaBudget = Math.max(0, width - prefixWidth - NAME_WIDTH);
