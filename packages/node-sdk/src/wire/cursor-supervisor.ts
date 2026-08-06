@@ -290,9 +290,13 @@ export class CursorSupervisor {
       return;
     }
     const payload: ResyncRequiredPayload = parsed.data;
-    // Adopt the announced cursor so the next reconnect doesn't re-trigger the
-    // same resync before the caller's reload lands.
-    this.cursors.set(payload.session_id, { seq: payload.current_seq, epoch: payload.epoch });
+    // Do NOT adopt the announced cursor here — only the caller's onResync
+    // callback knows whether the resync (fetch a fresh snapshot, resubscribe,
+    // replay) actually succeeded. Committing it eagerly would let a
+    // reconnect's resubscribe claim the session is caught up even when the
+    // real resync never completed, leaving it silently unsubscribed with no
+    // visible error. A successful resync updates the cursor itself via its
+    // own `subscribe()` call.
     this.options.onResync(payload.session_id);
   }
 
