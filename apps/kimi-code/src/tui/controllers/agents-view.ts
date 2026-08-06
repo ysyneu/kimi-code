@@ -252,6 +252,12 @@ export class AgentsViewController {
       this.unfocusDispatch();
       this.flash(message);
     };
+    // `exit` / `/exit` submitted from the dispatch composer — dispatch mode
+    // only, `AgentsViewDispatch` never fires this while `replying`. Same
+    // close path as onQuit (Esc-Esc / `?` grid's `esc to quit`).
+    dispatch.onExit = () => {
+      this.close();
+    };
     // Esc inside the focused editor returns focus to the list (the editor's
     // own autocomplete-cancel wins over this when a dropdown is open).
     // Reply mode is exited the same way as a submit: back to the "new

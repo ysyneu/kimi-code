@@ -1010,6 +1010,51 @@ describe('AgentsViewDispatch — editor wiring', () => {
     expect(onError).toHaveBeenCalledWith('"/yolo" is only available inside a session');
   });
 
+  it('exit or /exit in dispatch mode fires onExit instead of onSubmit/onError', () => {
+    const dispatch = makeDispatch();
+    const onSubmit = vi.fn();
+    const onError = vi.fn();
+    const onExit = vi.fn();
+    dispatch.onSubmit = onSubmit;
+    dispatch.onError = onError;
+    dispatch.onExit = onExit;
+
+    dispatch.editor.onSubmit?.('exit');
+    expect(onExit).toHaveBeenCalledTimes(1);
+    dispatch.editor.onSubmit?.('/exit');
+    expect(onExit).toHaveBeenCalledTimes(2);
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it('exit is an exact match — surrounding text still dispatches or errors normally', () => {
+    const dispatch = makeDispatch();
+    const onSubmit = vi.fn();
+    const onExit = vi.fn();
+    dispatch.onSubmit = onSubmit;
+    dispatch.onExit = onExit;
+
+    dispatch.editor.onSubmit?.('please exit the sandbox setup task');
+    expect(onExit).not.toHaveBeenCalled();
+    expect(onSubmit).toHaveBeenCalledWith({ text: 'please exit the sandbox setup task' });
+  });
+
+  it('exit/Exit while replying is sent as literal reply text, not intercepted', () => {
+    const dispatch = makeDispatch();
+    dispatch.replying = true;
+    const onSubmit = vi.fn();
+    const onExit = vi.fn();
+    dispatch.onSubmit = onSubmit;
+    dispatch.onExit = onExit;
+
+    dispatch.editor.onSubmit?.('exit');
+    expect(onExit).not.toHaveBeenCalled();
+    expect(onSubmit).toHaveBeenCalledWith({ text: 'exit' });
+    dispatch.editor.onSubmit?.('/exit');
+    expect(onExit).not.toHaveBeenCalled();
+    expect(onSubmit).toHaveBeenCalledWith({ text: '/exit' });
+  });
+
   it('installAutocomplete suggests only the installed commands', async () => {
     const dispatch = makeDispatch();
     dispatch.installAutocomplete(dispatchSlashCommands());
@@ -1451,6 +1496,52 @@ describe('AgentsViewController — dispatch editor mount', () => {
     expect(b.fake.createSession).toHaveBeenCalledWith({ workDir: '/home/user/project' });
     expect(b.fake.createdSession.prompt).toHaveBeenCalledWith('do stuff');
     expect(b.view().dispatchFocused).toBe(false);
+  });
+
+  it('typing exit and Enter in the dispatch composer closes the view — no session created', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    for (const ch of 'exit') b.component().handleInput(ch);
+    b.component().handleInput(ENTER);
+    await flush();
+    expect(b.controller.isOpen).toBe(false);
+    expect(b.fake.createSession).not.toHaveBeenCalled();
+  });
+
+  it('typing /exit and Enter in the dispatch composer also closes the view', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    for (const ch of '/exit') b.component().handleInput(ch);
+    b.component().handleInput(ENTER);
+    await flush();
+    expect(b.controller.isOpen).toBe(false);
+    expect(b.fake.createSession).not.toHaveBeenCalled();
+  });
+
+  it('exit is an exact match — a task merely mentioning "exit" still dispatches instead of closing', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    for (const ch of 'exit the retry loop cleanly') b.component().handleInput(ch);
+    b.component().handleInput(ENTER);
+    await flush();
+    expect(b.controller.isOpen).toBe(true);
+    expect(b.fake.createSession).toHaveBeenCalledWith({ workDir: '/home/user/project' });
+    expect(b.fake.createdSession.prompt).toHaveBeenCalledWith('exit the retry loop cleanly');
+  });
+
+  it('typing exit while replying sends it as a literal reply — the view stays open', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(SPACE);
+    for (const ch of 'exit') b.component().handleInput(ch);
+    b.component().handleInput(ENTER);
+    await flush();
+    expect(b.controller.isOpen).toBe(true);
+    expect(b.fake.wirePrompt).toHaveBeenCalledWith({
+      sessionId: 's1',
+      input: [{ type: 'text', text: 'exit' }],
+    });
   });
 });
 

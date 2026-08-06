@@ -70,6 +70,12 @@ export function parseDispatchInput(raw: string): DispatchParseResult {
   return { text, model, profile };
 }
 
+/** Exact strings that close the view from the dispatch composer — dispatch
+ *  mode only (see `AgentsViewDispatch.handleEditorSubmit`); reply mode has
+ *  no command surface at all, so typing either of these as a reply sends it
+ *  as literal text through `parseReplyInput`, same as anything else. */
+const EXIT_COMMANDS = new Set(['exit', '/exit']);
+
 /**
  * Parses raw REPLY input (an existing session, not a new one): unlike
  * `parseDispatchInput`, a leading `/` is never interpreted — there is no
@@ -98,6 +104,10 @@ export class AgentsViewDispatch {
   readonly editor: CustomEditor;
   onSubmit: ((parsed: DispatchSubmission) => void) | undefined;
   onError: ((message: string) => void) | undefined;
+  /** Fires instead of `onSubmit`/`onError` when the dispatch-mode composer
+   *  is submitted with exactly `exit` or `/exit` — closes the view. Never
+   *  checked in reply mode; see `EXIT_COMMANDS`. */
+  onExit: (() => void) | undefined;
   /**
    * Set by the controller for the duration of reply mode (see
    * `AgentsViewController.onReplyRequest` / `exitReplyMode`). Switches
@@ -148,6 +158,10 @@ export class AgentsViewDispatch {
   }
 
   private handleEditorSubmit(raw: string): void {
+    if (!this.replying && EXIT_COMMANDS.has(raw.trim())) {
+      this.onExit?.();
+      return;
+    }
     const parsed = this.replying ? parseReplyInput(raw) : parseDispatchInput(raw);
     if ('error' in parsed) {
       this.onError?.(parsed.error);
