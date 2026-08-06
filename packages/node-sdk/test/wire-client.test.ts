@@ -1286,16 +1286,15 @@ describe('createKimiHarnessWire', () => {
   /**
    * Regression for the agents-view "reply is invisible on re-attach" bug:
    * unlike the create-then-attach case above (whose resumeState starts
-   * undefined), a session that HAS already been resumed once keeps its
-   * cached snapshot forever on a plain cache hit — nothing refreshes it as
-   * new events stream in. If a message reaches the session through a path
-   * that never touches this cached `Session` object (agents-view's reply
-   * mode prompts over the bare wire rpc, exactly like the call below), a
-   * later resumeSession with no `forceResume` hands back the SAME, now-stale
-   * Session untouched. `forceResume: true` (what agents-view attach always
-   * sets) is the only thing that refreshes it.
+   * undefined), a session that has already been resumed once used to keep
+   * its cached snapshot forever on a plain cache hit — nothing refreshes it
+   * as new events stream in. If a message reaches the session through a
+   * path that never touches this cached `Session` object (agents-view's
+   * reply mode prompts over the bare wire rpc, exactly like the call
+   * below), a later resumeSession must still pick it up rather than hand
+   * back the same, now-stale Session untouched.
    */
-  it('forceResume refreshes an already-resumed session whose cached snapshot went stale', async () => {
+  it('resumeSession always refreshes an already-resumed session, even on a cache hit', async () => {
     const harness = await createKimiHarnessWire({
       serverUrl: base,
       token,
@@ -1320,7 +1319,8 @@ describe('createKimiHarnessWire', () => {
       ).toContain('first message');
 
       // A second message reaches the session without ever touching this
-      // cached Session object.
+      // cached Session object — e.g. agents-view's roster reply, which
+      // prompts over the bare wire rpc while the row sits unattached.
       const rpc = harness.wireRpc();
       await rpc?.prompt({
         sessionId: session.id,
@@ -1329,20 +1329,15 @@ describe('createKimiHarnessWire', () => {
       await rpc?.cancel({ sessionId: session.id });
       await waitForAsync(async () => !(await http.getSession(session.id)).busy);
 
-      // No forceResume: the cache hit returns the SAME Session untouched —
-      // the second message is invisible in its snapshot.
-      const staleReattach = await harness.resumeSession({ id: session.id });
-      expect(staleReattach).toBe(session);
+      // Re-resuming hits the SAME cached Session (`active !== undefined`,
+      // already carrying resume state from the resume above) — this is the
+      // exact shape that used to be treated as "not stale" and handed back
+      // untouched. It must instead refresh the snapshot in place and
+      // surface the message that arrived while this object sat cached.
+      const reattached = await harness.resumeSession({ id: session.id });
+      expect(reattached).toBe(session);
       expect(
-        replayUserTexts(staleReattach.getResumeState()?.agents['main'] ?? { replay: [] }),
-      ).not.toContain('second message via bare rpc');
-
-      // forceResume: true refreshes the SAME object's snapshot in place —
-      // exactly what agents-view attach does.
-      const freshReattach = await harness.resumeSession({ id: session.id, forceResume: true });
-      expect(freshReattach).toBe(session);
-      expect(
-        replayUserTexts(freshReattach.getResumeState()?.agents['main'] ?? { replay: [] }),
+        replayUserTexts(reattached.getResumeState()?.agents['main'] ?? { replay: [] }),
       ).toContain('second message via bare rpc');
 
       await harness.deleteSession(session.id);
