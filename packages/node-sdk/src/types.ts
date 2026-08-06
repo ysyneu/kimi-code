@@ -149,6 +149,17 @@ export interface ResumeSessionInput {
    */
   readonly replayTurnLimit?: number;
   readonly sessionStartedProperties?: TelemetryProperties;
+  /**
+   * Force a real resume RPC even when this session already has a cached
+   * `Session` with resume state — the normal cache hit hands that object
+   * back untouched, which is only safe for a caller that has stayed
+   * continuously attached the whole time. A caller re-attaching to a
+   * session it was previously detached from (e.g. the agents-view roster,
+   * where a background session can pick up new messages while unattached)
+   * cannot assume the cached resume state — and the transcript replay it
+   * was built from — is still current.
+   */
+  readonly forceResume?: boolean;
 }
 
 export interface ReloadSessionInput extends ResumeSessionInput {

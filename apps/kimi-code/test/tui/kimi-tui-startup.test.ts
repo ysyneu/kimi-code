@@ -1980,9 +1980,13 @@ describe('KimiTUI agents-view attach', () => {
     await vi.waitFor(() => {
       expect(driver.state.appState.sessionId).toBe('ses-attached');
     });
+    // forceResume: true — an agents-view attach always forces a real
+    // resume rather than risking a stale cached snapshot (see
+    // KimiHarness.resumeSession's needsResume gate).
     expect(harness.resumeSession).toHaveBeenCalledWith({
       id: 'ses-attached',
       replayTurnLimit: REPLAY_TURN_LIMIT,
+      forceResume: true,
     });
     expect(driver.session?.id).toBe('ses-attached');
     expect(showStatus).toHaveBeenCalledWith('Attached to session (ses-attached).');

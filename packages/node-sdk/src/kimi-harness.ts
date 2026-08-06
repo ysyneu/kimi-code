@@ -153,17 +153,23 @@ export class KimiHarness {
   async resumeSession(input: ResumeSessionInput): Promise<Session> {
     const id = normalizeSessionId(input.id);
     const active = this.activeSessions.get(id);
-    const { kaos, persistenceKaos, sessionStartedProperties, ...resumeInput } = input;
+    const { kaos, persistenceKaos, sessionStartedProperties, forceResume, ...resumeInput } = input;
     if (active !== undefined) {
       // A cache hit only skips the real resume when `active` already
-      // carries resume state from one. A `Session` that has only ever
-      // been through `createSession()` (e.g. agents-view dispatch,
-      // attached moments later while its id is still hot in this map) has
-      // `resumeState` undefined — handing it back untouched would silently
-      // return a session with no history and no live subscription. Do the
-      // real resume and merge it into the SAME object so identity-sensitive
-      // callers (kaos rebind, profile checks) keep getting `active` back.
-      const needsResume = active.getResumeState() === undefined;
+      // carries resume state, and the caller hasn't said that state might
+      // be stale. `resumeState` is a point-in-time snapshot — nothing
+      // refreshes it as new events stream in — so a `Session` that has
+      // only ever been through `createSession()` (e.g. agents-view
+      // dispatch, attached moments later while its id is still hot in this
+      // map) has `resumeState` undefined, and handing it back untouched
+      // would silently return a session with no history and no live
+      // subscription. The same staleness applies once a session HAS been
+      // resumed before but the caller is re-attaching after being
+      // detached (`forceResume`): the cached snapshot predates whatever
+      // happened while unattached. Either way, do the real resume and
+      // merge it into the SAME object so identity-sensitive callers
+      // (kaos rebind, profile checks) keep getting `active` back.
+      const needsResume = active.getResumeState() === undefined || forceResume === true;
       if (kaos !== undefined || persistenceKaos !== undefined) {
         const summary = await this.rpc.resumeSessionWithKaos({ ...resumeInput, id }, kaos ?? persistenceKaos as Kaos, persistenceKaos);
         if (needsResume) active.applyResumedState(summary);

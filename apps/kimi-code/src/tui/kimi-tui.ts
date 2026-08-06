@@ -1973,6 +1973,14 @@ export class KimiTUI {
    * Enter on the CURRENT session's row (attach → ← → Enter on the same row)
    * is a re-enter, not an attach: the chat is still live underneath, so the
    * view simply unmounts — no resume call, no guard error.
+   *
+   * forceResume: true — every OTHER row is, by construction, a session this
+   * process was not continuously attached to (it was dispatched, replied to,
+   * or otherwise progressed from the roster without ever mounting its chat
+   * view). Its cached resume state, if any, predates whatever happened while
+   * detached — a plain resumeSession cache hit would hand back that stale
+   * snapshot untouched and render history missing whatever just happened
+   * (e.g. a roster reply and its response).
    */
   private async attachAgentsViewSession(targetSessionId: string): Promise<void> {
     if (targetSessionId === this.state.appState.sessionId) {
@@ -1984,6 +1992,7 @@ export class KimiTUI {
       session = await this.harness.resumeSession({
         id: targetSessionId,
         replayTurnLimit: REPLAY_TURN_LIMIT,
+        forceResume: true,
       });
     } catch (error) {
       const msg = formatErrorMessage(error);
