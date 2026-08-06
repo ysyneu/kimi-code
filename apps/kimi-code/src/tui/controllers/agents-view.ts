@@ -28,6 +28,8 @@ export interface AgentsViewHost {
   agentsViewServerLabel(): string;
   /** Dispatch target: every session created from the view opens in this cwd. */
   agentsViewWorkDir(): string;
+  /** Header label for the model new sessions dispatch with by default. */
+  agentsViewModelLabel(): string;
   /**
    * Attach-mode footer badge feed: live roster counts while
    * detached; `undefined` clears the badge (return / close).
@@ -524,6 +526,7 @@ export class AgentsViewController {
       counts: view.roster.counts(),
       selectedId: view.selectedId,
       serverLabel: this.host.agentsViewServerLabel(),
+      modelLabel: this.host.agentsViewModelLabel(),
       confirmDeleteId: view.confirmDeleteId,
       renameDraft: view.renameDraft,
       flashMessage: view.flashMessage,

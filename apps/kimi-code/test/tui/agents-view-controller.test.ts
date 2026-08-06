@@ -273,6 +273,7 @@ async function boot(
     },
     agentsViewServerLabel: () => 'test-server',
     agentsViewWorkDir: () => '/home/user/project',
+    agentsViewModelLabel: () => 'test-model',
     setAttachBadge,
     getCurrentSessionId: () => opts.currentSessionId ?? '',
     onOpenSession: opts.onOpenSession,
@@ -362,7 +363,7 @@ describe('AgentsViewController — mount / unmount', () => {
     const out = b.render();
     expect(out).toContain('s1 title');
     expect(out).toContain('s2 title');
-    expect(out).toContain('test-server');
+    expect(out).toContain('test-model');
   });
 
   it('show lists only sessions in the view registry', async () => {
@@ -1086,10 +1087,10 @@ describe('AgentsViewController — dispatch editor mount', () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
     expect(b.view().dispatchFocused).toBe(false);
-    // The mounted CustomEditor renders its bordered box with the `>` prompt.
+    // The mounted CustomEditor renders its rule-only frame with the `❯` prompt.
     const out = b.render();
     expect(out).toContain('─'.repeat(20));
-    expect(out).toContain('>');
+    expect(out).toContain('❯');
   });
 
   it('typing a printable char focuses the dispatch editor and feeds it the text', async () => {

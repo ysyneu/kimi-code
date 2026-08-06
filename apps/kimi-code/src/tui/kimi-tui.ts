@@ -2,7 +2,7 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { DeviceAuthorization } from '@moonshot-ai/kimi-code-oauth';
-import { log } from '@moonshot-ai/kimi-code-sdk';
+import { effectiveModelAlias, log } from '@moonshot-ai/kimi-code-sdk';
 import type {
   ApprovalRequest,
   ApprovalResponse,
@@ -1617,6 +1617,18 @@ export class KimiTUI {
   /** Dispatch cwd for sessions created from the agents view. */
   agentsViewWorkDir(): string {
     return this.state.appState.workDir;
+  }
+
+  /**
+   * Display label for the model new sessions dispatch with, when no
+   * `/model` override is staged. Same alias-resolution the welcome panel and
+   * footer use for the active session's model.
+   */
+  agentsViewModelLabel(): string {
+    const { model, availableModels } = this.state.appState;
+    const alias = availableModels[model];
+    const effective = alias === undefined ? undefined : effectiveModelAlias(alias);
+    return effective?.displayName ?? effective?.model ?? model;
   }
 
   /**

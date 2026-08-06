@@ -64,14 +64,20 @@ function group(id: AgentsGroupId, rows: readonly AgentsRosterRow[]): AgentsGroup
 }
 
 /** A real dispatch editor over a minimal fake TUI (same stub shape as the
- *  controller test's FakeUI). */
+ *  controller test's FakeUI), built with the same options the real
+ *  `AgentsViewDispatch` uses — the rule-only frame, `❯` prompt and
+ *  placeholder are only real if the fixture actually opts into them. */
 function makeDispatchEditor(): CustomEditor {
   const tui = {
     requestRender: () => {},
     render: () => [],
     terminal: { rows: 40, columns: 120 },
   } as unknown as TUI;
-  return new CustomEditor(tui);
+  return new CustomEditor(tui, {
+    frameVariant: 'rules',
+    promptSymbol: '❯',
+    placeholder: 'describe a task for a new session',
+  });
 }
 
 function makeProps(overrides: Partial<AgentsViewProps> = {}): AgentsViewProps {
@@ -80,6 +86,7 @@ function makeProps(overrides: Partial<AgentsViewProps> = {}): AgentsViewProps {
     counts: { awaiting: 0, working: 0, completed: 0 },
     selectedId: undefined,
     serverLabel: 'embedded',
+    modelLabel: 'kimi-k2',
     confirmDeleteId: undefined,
     renameDraft: undefined,
     flashMessage: undefined,
@@ -124,15 +131,25 @@ describe('AgentsViewApp — full-screen rendering', () => {
     expect(out).toContain('too small');
   });
 
-  it('shows the header with server label and the summary counts', () => {
-    const out = render(
-      makeApp({ counts: { awaiting: 1, working: 2, completed: 5 }, serverLabel: '127.0.0.1:58627' }),
-    );
-    expect(out).toContain('KIMI AGENTS');
-    expect(out).toContain('127.0.0.1:58627');
-    expect(out).toContain('1 awaiting input');
-    expect(out).toContain('2 working');
-    expect(out).toContain('5 completed');
+  it('shows the 3-line header (brand + version / model · cwd / status counts), then a trailing blank line', () => {
+    const lines = makeApp({
+      counts: { awaiting: 1, working: 2, completed: 5 },
+      modelLabel: 'kimi-k2',
+    })
+      .render(120)
+      .map(strip);
+    expect(lines[0]).toContain('Kimi Code v');
+    expect(lines[1]).toContain('kimi-k2');
+    expect(lines[1]).toContain(process.cwd());
+    expect(lines[2]).toContain('1 awaiting input');
+    expect(lines[2]).toContain('2 working');
+    expect(lines[2]).toContain('5 completed');
+    expect(lines[3]?.trim()).toBe('');
+  });
+
+  it('drops the server label from the header — Claude Code has no server-label slot there', () => {
+    const out = render(makeApp({ serverLabel: '127.0.0.1:58627' }));
+    expect(out).not.toContain('127.0.0.1:58627');
   });
 
   it('renders group headers and rows in group order', () => {
@@ -158,7 +175,7 @@ describe('AgentsViewApp — full-screen rendering', () => {
     expect(out.indexOf('done-1 title')).toBeGreaterThan(completedHeader);
   });
 
-  it('inserts a blank spacer line between groups, never before the first one', () => {
+  it('inserts a blank spacer line between groups; the blank before the first one is the header\'s own trailing line, not a deriveItems spacer', () => {
     const app = makeApp({
       groups: [
         group('awaiting', [row('await-1', { pendingInteraction: 'approval' })]),
@@ -168,11 +185,13 @@ describe('AgentsViewApp — full-screen rendering', () => {
     const lines = app.render(120).map(strip);
     const awaitingHeaderIdx = lines.findIndex((l) => l.includes('Needs input'));
     const workingHeaderIdx = lines.findIndex((l) => l.includes('Working'));
-    // The line right above the second group's header is a blank spacer.
+    // The line right above the second group's header is a deriveItems spacer.
     expect(lines[workingHeaderIdx - 1]?.trim()).toBe('');
-    // The line right above the FIRST group's header is the app header row
-    // (server label / counts), never a spacer.
-    expect(lines[awaitingHeaderIdx - 1]).toContain('KIMI AGENTS');
+    // The first group sits right after the fixed 4-line header block (3 info
+    // lines + its own trailing blank at index 3) — never a leading spacer
+    // item, which would break moveSelection's step-over invariant.
+    expect(awaitingHeaderIdx).toBe(4);
+    expect(lines[3]?.trim()).toBe('');
   });
 
   it('renders the untrusted badge on rows, without the cwd', () => {
@@ -207,11 +226,28 @@ describe('AgentsViewApp — full-screen rendering', () => {
     expect(out).toContain('No sessions');
   });
 
-  it('renders the dispatch editor box above the footer', () => {
+  it('renders the dispatch editor as a rule-only frame with its `❯` prompt', () => {
     const out = render(makeApp());
-    // The mounted CustomEditor renders a bordered box with its `>` prompt.
     expect(out).toContain('─'.repeat(20));
-    expect(out).toContain('>');
+    expect(out).toContain('❯');
+  });
+
+  it('composer: an empty buffer shows the dim placeholder, no side borders on the rule frame', () => {
+    const lines = makeApp().render(120).map(strip);
+    const ruleLines = lines.filter((l) => l.length > 0 && l[0] === '─' && l.at(-1) === '─');
+    expect(ruleLines.length).toBe(2); // top + bottom rule, full-width dashes
+    const promptLine = lines.find((l) => l.includes('❯'));
+    expect(promptLine).toContain('describe a task for a new session');
+    // No side bars or corners anywhere — the rule-only variant never draws them.
+    expect(lines.some((l) => /[╭╮╰╯│]/.test(l))).toBe(false);
+  });
+
+  it('composer: a non-empty buffer hides the placeholder and shows the typed text', () => {
+    const editor = makeDispatchEditor();
+    editor.setText('fix the flaky test');
+    const out = render(makeApp({ dispatchEditor: editor }));
+    expect(out).toContain('fix the flaky test');
+    expect(out).not.toContain('describe a task for a new session');
   });
 
   it('collapses completed rows behind a "… N more" row', () => {
@@ -327,11 +363,12 @@ describe('AgentsViewApp — footer hints follow the selection target', () => {
   ];
   const counts = { awaiting: 0, working: 1, completed: 11 };
 
-  it('session row footer mentions open/rename/pin', () => {
+  it('session row footer mentions open/delete — rename/pin moved into the ? grid', () => {
     const out = render(makeApp({ groups, counts, selectedId: 'work-1' }));
-    expect(out).toContain('open');
-    expect(out).toContain('rename');
-    expect(out).toContain('pin');
+    expect(out).toContain('enter to open');
+    expect(out).toContain('ctrl+x to delete');
+    expect(out).not.toContain('rename');
+    expect(out).not.toContain('pin');
   });
 
   it('group header footer mentions collapse', () => {
@@ -570,24 +607,49 @@ describe('AgentsViewApp — pin / help / quit', () => {
     expect(onPinToggle).toHaveBeenCalledWith('s1');
   });
 
-  it('? toggles the shortcuts page and fires onHelpToggle', () => {
+  it('? replaces the footer with the 2-row grid — the roster list stays visible underneath', () => {
     const onHelpToggle = vi.fn();
-    const app = makeApp({ onHelpToggle });
+    const groups = [group('completed', [row('s1')])];
+    const app = makeApp({ groups, onHelpToggle });
+    expect(render(app)).toContain('s1 title');
+
     app.handleInput('?');
     expect(onHelpToggle).toHaveBeenCalledTimes(1);
-    expect(render(app)).toContain('Shortcuts');
+    const opened = render(app);
+    expect(opened).toContain('s1 title'); // the list never gets swapped out
+    expect(opened).toContain('? to close');
+    expect(opened).toContain('ctrl+r to rename');
+    expect(opened).toContain('ctrl+j for newline');
+
     app.handleInput('?');
     expect(onHelpToggle).toHaveBeenCalledTimes(2);
-    expect(render(app)).not.toContain('Shortcuts');
+    expect(render(app)).not.toContain('? to close');
   });
 
-  it('Esc closes the help page without quitting', () => {
+  it("the ? grid shrinks the list's visible window by exactly one row", () => {
+    const completedRows = Array.from({ length: 10 }, (_, i) => row(`done-${String(i)}`));
+    const app = new AgentsViewApp(
+      makeProps({
+        groups: [group('completed', completedRows)],
+        counts: { awaiting: 0, working: 0, completed: 10 },
+      }),
+      fakeTerminal(15, 120),
+    );
+    const before = strip(app.render(120).join('\n'));
+    expect(before).toContain('done-5 title');
+    app.handleInput('?');
+    const after = strip(app.render(120).join('\n'));
+    expect(after).not.toContain('done-5 title');
+    expect(after).toContain('done-4 title');
+  });
+
+  it('Esc closes the ? grid without quitting', () => {
     const onQuit = vi.fn();
     const app = makeApp({ onQuit });
     app.handleInput('?');
     app.handleInput('\u001B');
     expect(onQuit).not.toHaveBeenCalled();
-    expect(render(app)).not.toContain('Shortcuts');
+    expect(render(app)).not.toContain('? to close');
   });
 
   it('Esc quits from the plain list', () => {

@@ -81,7 +81,15 @@ export class AgentsViewDispatch {
     // newline — right for the main editor's chat box, wrong here: the
     // dispatch box is a single-task line and scripted input must still
     // submit.
-    this.editor = new CustomEditor(ui, { disablePasteBurst: true });
+    // frameVariant/promptSymbol/placeholder: the agents-view composer opts
+    // into the rule-only chrome (no side borders) — the chat editor keeps
+    // its default rounded box.
+    this.editor = new CustomEditor(ui, {
+      disablePasteBurst: true,
+      frameVariant: 'rules',
+      promptSymbol: '❯',
+      placeholder: 'describe a task for a new session',
+    });
     this.editor.onSubmit = (raw) => {
       this.handleEditorSubmit(raw);
     };

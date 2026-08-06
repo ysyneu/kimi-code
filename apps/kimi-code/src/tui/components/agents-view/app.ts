@@ -5,8 +5,10 @@
  * Working / Pinned / Completed), each group separated by a blank spacer
  * line. Mirrors the TasksBrowserApp mount/render contract: mounted by a
  * controller via container swap, `render(width)` returns exactly
- * `terminal.rows` lines (header 1 + body rows-2 + footer 1), data flows in
- * via `setProps`, user actions fire the `on*` callbacks.
+ * `terminal.rows` lines (header 4 [brand mark + version / model · cwd /
+ * status counts / trailing blank] + body + footer 1, or 2 while the `?` grid
+ * is open), data flows in via `setProps`, user actions fire the `on*`
+ * callbacks.
  *
  * Zero SDK access: the controller owns the roster, delete / rename / pin
  * side effects and re-pushes props after every action.
@@ -41,6 +43,8 @@ import {
 
 import type { AgentsGroup, AgentsGroupId, AgentsRosterRow } from '@/tui/agents/roster';
 import type { CustomEditor } from '@/tui/components/editor/custom-editor';
+import { getVersion } from '#/cli/version';
+import { PRODUCT_NAME } from '#/constant/app';
 import { currentTheme } from '#/tui/theme';
 import { printableChar, isPrintableChar } from '@/tui/utils/printable-key';
 
@@ -51,8 +55,12 @@ export interface AgentsViewProps {
   readonly counts: { awaiting: number; working: number; completed: number };
   /** Selected item: a row id, `group:<id>`, or `more:completed`. */
   readonly selectedId: string | undefined;
-  /** "embedded" or host:port of the connected kap-server. */
+  /** "embedded" or host:port of the connected kap-server. Not currently shown
+   *  by the header chrome (Claude Code's header has no server-label slot),
+   *  but kept on the props contract for the host wiring that supplies it. */
   readonly serverLabel: string;
+  /** Header label for the model new sessions dispatch with by default. */
+  readonly modelLabel: string;
   /** Ctrl+X first-press target awaiting a second Ctrl+X. */
   readonly confirmDeleteId: string | undefined;
   readonly renameDraft: { readonly sessionId: string; readonly text: string } | undefined;
@@ -76,6 +84,21 @@ export interface AgentsViewProps {
 const MIN_WIDTH = 48;
 const MIN_HEIGHT = 10;
 
+/** Header block: 3 info lines + 1 trailing blank before the first group (the
+ *  blank line lives here, never as a leading spacer item — see `deriveItems`'s
+ *  `moveSelection` invariant docs). */
+const HEADER_HEIGHT = 4;
+
+/** Small brand mark reused from the welcome banner (`chrome/welcome.ts`) —
+ *  no new ASCII art invented for this view. */
+const LOGO = ['▐█▛█▛█▌', '▐█████▌'] as const;
+
+let cachedVersion: string | undefined;
+function kimiVersion(): string {
+  cachedVersion ??= getVersion();
+  return cachedVersion;
+}
+
 const MORE_ITEM_ID = 'more:completed';
 
 type ViewItemKind = 'header' | 'row' | 'more' | 'spacer';
@@ -93,19 +116,28 @@ interface RenameState {
   text: string;
 }
 
-const HELP_LINES: readonly string[] = [
-  'Shortcuts',
-  '',
-  '  ↑/↓          move selection',
-  '  →            open session (same as Enter) · expand a collapsed group',
-  '  ←            collapse an expanded group',
-  '  type         focus the dispatch editor · Enter dispatches · Esc back',
-  '  Enter        open session · collapse/expand group · expand completed',
-  '  Ctrl+X       delete session (press twice to confirm)',
-  '  Ctrl+R       rename session',
-  '  Ctrl+T       pin / unpin',
-  '  ?            toggle this help',
-  '  Esc          quit',
+/**
+ * `?` help overlay: a 2-row key/hint grid replacing the single-line footer
+ * (the roster list itself stays visible and scrollable behind it — see
+ * `render`). Column-aligned per row; `undefined` is a blank cell. Only keys
+ * that exist today — the reorder / switch-views / mention / quick-open keys
+ * from the Claude Code reference are a later task's addition.
+ */
+type HelpCell = readonly [key: string, hint: string];
+
+const HELP_GRID: readonly (readonly (HelpCell | undefined)[])[] = [
+  [
+    ['↑↓', 'to select'],
+    ['ctrl+r', 'to rename'],
+    ['ctrl+t', 'to pin/unpin'],
+    ['esc', 'to quit'],
+  ],
+  [
+    ['ctrl+j', 'for newline'],
+    ['ctrl+x', 'to delete'],
+    undefined,
+    ['?', 'to close'],
+  ],
 ];
 
 export class AgentsViewApp extends Container implements Focusable {
@@ -349,7 +381,11 @@ export class AgentsViewApp extends Container implements Focusable {
       return this.renderTooSmall(width, rows);
     }
 
-    const bodyHeight = rows - 2;
+    // The `?` grid replaces the single-line footer with a 2-row one — the
+    // list's visible window shrinks by one row to make room; total screen
+    // rows stay fixed either way.
+    const footerLines = this.renderFooter(width);
+    const bodyHeight = rows - HEADER_HEIGHT - footerLines.length;
     // The dispatch editor box (bordered CustomEditor: ≥3 lines, taller while
     // the autocomplete dropdown is open) takes the bottom of the body; the
     // list keeps at least 3 rows.
@@ -357,27 +393,48 @@ export class AgentsViewApp extends Container implements Focusable {
     const dispatchHeight = Math.min(dispatchLines.length, Math.max(3, bodyHeight - 3));
     const listHeight = Math.max(1, bodyHeight - dispatchHeight);
 
-    const lines: string[] = [this.renderHeader(width)];
-    if (this.helpVisible) {
-      lines.push(...this.renderHelp(width, listHeight));
-    } else {
-      lines.push(...this.renderList(width, listHeight));
-    }
-    lines.push(...dispatchLines.slice(0, dispatchHeight));
-    lines.push(this.renderFooter(width));
-    return lines;
+    // The roster stays visible and scrollable behind the `?` grid — it never
+    // gets swapped out for a full-body help screen.
+    return [
+      ...this.renderHeader(width),
+      ...this.renderList(width, listHeight),
+      ...dispatchLines.slice(0, dispatchHeight),
+      ...footerLines,
+    ];
   }
 
-  private renderHeader(width: number): string {
+  /**
+   * 3 info lines (brand mark + version, model · cwd, status counts) + 1
+   * trailing blank line before the first group. The blank line is rendered
+   * HERE, not inserted into `deriveItems` as a leading spacer — a spacer at
+   * index 0 would break `moveSelection`'s "spacer never sits at the list's
+   * first stop" invariant and its step-over loop could spin forever.
+   */
+  private renderHeader(width: number): string[] {
     const { awaiting, working, completed } = this.props.counts;
-    const line =
-      currentTheme.boldFg('primary', ' KIMI AGENTS ') +
-      currentTheme.fg('textMuted', ` ${this.props.serverLabel} `) +
+    const logoWidth = Math.max(...LOGO.map((row) => visibleWidth(row)));
+    const gap = '  ';
+    const logoCol = (row: string): string =>
+      ' ' + currentTheme.fg('primary', row) + ' '.repeat(logoWidth - visibleWidth(row)) + gap;
+
+    const titleLine = logoCol(LOGO[0]) + currentTheme.boldFg('textStrong', `${PRODUCT_NAME} v${kimiVersion()}`);
+    const modelCwdLine =
+      logoCol(LOGO[1]) + currentTheme.fg('textMuted', `${this.props.modelLabel} · ${process.cwd()}`);
+    const countsLine =
+      ' ' +
+      ' '.repeat(logoWidth) +
+      gap +
       currentTheme.fg(
         'textDim',
-        ` ${String(awaiting)} awaiting input · ${String(working)} working · ${String(completed)} completed `,
+        `${String(awaiting)} awaiting input · ${String(working)} working · ${String(completed)} completed`,
       );
-    return fitExactly(line, width);
+
+    return [
+      fitExactly(titleLine, width),
+      fitExactly(modelCwdLine, width),
+      fitExactly(countsLine, width),
+      ' '.repeat(width),
+    ];
   }
 
   private renderList(width: number, height: number): string[] {
@@ -433,40 +490,74 @@ export class AgentsViewApp extends Container implements Focusable {
     return undefined;
   }
 
-  private renderHelp(width: number, height: number): string[] {
-    const lines: string[] = [];
-    for (const [i, text] of HELP_LINES.entries()) {
-      lines.push(
-        fitExactly(i === 0 ? currentTheme.boldFg('textStrong', text) : currentTheme.fg('text', text), width),
-      );
-    }
-    while (lines.length < height) lines.push(' '.repeat(width));
-    return lines.slice(0, height);
+  /**
+   * The `?` grid: 2 rows, column-aligned (each column padded to its widest
+   * cell across both rows). Replaces the single-line footer entirely while
+   * visible — the roster list underneath is untouched (see `render`).
+   */
+  private renderHelpGrid(width: number): string[] {
+    const columns = Math.max(...HELP_GRID.map((row) => row.length));
+    const colWidths = Array.from({ length: columns }, (_unused, c) =>
+      Math.max(
+        0,
+        ...HELP_GRID.map((row) => {
+          const cell = row[c];
+          return cell === undefined ? 0 : cell[0].length + 1 + cell[1].length;
+        }),
+      ),
+    );
+    return HELP_GRID.map((row) => {
+      const cells = row.map((cell, c) => {
+        const colWidth = colWidths[c] ?? 0;
+        if (cell === undefined) return ' '.repeat(colWidth);
+        const [cellKey, hint] = cell;
+        const plainWidth = cellKey.length + 1 + hint.length;
+        return (
+          currentTheme.boldFg('primary', cellKey) +
+          ' ' +
+          currentTheme.fg('textMuted', hint) +
+          ' '.repeat(Math.max(0, colWidth - plainWidth))
+        );
+      });
+      return fitExactly('  ' + cells.join('   '), width);
+    });
   }
 
-  private renderFooter(width: number): string {
+  /**
+   * Terse, `" · "`-joined hints (Claude Code's register) instead of an
+   * always-on verbose bar — rename/pin/quit live in the `?` grid instead of
+   * every row footer. Returns 2 lines while the `?` grid is open, 1
+   * otherwise (see `render`'s header/footer height accounting).
+   */
+  private renderFooter(width: number): string[] {
+    if (this.helpVisible) return this.renderHelpGrid(width);
+
     const key = (text: string): string => currentTheme.boldFg('primary', text);
     const dim = (text: string): string => currentTheme.fg('textMuted', text);
+    const hint = (k: string, rest: string): string => `${key(k)} ${dim(rest)}`;
+    const compose = (...parts: string[]): string => ` ${parts.join(dim(' · '))} `;
 
     let left: string;
     if (this.draftFor(this.props.renameDraft?.sessionId ?? this.rename?.id ?? '') !== undefined) {
-      left = ` ${key('Enter')} ${dim('submit rename')}  ${key('Esc')} ${dim('cancel')} `;
+      left = compose(hint('enter', 'to submit'), hint('esc', 'to cancel'));
     } else if (this.props.dispatchFocused) {
-      left = ` ${key('Enter')} ${dim('dispatch')}  ${key('Esc')} ${dim('back to list')} `;
+      left = compose(hint('enter', 'to dispatch'), hint('esc', 'to back to list'));
     } else if (this.props.confirmDeleteId !== undefined) {
-      left = ` ${currentTheme.boldFg('warning', this.deleteConfirmCopy(this.props.confirmDeleteId))} ${key('^X')} ${dim('confirm')}  ${dim('any other key cancels')} `;
-    } else if (this.helpVisible) {
-      left = ` ${key('?')}${dim('/')}${key('Esc')} ${dim('close')} `;
+      left = compose(
+        currentTheme.boldFg('warning', this.deleteConfirmCopy(this.props.confirmDeleteId)),
+        hint('ctrl+x', 'to confirm'),
+        dim('any other key cancels'),
+      );
     } else {
       const item = this.deriveItems()[this.selectedIndex];
       if (item === undefined) {
-        left = ` ${key('?')} ${dim('shortcuts')}  ${key('Esc')} ${dim('quit')} `;
+        left = compose(hint('?', 'for shortcuts'));
       } else if (item.kind === 'header') {
-        left = ` ${key('↑↓')} ${dim('select')}  ${key('Enter')} ${dim('collapse')}  ${key('←→')} ${dim('expand/collapse')}  ${key('^X')} ${dim('delete group')}  ${key('?')} ${dim('shortcuts')}  ${key('Esc')} ${dim('quit')} `;
+        left = compose(hint('enter', 'to collapse'), hint('ctrl+x', 'to delete all'), hint('?', 'for shortcuts'));
       } else if (item.kind === 'more') {
-        left = ` ${key('↑↓')} ${dim('select')}  ${key('Enter')} ${dim('expand')}  ${key('Esc')} ${dim('quit')} `;
+        left = compose(hint('enter', 'to expand'), hint('?', 'for shortcuts'));
       } else {
-        left = ` ${key('↑↓')} ${dim('select')}  ${key('Enter/→')} ${dim('open')}  ${key('^X')} ${dim('delete')}  ${key('^R')} ${dim('rename')}  ${key('^T')} ${dim('pin')}  ${key('?')} ${dim('shortcuts')}  ${key('Esc')} ${dim('quit')} `;
+        left = compose(hint('enter', 'to open'), hint('ctrl+x', 'to delete'), hint('?', 'for shortcuts'));
       }
     }
 
@@ -478,11 +569,11 @@ export class AgentsViewApp extends Container implements Focusable {
         // The flash is transient and carries the action's outcome (dispatch
         // errors!) — the static key hints truncate to make room instead of
         // the flash being dropped on narrower terminals.
-        return fitExactly(left, width - flashWidth) + flashStyled;
+        return [fitExactly(left, width - flashWidth) + flashStyled];
       }
-      return fitExactly(flashStyled, width);
+      return [fitExactly(flashStyled, width)];
     }
-    return fitExactly(left, width);
+    return [fitExactly(left, width)];
   }
 
   private deleteConfirmCopy(id: string): string {

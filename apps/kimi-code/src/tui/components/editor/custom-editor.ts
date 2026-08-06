@@ -116,6 +116,16 @@ function stripSgr(s: string): string {
 
 interface CustomEditorOptions {
   disablePasteBurst?: boolean;
+  /**
+   * Prompt-box frame: `'box'` (default) is the 4-sided rounded border the
+   * chat editor uses; `'rules'` draws only the top/bottom horizontal rules,
+   * no side bars — opt-in per instance, never the global default.
+   */
+  frameVariant?: 'box' | 'rules';
+  /** Prompt-token overlay (default `'>'`); bash mode always shows `'!'` regardless. */
+  promptSymbol?: string;
+  /** Dimmed placeholder shown on the first content line while the buffer is empty. */
+  placeholder?: string;
 }
 
 export class CustomEditor extends Editor {
@@ -164,6 +174,9 @@ export class CustomEditor extends Editor {
   public onInputModeChange?: (mode: 'prompt' | 'bash') => void;
   public connectedAbove = false;
   public borderHighlighted = false;
+  public readonly frameVariant: 'box' | 'rules';
+  public readonly promptSymbol: string;
+  public readonly placeholder: string | undefined;
   /**
    * Called when the user triggers "paste image" (Ctrl-V on Unix,
    * Alt-V on Windows — Ctrl-V is terminal-reserved there). Return
@@ -191,6 +204,9 @@ export class CustomEditor extends Editor {
     // border at the last column.
     const theme = createEditorTheme();
     super(tui, theme, { paddingX: 4, disablePasteBurst: options.disablePasteBurst });
+    this.frameVariant = options.frameVariant ?? 'box';
+    this.promptSymbol = options.promptSymbol ?? '>';
+    this.placeholder = options.placeholder;
 
     // pi-tui keeps `createAutocompleteList` private; shadow it with an
     // instance property so slash command menus render descriptions wrapped
@@ -326,12 +342,17 @@ export class CustomEditor extends Editor {
       if (line !== undefined) {
         lines[firstContentIdx] = injectArgumentHint(line, hint, this.getText().length, width);
       }
+    } else if (this.getText().length === 0 && this.placeholder !== undefined) {
+      const line = lines[firstContentIdx];
+      if (line !== undefined) {
+        lines[firstContentIdx] = injectPlaceholder(line, this.placeholder, width);
+      }
     }
     const firstContent = lines[firstContentIdx];
     if (firstContent !== undefined) {
       const withPrompt = injectPromptSymbol(
         firstContent,
-        isBash ? '!' : '>',
+        isBash ? '!' : this.promptSymbol,
         isBash ? (s) => this.borderColor(s) : undefined,
       );
       if (withPrompt !== undefined) {
@@ -345,6 +366,7 @@ export class CustomEditor extends Editor {
     return wrapWithSideBorders(lines, (s) => this.borderColor(s), {
       connectedAbove: this.connectedAbove && !this.borderHighlighted,
       label: isBash ? ` ${currentTheme.boldFg('shellMode', '! shell mode')} ` : undefined,
+      variant: this.frameVariant,
     });
   }
 
@@ -746,6 +768,28 @@ function truncateHint(hint: string, maxLen: number): string {
 }
 
 /**
+ * Splice a dimmed placeholder string into the first content line while the
+ * buffer is empty. Same insertion mechanics as {@link injectArgumentHint}
+ * (after the cursor block when one is rendered, consuming trailing padding
+ * so the line width is preserved) — the two never fire together, since a
+ * hint requires non-empty `/`-prefixed text.
+ */
+function injectPlaceholder(line: string, placeholder: string, width: number): string {
+  const cursorIdx = line.indexOf(CURSOR_BLOCK);
+  const cursorPresent = cursorIdx !== -1;
+  const contentWidth = Math.max(1, width - EDITOR_LEFT_PADDING * 2);
+  const available = contentWidth - (cursorPresent ? 1 : 0);
+  const trimmed = truncateHint(placeholder, available);
+  if (trimmed.length === 0) return line;
+  const colored = currentTheme.fg('textDim', trimmed);
+  const insertAt = cursorPresent
+    ? cursorIdx + CURSOR_BLOCK.length
+    : mapVisibleIdxToRaw(line, EDITOR_LEFT_PADDING);
+  const trailing = line.length - insertAt;
+  return line.slice(0, insertAt) + colored + ' '.repeat(Math.max(0, trailing - trimmed.length));
+}
+
+/**
  * Overlay a terminal-style `> ` prompt symbol on the first content line.
  * Column 0 is reserved for the left vertical border (overlaid later by
  * wrapWithSideBorders); column 1 is a single-space gap, so the `>` token
@@ -783,12 +827,27 @@ export function injectPromptSymbol(
  * When `options.label` is set, it is overlaid on the left of the top border
  * (e.g. the `! shell mode` badge), replacing the leading dashes. It is only
  * applied to a plain dash run, never to a `↑/↓ N more` scroll indicator.
+ *
+ * `options.variant: 'rules'` skips corners and side bars entirely: the
+ * top/bottom border rows are just recoloured (whatever pi-tui laid out,
+ * including scroll indicators), and content rows pass through untouched —
+ * a full-width horizontal-rule frame instead of a box.
  */
 export function wrapWithSideBorders(
   lines: string[],
   paint: (s: string) => string,
-  options: { readonly connectedAbove?: boolean; readonly label?: string } = {},
+  options: {
+    readonly connectedAbove?: boolean;
+    readonly label?: string;
+    readonly variant?: 'box' | 'rules';
+  } = {},
 ): string[] {
+  if (options.variant === 'rules') {
+    return lines.map((line) => {
+      const plain = stripSgr(line);
+      return plain.length > 0 && plain[0] === '─' ? paint(plain) : line;
+    });
+  }
   let seenTop = false;
   return lines.map((line) => {
     const plain = stripSgr(line);
