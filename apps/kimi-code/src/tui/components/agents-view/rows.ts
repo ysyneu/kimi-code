@@ -132,10 +132,10 @@ export function rosterRowName(row: AgentsRosterRow): string {
  *
  * `selected` (cursor position) and `isOrigin` (the session this roster-attach
  * lifecycle was last backed out of via ←) are independent flags that can
- * both be true on the same row at once: `selected` only drives the `❯`
- * pointer here (its full-row background fill lands separately once a
- * theme token exists for it — see the r4 parity spec); `isOrigin` is what
- * bolds the name. Selection alone no longer bolds anything.
+ * both be true on the same row at once: `selected` drives the `❯` pointer
+ * and a full-row `surfaceSelected` background fill — not bold; `isOrigin` is
+ * what bolds the name — not a background. The two compose freely on the
+ * same row.
  */
 export function renderRosterRow(
   row: AgentsRosterRow,
@@ -169,7 +169,13 @@ export function renderRosterRow(
   // The 42-col name slot is fixed regardless of `width`; fitExactly is a
   // last-resort safety net for terminals narrower than prefix+name (46
   // cols) can hold — below the app's own minimum width, in practice.
-  return fitExactly(left + ' '.repeat(fillWidth) + metaSegment, width);
+  const line = fitExactly(left + ' '.repeat(fillWidth) + metaSegment, width);
+  // Background wraps the already width-exact, already fg/bold-styled line
+  // last, so it never interferes with fitExactly's own ANSI-aware width
+  // measurement — nested bg/fg/bold each carry independent SGR resets, the
+  // same composition question-dialog.ts already relies on for its own
+  // `bg('primary', boldFg('text', text))`.
+  return selected ? currentTheme.bg('surfaceSelected', line) : line;
 }
 
 /**

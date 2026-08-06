@@ -183,6 +183,26 @@ describe('AgentsViewApp — originId threads into the row\'s bold "came from" st
     const line = out.split('\n').find((l) => l.includes('s1 title'));
     expect(line).toContain(chalk.hex(darkColors.textStrong).bold('s1 title'));
   });
+
+  it('the selected row carries the surfaceSelected background fill; an unselected row does not', () => {
+    const bgOpen = chalk.bgHex(darkColors.surfaceSelected)('x').split('x')[0];
+    const groups = [group('working', [row('s1'), row('s2')])];
+    const out = renderRaw(makeApp({ groups, selectedId: 's1' }));
+    const lines = out.split('\n');
+    const s1Line = lines.find((l) => l.includes('s1 title'));
+    const s2Line = lines.find((l) => l.includes('s2 title'));
+    expect(s1Line).toContain(bgOpen);
+    expect(s2Line).not.toContain(bgOpen);
+  });
+
+  it('the same row as both selected and origin shows the background fill AND the bold name together', () => {
+    const bgOpen = chalk.bgHex(darkColors.surfaceSelected)('x').split('x')[0];
+    const groups = [group('working', [row('s1')])];
+    const out = renderRaw(makeApp({ groups, originId: 's1', selectedId: 's1' }));
+    const line = out.split('\n').find((l) => l.includes('s1 title'));
+    expect(line).toContain(bgOpen);
+    expect(line).toContain(chalk.hex(darkColors.textStrong).bold('s1 title'));
+  });
 });
 
 describe('AgentsViewApp — full-screen rendering', () => {

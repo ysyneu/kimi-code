@@ -3,8 +3,9 @@
  * Responsibilities: the fixed-width `glyph name summary meta` row layout,
  * the lastAssistantText → lastPrompt fallback, the no-cwd/no-duplicate
  * rules, the busy/unseen/seen status glyph, the ping-pong spinner, and the
- * selected/isOrigin styling split (background fill on selection is a
- * separate, not-yet-landed mechanism — see rows.ts's doc comment).
+ * selected/isOrigin styling split (full-row background on selection, bold
+ * name on isOrigin — independent, composable flags; see rows.ts's doc
+ * comment).
  * Wiring: pure function, no TUI/component harness needed.
  * Run: pnpm exec vitest run test/tui/components/agents-view-rows.test.ts
  */
@@ -37,6 +38,13 @@ afterAll(() => {
 const BOLD_SGR = /\[1m/;
 function isBold(rawLine: string): boolean {
   return BOLD_SGR.test(rawLine);
+}
+
+/** True when the raw (unstripped) line carries a truecolor background SGR
+ *  code anywhere -- chalk.bgHex always emits the 48;2;r;g;b form. */
+const BG_SGR = /\[48;2;/;
+function hasBg(rawLine: string): boolean {
+  return BG_SGR.test(rawLine);
 }
 
 /** pointer (2 cols) + glyph (1 col) + space (1 col) — constant either state. */
@@ -268,15 +276,26 @@ describe('renderRosterRow — status glyph (busy / unseen / seen)', () => {
 describe('renderRosterRow — selected vs isOrigin (independent styling flags)', () => {
   // R4 parity: Claude Code's roster bolds the title on `isOrigin` ("the
   // session you came from"), never on cursor `selected` — the two used to
-  // be conflated onto `selected` here. Selection's own full-row background
-  // fill is a separate mechanism (not yet landed — no equivalent theme
-  // token exists in `ColorPalette`; see rows.ts's doc comment), so these
-  // only cover the bold half of the split.
+  // be conflated onto `selected` here. Selection instead drives its own
+  // full-row `surfaceSelected` background fill. Both flags are independent
+  // and compose on the same row.
 
   it('selected alone (isOrigin false) renders the name in the plain "text" token, not bold', () => {
     const line = renderRosterRow(row({ title: 'abc' }), true, false, 120);
     expect(isBold(line)).toBe(false);
     expect(line).toContain(chalk.hex(darkColors.text)('abc'));
+  });
+
+  it('selected alone shows the full-row background fill', () => {
+    const line = renderRosterRow(row({ title: 'abc' }), true, false, 120);
+    expect(hasBg(line)).toBe(true);
+  });
+
+  it('an unselected row never shows the background fill, isOrigin or not', () => {
+    const plain = renderRosterRow(row({ title: 'abc' }), false, false, 120);
+    const origin = renderRosterRow(row({ title: 'abc' }), false, true, 120);
+    expect(hasBg(plain)).toBe(false);
+    expect(hasBg(origin)).toBe(false);
   });
 
   it('isOrigin alone (not selected) bolds the name in "textStrong"', () => {
@@ -294,6 +313,12 @@ describe('renderRosterRow — selected vs isOrigin (independent styling flags)',
     const line = renderRosterRow(row({ title: 'abc' }), true, true, 120);
     expect(isBold(line)).toBe(true);
     expect(line).toContain(chalk.hex(darkColors.textStrong).bold('abc'));
+  });
+
+  it('both selected and isOrigin on the same row: the background fill also still applies (bg + bold together)', () => {
+    const line = renderRosterRow(row({ title: 'abc' }), true, true, 120);
+    expect(hasBg(line)).toBe(true);
+    expect(isBold(line)).toBe(true);
   });
 
   it('the ❯ pointer still keys off `selected`, independently of `isOrigin`', () => {
