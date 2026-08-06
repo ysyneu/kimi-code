@@ -54,6 +54,20 @@ export function fitExactly(line: string, width: number): string {
   return padToWidth(s, width);
 }
 
+/**
+ * The selection background fill, applied uniformly across every selectable
+ * stop in the list — roster rows, group headers, the collapsed "more" row,
+ * and the inline rename-draft row. Always the last step, wrapping an
+ * already width-exact, already fg/bold-styled line: nested bg/fg/bold each
+ * carry independent SGR resets, the same composition question-dialog.ts
+ * already relies on for its own `bg('primary', boldFg('text', text))`, and
+ * wrapping after the width-fit keeps the fill from perturbing that
+ * function's own ANSI-aware measurement.
+ */
+export function withSelectedBg(line: string, selected: boolean): string {
+  return selected ? currentTheme.bg('surfaceSelected', line) : line;
+}
+
 function singleLine(text: string): string {
   return text.replaceAll(/\s+/g, ' ').trim();
 }
@@ -170,12 +184,7 @@ export function renderRosterRow(
   // last-resort safety net for terminals narrower than prefix+name (46
   // cols) can hold — below the app's own minimum width, in practice.
   const line = fitExactly(left + ' '.repeat(fillWidth) + metaSegment, width);
-  // Background wraps the already width-exact, already fg/bold-styled line
-  // last, so it never interferes with fitExactly's own ANSI-aware width
-  // measurement — nested bg/fg/bold each carry independent SGR resets, the
-  // same composition question-dialog.ts already relies on for its own
-  // `bg('primary', boldFg('text', text))`.
-  return selected ? currentTheme.bg('surfaceSelected', line) : line;
+  return withSelectedBg(line, selected);
 }
 
 /**
@@ -216,11 +225,11 @@ export function renderGroupHeader(
 ): string {
   const suffix = collapsedCount === undefined ? '' : ` (${String(collapsedCount)})`;
   const line = pointer(selected) + currentTheme.boldFg('textStrong', label + suffix);
-  return fitExactly(line, width);
+  return withSelectedBg(fitExactly(line, width), selected);
 }
 
 /** The collapsed completed-group remainder: `<ptr>… N more`. */
 export function renderMoreRow(moreCount: number, selected: boolean, width: number): string {
   const line = pointer(selected) + currentTheme.fg('textMuted', `… ${String(moreCount)} more`);
-  return fitExactly(line, width);
+  return withSelectedBg(fitExactly(line, width), selected);
 }

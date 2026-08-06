@@ -8,6 +8,7 @@ import type { KimiSlashCommand } from '../commands/types';
 import { AgentsViewApp, type AgentsViewProps } from '../components/agents-view/app';
 import { rosterRowName } from '../components/agents-view/rows';
 import type { CustomEditor } from '../components/editor/custom-editor';
+import { EXIT_CONFIRM_WINDOW_MS } from '#/tui/constant/kimi-tui';
 import type { Theme } from '#/tui/theme';
 
 import { AgentsViewDispatch, DISPATCH_PLACEHOLDER, type DispatchSubmission } from './agents-view-dispatch';
@@ -115,6 +116,14 @@ export interface AgentsViewState {
    * mounted (stopped on detach / close / when nothing is busy).
    */
   busyTicker: NodeJS.Timeout | undefined;
+  /**
+   * Set while a first Ctrl+C is armed, waiting on a confirming second press
+   * within `EXIT_CONFIRM_WINDOW_MS` — owned here (not the component) because
+   * disarming on a silent timeout needs `host.state.ui.requestRender()` to
+   * repaint without a keypress, access only the controller has. Exposed to
+   * the component read-only as `AgentsViewProps.pendingExitArmed`.
+   */
+  pendingExitTimer: ReturnType<typeof setTimeout> | undefined;
   collapsedGroups: Set<AgentsGroupId>;
   completedExpanded: boolean;
   eventUnsubscribe: Unsubscribe;
@@ -243,6 +252,7 @@ export class AgentsViewController {
         confirmDeleteId: undefined,
         renameDraft: undefined,
         flashMessage: undefined,
+        pendingExitTimer: undefined,
         collapsedGroups: new Set(),
         completedExpanded: false,
       }),
@@ -307,6 +317,7 @@ export class AgentsViewController {
       flashMessage: undefined,
       flashTimer: undefined,
       busyTicker: undefined,
+      pendingExitTimer: undefined,
       collapsedGroups: new Set(),
       completedExpanded: false,
       eventUnsubscribe: this.host.harness.onEvent((event) => {
@@ -340,6 +351,7 @@ export class AgentsViewController {
     view.connectionUnsubscribe?.();
     if (view.flashTimer !== undefined) clearTimeout(view.flashTimer);
     if (view.busyTicker !== undefined) clearInterval(view.busyTicker);
+    if (view.pendingExitTimer !== undefined) clearTimeout(view.pendingExitTimer);
     this.host.setAttachBadge(undefined);
 
     state.ui.clear();
@@ -381,6 +393,15 @@ export class AgentsViewController {
     if (view.busyTicker !== undefined) {
       clearInterval(view.busyTicker);
       view.busyTicker = undefined;
+    }
+    // An armed Ctrl+C hint is screen-local: detaching mid-window must not
+    // leave a stale timer running against the now-invisible component, nor
+    // let its footer hint reappear armed on remount (remount reuses this
+    // same component instance) with the next Ctrl+C misread as a
+    // confirming second press instead of a fresh first one.
+    if (view.pendingExitTimer !== undefined) {
+      clearTimeout(view.pendingExitTimer);
+      view.pendingExitTimer = undefined;
     }
 
     state.ui.clear();
@@ -603,6 +624,7 @@ export class AgentsViewController {
     confirmDeleteId: string | undefined;
     renameDraft: { sessionId: string; text: string } | undefined;
     flashMessage: string | undefined;
+    pendingExitTimer: ReturnType<typeof setTimeout> | undefined;
     collapsedGroups: ReadonlySet<AgentsGroupId>;
     completedExpanded: boolean;
   }): AgentsViewProps {
@@ -625,6 +647,7 @@ export class AgentsViewController {
       dispatchFocused: view.dispatchFocused,
       dispatchEditor: view.dispatch.editor,
       replyTargetId: view.replyTargetId,
+      pendingExitArmed: view.pendingExitTimer !== undefined,
       ...this.buildCallbacks(),
     };
   }
@@ -652,6 +675,19 @@ export class AgentsViewController {
     return true;
   }
 
+  /**
+   * The shared "actually leave" path behind both `onQuit` and a confirming
+   * second Ctrl+C: a pending delete confirm still absorbs it as a cancel
+   * first (matches Ctrl+X's own confirm flow), otherwise closes the view.
+   */
+  private quitOrCancelConfirm(view: AgentsViewState): void {
+    if (this.clearConfirm(view)) {
+      this.pushProps();
+      return;
+    }
+    this.close();
+  }
+
   private buildCallbacks(): Pick<
     AgentsViewProps,
     | 'onSelect'
@@ -665,6 +701,7 @@ export class AgentsViewController {
     | 'onReorderPinned'
     | 'onHelpToggle'
     | 'onQuit'
+    | 'onCtrlC'
     | 'onDispatchFocusChange'
   > {
     return {
@@ -773,11 +810,28 @@ export class AgentsViewController {
         const view = this.host.state.agentsView;
         if (view === undefined) return;
         // Esc during delete-confirm cancels the confirm, not the view.
-        if (this.clearConfirm(view)) {
-          this.pushProps();
+        this.quitOrCancelConfirm(view);
+      },
+      // Every Ctrl+C press reports here unconditionally — arm vs. quit is
+      // decided by whether a timer is already running. The timer (not the
+      // component) owns the auto-disarm because only the controller has
+      // `state.ui.requestRender()` to repaint on a silent timeout.
+      onCtrlC: () => {
+        const view = this.host.state.agentsView;
+        if (view === undefined) return;
+        if (view.pendingExitTimer !== undefined) {
+          clearTimeout(view.pendingExitTimer);
+          view.pendingExitTimer = undefined;
+          this.quitOrCancelConfirm(view);
           return;
         }
-        this.close();
+        view.pendingExitTimer = setTimeout(() => {
+          const current = this.host.state.agentsView;
+          if (current === undefined || current.pendingExitTimer === undefined) return;
+          current.pendingExitTimer = undefined;
+          this.pushProps();
+        }, EXIT_CONFIRM_WINDOW_MS);
+        this.pushProps();
       },
       onDispatchFocusChange: (focused) => {
         const view = this.host.state.agentsView;

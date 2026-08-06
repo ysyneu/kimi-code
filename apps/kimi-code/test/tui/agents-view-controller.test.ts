@@ -24,6 +24,7 @@ import {
   parseReplyInput,
 } from '@/tui/controllers/agents-view-dispatch';
 import { currentTheme } from '@/tui/theme';
+import { EXIT_CONFIRM_WINDOW_MS } from '#/tui/constant/kimi-tui';
 
 const ANSI_SGR = /\[[0-9;]*m/g;
 function strip(text: string): string {
@@ -331,6 +332,7 @@ async function waitForViewState(
 }
 
 const ESC = '\u001B';
+const CTRL_C = '\u0003';
 const CTRL_X = '\u0018';
 const CTRL_R = '\u0012';
 const CTRL_T = '\u0014';
@@ -419,6 +421,92 @@ describe('AgentsViewController — mount / unmount', () => {
     b.ui.requestRender.mockClear();
     b.fake.emit({ type: 'event.session.work_changed', sessionId: 's1', busy: true });
     expect(b.ui.requestRender).not.toHaveBeenCalled();
+  });
+});
+
+describe('AgentsViewController — Ctrl+C two-stage exit confirm (fix round 1)', () => {
+  // The arm/quit/auto-disarm state machine lives HERE, not on the
+  // component — the component has no `state.ui` access, so only the
+  // controller can force a repaint when the window elapses with no further
+  // keypress. That autonomous-repaint requirement is the actual regression
+  // under review (agents-view.test.ts covers the render-given-props half:
+  // the component showing the right footer text for a given
+  // `pendingExitArmed`/counts combination).
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
+    dir = undefined;
+  });
+
+  it('a first Ctrl+C arms pendingExitTimer, pushes a render, and shows the footer hint', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.ui.requestRender.mockClear();
+    b.component().handleInput(CTRL_C);
+    expect(b.view().pendingExitTimer).toBeDefined();
+    expect(b.ui.requestRender).toHaveBeenCalled();
+    expect(b.render()).toContain('Press Ctrl+C again to exit');
+  });
+
+  it('a second Ctrl+C within the window closes the view', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput(CTRL_C);
+    b.component().handleInput(CTRL_C);
+    expect(b.controller.isOpen).toBe(false);
+  });
+
+  it('the window elapsing with zero further input still clears the timer AND triggers an autonomous repaint — the actual regression under review', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    vi.useFakeTimers();
+    try {
+      b.component().handleInput(CTRL_C);
+      expect(b.view().pendingExitTimer).toBeDefined();
+      b.ui.requestRender.mockClear();
+
+      // No handleInput, no other action between arming and here — this is
+      // exactly the "wait with no further input" scenario the spec's live
+      // capture requires and the original component-local timer couldn't
+      // deliver (Container.invalidate() on a childless component is a
+      // no-op; nothing else in this codebase repaints without an explicit
+      // requestRender call).
+      vi.advanceTimersByTime(EXIT_CONFIRM_WINDOW_MS + 1);
+
+      expect(b.view().pendingExitTimer).toBeUndefined();
+      expect(b.ui.requestRender).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a later Ctrl+C after the window elapsed re-arms instead of quitting', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    vi.useFakeTimers();
+    try {
+      b.component().handleInput(CTRL_C);
+      vi.advanceTimersByTime(EXIT_CONFIRM_WINDOW_MS + 1);
+      b.component().handleInput(CTRL_C);
+      expect(b.controller.isOpen).toBe(true);
+      expect(b.view().pendingExitTimer).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a pending delete confirm still absorbs a confirming second Ctrl+C as a cancel, matching onQuit', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN); // onto row s1
+    b.component().handleInput(CTRL_X); // arm delete-confirm on the selected row
+    expect(b.view().confirmDeleteId).toBe('s1');
+    b.component().handleInput(CTRL_C); // arms the exit hint
+    b.component().handleInput(CTRL_C); // confirming press
+    expect(b.controller.isOpen).toBe(true);
+    expect(b.view().confirmDeleteId).toBeUndefined();
   });
 });
 
@@ -1589,6 +1677,15 @@ describe('AgentsViewController — detach for attach', () => {
     expect(b.ui.setFocus).toHaveBeenLastCalledWith(b.host.state.editor);
     // The state (roster + subscription) survives — only the component unmounted.
     expect(b.controller.isOpen).toBe(true);
+  });
+
+  it('an armed Ctrl+C timer is cleared on detach — a quick detach-then-return within the window must not leave the hint armed or misread the next Ctrl+C as a confirming second press (fix round 1)', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput(CTRL_C);
+    expect(b.view().pendingExitTimer).toBeDefined();
+    b.controller.detachForAttach('s1');
+    expect(b.view().pendingExitTimer).toBeUndefined();
   });
 
   it('the roster subscription keeps reducing events while detached, without rendering', async () => {

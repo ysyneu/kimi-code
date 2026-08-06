@@ -6,7 +6,6 @@ import type { AgentsGroup, AgentsGroupId, AgentsRosterRow } from '@/tui/agents/r
 import { AgentsViewApp, type AgentsViewProps } from '@/tui/components/agents-view/app';
 import { AgentsExitConfirmComponent } from '@/tui/components/agents-view/exit-confirm';
 import { CustomEditor } from '@/tui/components/editor/custom-editor';
-import { EXIT_CONFIRM_WINDOW_MS } from '#/tui/constant/kimi-tui';
 import { darkColors } from '@/tui/theme/colors';
 
 const ANSI_SGR = /\[[0-9;]*m/g;
@@ -100,6 +99,7 @@ function makeProps(overrides: Partial<AgentsViewProps> = {}): AgentsViewProps {
     dispatchFocused: false,
     dispatchEditor: makeDispatchEditor(),
     replyTargetId: undefined,
+    pendingExitArmed: false,
     onSelect: vi.fn(),
     onOpen: vi.fn(),
     onDeleteRequest: vi.fn(),
@@ -111,6 +111,7 @@ function makeProps(overrides: Partial<AgentsViewProps> = {}): AgentsViewProps {
     onReorderPinned: vi.fn(),
     onHelpToggle: vi.fn(),
     onQuit: vi.fn(),
+    onCtrlC: vi.fn(),
     onDispatchFocusChange: vi.fn(),
     ...overrides,
   };
@@ -749,6 +750,21 @@ describe('AgentsViewApp — rename', () => {
     const out = render(makeApp({ groups, selectedId: 's1', renameDraft: { sessionId: 's1', text: 'draft text' } }));
     expect(out).toContain('draft text');
   });
+
+  it('the rename-draft row also carries the selection background fill — rename can only start on the selected row, so it always applies (fix round 1)', () => {
+    const previousChalkLevel = chalk.level;
+    chalk.level = 3;
+    try {
+      const bgOpen = chalk.bgHex(darkColors.surfaceSelected)('x').split('x')[0];
+      const out = renderRaw(
+        makeApp({ groups, selectedId: 's1', renameDraft: { sessionId: 's1', text: 'draft text' } }),
+      );
+      const line = out.split('\n').find((l) => l.includes('draft text'));
+      expect(line).toContain(bgOpen);
+    } finally {
+      chalk.level = previousChalkLevel;
+    }
+  });
 });
 
 describe('AgentsViewApp — pin / help / quit', () => {
@@ -894,63 +910,48 @@ describe('AgentsViewApp — pin / help / quit', () => {
   });
 });
 
-describe('AgentsViewApp — Ctrl+C two-stage exit confirm (R4 parity)', () => {
-  // Mirrors the main REPL's armPendingExit/CTRL_C_HINT pattern (see the
-  // class docstring): independent of Esc/origin — a first press only arms
-  // a footer hint, a second press inside EXIT_CONFIRM_WINDOW_MS quits, and
-  // the window elapsing disarms silently.
+describe('AgentsViewApp — Ctrl+C reports to the controller (R4 parity, fix round 1)', () => {
+  // The two-stage arm/timeout/auto-disarm state machine now lives in the
+  // controller, not here — only it has `state.ui.requestRender()` to repaint
+  // on a silent timeout (see agents-view-controller.test.ts's "Ctrl+C
+  // two-stage exit confirm" block for that coverage). This component just
+  // forwards every press via `onCtrlC` and renders whatever
+  // `pendingExitArmed` it's handed — no arm/quit decision, no timer, here.
 
-  it('a first Ctrl+C arms the footer hint without quitting', () => {
+  it('every Ctrl+C press reports to onCtrlC unconditionally — no local arm/quit decision', () => {
+    const onCtrlC = vi.fn();
     const onQuit = vi.fn();
-    const app = makeApp({ onQuit, counts: { awaiting: 0, working: 3, completed: 0 } });
+    const app = makeApp({ onCtrlC, onQuit });
     app.handleInput(CTRL_C);
+    app.handleInput(CTRL_C);
+    expect(onCtrlC).toHaveBeenCalledTimes(2);
     expect(onQuit).not.toHaveBeenCalled();
+  });
+
+  it('renders the armed footer hint with the running-agent count when pendingExitArmed is true', () => {
+    const app = makeApp({ pendingExitArmed: true, counts: { awaiting: 0, working: 3, completed: 0 } });
     const out = render(app);
     expect(out).toContain('Press Ctrl+C again to exit');
     expect(out).toContain('3 agents will keep running');
   });
 
   it('omits the running-agent suffix when nothing is working', () => {
-    const app = makeApp({ counts: { awaiting: 0, working: 0, completed: 0 } });
-    app.handleInput(CTRL_C);
+    const app = makeApp({ pendingExitArmed: true, counts: { awaiting: 0, working: 0, completed: 0 } });
     const out = render(app);
     expect(out).toContain('Press Ctrl+C again to exit');
     expect(out).not.toContain('will keep running');
   });
 
   it('uses singular phrasing for exactly one working agent', () => {
-    const app = makeApp({ counts: { awaiting: 0, working: 1, completed: 0 } });
-    app.handleInput(CTRL_C);
+    const app = makeApp({ pendingExitArmed: true, counts: { awaiting: 0, working: 1, completed: 0 } });
     const out = render(app);
     expect(out).toContain('1 agent will keep running');
     expect(out).not.toContain('1 agents');
   });
 
-  it('a second Ctrl+C within the window quits', () => {
-    const onQuit = vi.fn();
-    const app = makeApp({ onQuit });
-    app.handleInput(CTRL_C);
-    app.handleInput(CTRL_C);
-    expect(onQuit).toHaveBeenCalledTimes(1);
-  });
-
-  it('auto-disarms after the window elapses — the hint clears and a later Ctrl+C re-arms instead of quitting', () => {
-    vi.useFakeTimers();
-    try {
-      const onQuit = vi.fn();
-      const app = makeApp({ onQuit });
-      app.handleInput(CTRL_C);
-      expect(render(app)).toContain('Press Ctrl+C again to exit');
-
-      vi.advanceTimersByTime(EXIT_CONFIRM_WINDOW_MS + 1);
-      expect(render(app)).not.toContain('Press Ctrl+C again to exit');
-
-      app.handleInput(CTRL_C);
-      expect(onQuit).not.toHaveBeenCalled(); // a fresh arm, not a confirming second press
-      expect(render(app)).toContain('Press Ctrl+C again to exit');
-    } finally {
-      vi.useRealTimers();
-    }
+  it('shows no hint at all when pendingExitArmed is false', () => {
+    const app = makeApp({ pendingExitArmed: false, counts: { awaiting: 0, working: 3, completed: 0 } });
+    expect(render(app)).not.toContain('Press Ctrl+C again to exit');
   });
 });
 

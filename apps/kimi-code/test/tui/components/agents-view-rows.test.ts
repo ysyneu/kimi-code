@@ -13,7 +13,13 @@ import chalk from 'chalk';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import type { AgentsRosterRow } from '@/tui/agents/roster';
-import { formatRelativeTime, renderGroupHeader, renderRosterRow, spinnerFrames } from '@/tui/components/agents-view/rows';
+import {
+  formatRelativeTime,
+  renderGroupHeader,
+  renderMoreRow,
+  renderRosterRow,
+  spinnerFrames,
+} from '@/tui/components/agents-view/rows';
 import { darkColors } from '@/tui/theme/colors';
 
 // This file asserts exact lengths and column offsets, so (unlike the
@@ -376,6 +382,32 @@ describe('renderGroupHeader', () => {
     const out = strip(renderGroupHeader('Completed', 9, true, 40));
     expect(out.trimEnd().startsWith('❯')).toBe(true);
     expect(out).toContain('Completed (9)');
+  });
+
+  it('fix round 1: a selected header also carries the full-width background fill — the spec applies it to header rows, not just job rows', () => {
+    const selected = renderGroupHeader('Completed', undefined, true, 40);
+    const plain = renderGroupHeader('Completed', undefined, false, 40);
+    expect(hasBg(selected)).toBe(true);
+    expect(hasBg(plain)).toBe(false);
+  });
+});
+
+describe('renderMoreRow', () => {
+  it('renders the pointer, ellipsis and hidden count', () => {
+    const out = strip(renderMoreRow(4, false, 40));
+    expect(out.trim()).toBe('… 4 more');
+  });
+
+  it('the selection pointer still renders ahead of the label', () => {
+    const out = strip(renderMoreRow(4, true, 40));
+    expect(out.trimEnd().startsWith('❯')).toBe(true);
+  });
+
+  it('fix round 1: a selected "more" row also carries the full-width background fill — the spec applies it to fold rows, not just job rows', () => {
+    const selected = renderMoreRow(4, true, 40);
+    const plain = renderMoreRow(4, false, 40);
+    expect(hasBg(selected)).toBe(true);
+    expect(hasBg(plain)).toBe(false);
   });
 });
 

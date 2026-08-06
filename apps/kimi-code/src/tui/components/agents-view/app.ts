@@ -44,10 +44,14 @@
  *   session you already left resolves as a re-enter, not a fresh resume) when
  *   an origin is set, and only calls `onQuit` when there is none.
  * - Ctrl+C is a genuine two-stage confirm-to-exit, independent of Esc/origin:
- *   first press arms a footer hint (mirrors the main REPL's
- *   `armPendingExit`/`CTRL_C_HINT` pattern) for `EXIT_CONFIRM_WINDOW_MS`; a
- *   second press inside that window calls `onQuit`, same as Esc's no-origin
- *   fallback; the window elapsing disarms silently.
+ *   every press just reports `onCtrlC()` — the component makes no arm/quit
+ *   decision itself and holds no timer. The controller owns the actual
+ *   state machine (mirrors the main REPL's `armPendingExit`/`CTRL_C_HINT`
+ *   pattern) because disarming on a silent timeout needs `state.ui.
+ *   requestRender()` to repaint without a keypress, which only the
+ *   controller (via `host`) has access to. `props.pendingExitArmed` is all
+ *   this component reads back to decide whether the footer shows the
+ *   two-stage hint.
  */
 
 import {
@@ -63,11 +67,11 @@ import type { AgentsGroup, AgentsGroupId, AgentsRosterRow } from '@/tui/agents/r
 import type { CustomEditor } from '@/tui/components/editor/custom-editor';
 import { getVersion } from '#/cli/version';
 import { PRODUCT_NAME } from '#/constant/app';
-import { CTRL_C_HINT, EXIT_CONFIRM_WINDOW_MS } from '#/tui/constant/kimi-tui';
+import { CTRL_C_HINT } from '#/tui/constant/kimi-tui';
 import { currentTheme } from '#/tui/theme';
 import { printableChar, isPrintableChar } from '@/tui/utils/printable-key';
 
-import { fitExactly, renderGroupHeader, renderMoreRow, renderRosterRow } from './rows';
+import { fitExactly, renderGroupHeader, renderMoreRow, renderRosterRow, withSelectedBg } from './rows';
 
 export interface AgentsViewProps {
   readonly groups: readonly AgentsGroup[];
@@ -102,6 +106,14 @@ export interface AgentsViewProps {
    * a controller-owned side effect on `dispatchEditor`, not a render path.
    */
   readonly replyTargetId: string | undefined;
+  /**
+   * True while a first Ctrl+C is armed, waiting on a confirming second press
+   * within the controller's exit-confirm window — drives the footer's
+   * two-stage hint. Controller-owned state (see `onCtrlC`): the component
+   * has no `state.ui` access, so it cannot itself repaint when the window
+   * elapses with no further input.
+   */
+  readonly pendingExitArmed: boolean;
   onSelect(id: string): void;
   onOpen(id: string): void;
   onDeleteRequest(id: string): void;
@@ -115,6 +127,12 @@ export interface AgentsViewProps {
   onReorderPinned(id: string, delta: -1 | 1): void;
   onHelpToggle(): void;
   onQuit(): void;
+  /**
+   * Every Ctrl+C press, unconditionally — arm-vs-quit is the controller's
+   * decision (it owns the timer and the repaint access an autonomous
+   * disarm needs; see `pendingExitArmed`).
+   */
+  onCtrlC(): void;
   onDispatchFocusChange(focused: boolean): void;
 }
 
@@ -198,9 +216,6 @@ export class AgentsViewApp extends Container implements Focusable {
   private listScroll = 0;
   private helpVisible = false;
   private rename: RenameState | undefined = undefined;
-  /** Set while a first Ctrl+C is armed and waiting for a confirming second
-   *  press within `EXIT_CONFIRM_WINDOW_MS` — see `armPendingExit`. */
-  private pendingExitTimer: ReturnType<typeof setTimeout> | undefined = undefined;
 
   constructor(props: AgentsViewProps, terminal: Terminal) {
     super();
@@ -337,15 +352,11 @@ export class AgentsViewApp extends Container implements Focusable {
     }
 
     // Ctrl+C: two-stage confirm-to-exit, independent of Esc/origin — see the
-    // class docstring. A first press only arms the footer hint; nothing
-    // quits until a second press lands inside the window.
+    // class docstring. The arm/quit decision and the footer hint's own
+    // display are both the controller's job (`pendingExitArmed`/`onCtrlC`);
+    // this just reports the raw keypress.
     if (matchesKey(data, Key.ctrl('c'))) {
-      if (this.pendingExitTimer !== undefined) {
-        this.clearPendingExit();
-        this.props.onQuit();
-        return;
-      }
-      this.armPendingExit();
+      this.props.onCtrlC();
       return;
     }
 
@@ -469,26 +480,6 @@ export class AgentsViewApp extends Container implements Focusable {
     this.props.dispatchEditor.handleInput(data);
     this.props.onDispatchFocusChange(true);
     this.invalidate();
-  }
-
-  /** Arms the Ctrl+C footer hint; auto-disarms after `EXIT_CONFIRM_WINDOW_MS`
-   *  if no confirming second press lands first. */
-  private armPendingExit(): void {
-    this.clearPendingExit();
-    const timer = setTimeout(() => {
-      if (this.pendingExitTimer === timer) {
-        this.pendingExitTimer = undefined;
-        this.invalidate();
-      }
-    }, EXIT_CONFIRM_WINDOW_MS);
-    this.pendingExitTimer = timer;
-    this.invalidate();
-  }
-
-  private clearPendingExit(): void {
-    if (this.pendingExitTimer === undefined) return;
-    clearTimeout(this.pendingExitTimer);
-    this.pendingExitTimer = undefined;
   }
 
   private moveSelection(delta: number): void {
@@ -629,7 +620,10 @@ export class AgentsViewApp extends Container implements Focusable {
         currentTheme.fg('accent', '✎ ') +
         currentTheme.fg('text', draft) +
         currentTheme.fg('textDim', '▌');
-      return fitExactly(line, width);
+      // Rename can only begin on the currently-selected row, so `selected`
+      // is always true for the duration of editing — same fill every other
+      // selectable stop gets, for visual consistency.
+      return withSelectedBg(fitExactly(line, width), selected);
     }
     return renderRosterRow(row, selected, row.id === this.props.originId, width);
   }
@@ -690,7 +684,7 @@ export class AgentsViewApp extends Container implements Focusable {
     const compose = (...parts: string[]): string => ` ${parts.join(dim(' · '))} `;
 
     let left: string;
-    if (this.pendingExitTimer !== undefined) {
+    if (this.props.pendingExitArmed) {
       // Ctrl+C armed: replaces the whole footer, same as the main REPL's
       // transient exit hint — the two-stage confirm is the most urgent
       // signal on screen while it's live.
