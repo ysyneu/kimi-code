@@ -165,18 +165,17 @@ describe('KimiHarness.createSession transport link', () => {
         properties: undefined,
       });
 
-      // A further resume of the same still-open, still-cached session is
-      // NOT a no-op shortcut: `resumeSession` is always an explicit,
-      // user-triggered action, so every call refreshes from the server and
-      // is attributed the same way, even on a repeat cache hit.
+      // Now that resume state is actually populated, a further resume of
+      // the same still-open session IS the legitimate cache-hit shortcut:
+      // same object, no further telemetry.
       const resumedAgainWhileCached = await harness.resumeSession({ id: session.id });
       expect(resumedAgainWhileCached).toBe(session);
-      expect(records.filter((record) => record.event === 'session_started')).toHaveLength(3);
+      expect(records.filter((record) => record.event === 'session_started')).toHaveLength(2);
 
       await session.close();
       await harness.resumeSession({ id: session.id });
 
-      expect(records.filter((record) => record.event === 'session_started')).toHaveLength(4);
+      expect(records.filter((record) => record.event === 'session_started')).toHaveLength(3);
       expect(records).toContainEqual({
         event: 'session_started',
         sessionId: session.id,

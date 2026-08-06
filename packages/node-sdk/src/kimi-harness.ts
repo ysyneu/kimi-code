@@ -155,24 +155,26 @@ export class KimiHarness {
     const active = this.activeSessions.get(id);
     const { kaos, persistenceKaos, sessionStartedProperties, ...resumeInput } = input;
     if (active !== undefined) {
-      // Always do a real resume on a cache hit and merge it into the SAME
-      // object (`Session.applyResumedState`) so identity-sensitive callers
-      // (kaos rebind, profile checks) keep getting `active` back.
-      // `resumeState` is a point-in-time snapshot — nothing refreshes it as
-      // new events stream in — so a cached Session goes stale the moment
-      // anything reaches the session without going through this same object
-      // (e.g. agents-view's roster reply, which prompts over the bare wire
-      // rpc while the row sits unattached). `resumeSession` is always an
-      // explicit, user-triggered action at every call site — one more RPC
-      // round-trip is a negligible cost next to silently handing back a
-      // stale snapshot.
-      const summary =
-        kaos !== undefined || persistenceKaos !== undefined
-          ? await this.rpc.resumeSessionWithKaos({ ...resumeInput, id }, kaos ?? persistenceKaos as Kaos, persistenceKaos)
-          : await this.rpc.resumeSession({ ...resumeInput, id });
-      active.applyResumedState(summary);
-      this.trackSessionStarted(id, true, sessionStartedProperties);
-      this.trackSessionEvent(id, 'session_resume');
+      // A cache hit only skips the real resume when `active` already
+      // carries resume state from one. A `Session` that has only ever
+      // been through `createSession()` (e.g. agents-view dispatch,
+      // attached moments later while its id is still hot in this map) has
+      // `resumeState` undefined — handing it back untouched would silently
+      // return a session with no history and no live subscription. Do the
+      // real resume and merge it into the SAME object so identity-sensitive
+      // callers (kaos rebind, profile checks) keep getting `active` back.
+      const needsResume = active.getResumeState() === undefined;
+      if (kaos !== undefined || persistenceKaos !== undefined) {
+        const summary = await this.rpc.resumeSessionWithKaos({ ...resumeInput, id }, kaos ?? persistenceKaos as Kaos, persistenceKaos);
+        if (needsResume) active.applyResumedState(summary);
+      } else if (input.agentProfile !== undefined || needsResume) {
+        const summary = await this.rpc.resumeSession({ ...resumeInput, id });
+        if (needsResume) active.applyResumedState(summary);
+      }
+      if (needsResume) {
+        this.trackSessionStarted(id, true, sessionStartedProperties);
+        this.trackSessionEvent(id, 'session_resume');
+      }
       return active;
     }
 
