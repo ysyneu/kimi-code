@@ -528,15 +528,17 @@ export class AgentsViewController {
   }
 
   /**
-   * Clears reply-mode state (placeholder + `replyTargetId`) — called on
-   * every editor submit round trip (success or parse-error) and on Esc.
-   * Reply is the same composer as dispatch; only its momentary target and
-   * placeholder differ, so "leaving reply mode" is just resetting those
-   * two fields back to the dispatch defaults.
+   * Clears reply-mode state (placeholder + `replyTargetId` + the dispatch's
+   * `replying` parse-mode flag) — called on every editor submit round trip
+   * (success or parse-error) and on Esc. Reply is the same composer as
+   * dispatch; only its momentary target, placeholder and input parsing
+   * differ, so "leaving reply mode" is just resetting those back to the
+   * dispatch defaults.
    */
   private exitReplyMode(view: AgentsViewState): void {
     if (view.replyTargetId === undefined) return;
     view.replyTargetId = undefined;
+    view.dispatch.replying = false;
     view.dispatch.editor.setPlaceholder(DISPATCH_PLACEHOLDER);
   }
 
@@ -719,6 +721,7 @@ export class AgentsViewController {
         const row = view.roster.get(id);
         if (row === undefined) return;
         view.replyTargetId = id;
+        view.dispatch.replying = true;
         view.dispatchFocused = true;
         view.dispatch.editor.focused = true;
         view.dispatch.editor.setPlaceholder(`reply to ${rosterRowName(row)}`);

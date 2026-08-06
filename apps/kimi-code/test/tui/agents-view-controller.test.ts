@@ -20,6 +20,7 @@ import {
 import {
   AgentsViewDispatch,
   parseDispatchInput,
+  parseReplyInput,
 } from '@/tui/controllers/agents-view-dispatch';
 import { currentTheme } from '@/tui/theme';
 
@@ -959,6 +960,27 @@ describe('parseDispatchInput', () => {
   });
 });
 
+describe('parseReplyInput', () => {
+  it('a leading /model or /agent is literal text, not a staged override — the bug this guards', () => {
+    expect(parseReplyInput('/model foo hello there')).toEqual({ text: '/model foo hello there' });
+    expect(parseReplyInput('/agent reviewer hello there')).toEqual({ text: '/agent reviewer hello there' });
+  });
+
+  it('any other leading slash is also literal text, not a session-only rejection', () => {
+    expect(parseReplyInput('/yolo fix the flaky test')).toEqual({ text: '/yolo fix the flaky test' });
+  });
+
+  it('plain text passes through completely unmodified — no trim of its own', () => {
+    expect(parseReplyInput('fix the flaky test')).toEqual({ text: 'fix the flaky test' });
+  });
+
+  it('still rejects empty and too-short input with the same message as dispatch mode', () => {
+    expect(parseReplyInput('')).toEqual({ error: 'Too short — describe the task' });
+    expect(parseReplyInput('   ')).toEqual({ error: 'Too short — describe the task' });
+    expect(parseReplyInput('ab')).toEqual({ error: 'Too short — describe the task' });
+  });
+});
+
 describe('AgentsViewDispatch — editor wiring', () => {
   function makeDispatch(): AgentsViewDispatch {
     const tui = {
@@ -1230,6 +1252,22 @@ describe('AgentsViewController — reply mode (space)', () => {
     expect(b.view().replyTargetId).toBeUndefined();
     expect(b.view().dispatchFocused).toBe(false);
     expect(b.view().dispatch.editor.placeholder).toBe('describe a task for a new session');
+  });
+
+  it('reply text starting with /model or /agent is sent verbatim, not parsed as a dispatch override', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(SPACE);
+    b.view().dispatch.editor.onSubmit?.('/model foo hello there');
+    await flush();
+    // The full text reaches the target session unmangled — no override
+    // silently applied, no prefix silently dropped.
+    expect(b.fake.wirePrompt).toHaveBeenCalledWith({
+      sessionId: 's1',
+      input: [{ type: 'text', text: '/model foo hello there' }],
+    });
+    expect(b.fake.createSession).not.toHaveBeenCalled();
   });
 
   it('a non-wire transport flashes an error and never falls back to creating a new session', async () => {

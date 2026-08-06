@@ -71,15 +71,41 @@ export function parseDispatchInput(raw: string): DispatchParseResult {
 }
 
 /**
+ * Parses raw REPLY input (an existing session, not a new one): unlike
+ * `parseDispatchInput`, a leading `/` is never interpreted — there is no
+ * slash-command surface to route to inside a reply, so treating one as a
+ * `/model`/`/agent` override (or rejecting it as session-only) would either
+ * silently swallow the user's actual text or reject text that was never a
+ * command in the first place. The only check kept is the same too-short
+ * floor `parseDispatchInput` already applies, so a stray Enter can't send a
+ * blank prompt to the target session.
+ */
+export function parseReplyInput(raw: string): DispatchParseResult {
+  if (raw.replaceAll(/\s/g, '').length < MIN_NON_SPACE_CHARS) {
+    return { error: 'Too short — describe the task' };
+  }
+  return { text: raw };
+}
+
+/**
  * Owns the dispatch CustomEditor: submits parse through `parseDispatchInput`
- * and fan out to `onSubmit` (parsed submission) or `onError` (rejection
- * message). The editor clears itself on submit (pi-tui behaviour), so every
- * dispatch starts from an empty box.
+ * (or, while `replying` is set, the no-slash-detection `parseReplyInput`) and
+ * fan out to `onSubmit` (parsed submission) or `onError` (rejection message).
+ * The editor clears itself on submit (pi-tui behaviour), so every submission
+ * starts from an empty box.
  */
 export class AgentsViewDispatch {
   readonly editor: CustomEditor;
   onSubmit: ((parsed: DispatchSubmission) => void) | undefined;
   onError: ((message: string) => void) | undefined;
+  /**
+   * Set by the controller for the duration of reply mode (see
+   * `AgentsViewController.onReplyRequest` / `exitReplyMode`). Switches
+   * `handleEditorSubmit` from `parseDispatchInput` to `parseReplyInput` —
+   * the composer instance is shared between dispatch and reply, so which
+   * parser applies has to be a runtime flag, not two separate editors.
+   */
+  replying = false;
 
   constructor(
     ui: TUI,
@@ -122,7 +148,7 @@ export class AgentsViewDispatch {
   }
 
   private handleEditorSubmit(raw: string): void {
-    const parsed = parseDispatchInput(raw);
+    const parsed = this.replying ? parseReplyInput(raw) : parseDispatchInput(raw);
     if ('error' in parsed) {
       this.onError?.(parsed.error);
       return;
