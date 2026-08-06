@@ -197,9 +197,9 @@ Generate a new persistent bearer token (written to `~/.kimi-code/server.token`);
 
 ### `kimi agents`
 
-Open the agents view — a full-screen terminal dashboard over the local Kimi server. It lists the sessions the view owns — every session dispatched from or attached through it — grouped by live status (Awaiting input / Working / Pinned / Completed), updates as sessions make progress or ask for input, and dispatches new sessions from an input box at the bottom, so you can run and supervise many sessions at once without leaving the terminal.
+Open the agents view — a full-screen terminal dashboard over the local Kimi server. It lists the sessions the view owns — every session dispatched from or attached through it — grouped by live status (Pinned / Needs input / Working / Completed, in that order), updates as sessions make progress or ask for input, and dispatches new sessions from an input box at the bottom, so you can run and supervise many sessions at once without leaving the terminal.
 
-Each row shows the session's status, name, a summary of its latest assistant reply, and how long ago it last updated.
+Each row shows the session's status, name, a summary of its latest assistant reply, and how long ago it last updated. The status symbol animates while the session is busy, shows `✻` when it has new output you haven't looked at yet, and `∙` once you have.
 
 ```sh
 kimi agents
@@ -209,17 +209,22 @@ This subcommand has no flags.
 
 | Key | Action |
 | --- | --- |
-| `↑` / `↓` or `j` / `k` | Move the selection |
+| `↑` / `↓` | Move the selection |
 | `Enter` | Attach the full chat UI for the selected session; on a group header, collapse or expand the group |
 | `→` | Same as `Enter` for opening a session; on a group header, expand a collapsed group |
 | `←` | Collapse an expanded group; from an attached chat (with an empty editor), return to the agents view |
+| `Space` | Reply to the selected session from the bottom input box, without opening its chat |
+| `Shift-↑` / `Shift-↓` | Reorder the selected session within the Pinned group |
+| `Alt-1` – `Alt-9` | Open the Nth visible session, same as `Enter` |
+| `@` | Mention a file by path in the bottom input box |
+| `Ctrl-J` | Insert a newline in the bottom input box |
 | `Ctrl-X` | Archive the selected session (press twice to confirm); on a group header, archive the whole group. A session's running turn is cancelled first |
 | `Ctrl-R` | Rename the session |
 | `Ctrl-T` | Pin or unpin the session; pinned sessions move to the Pinned group |
 | `?` | Show the shortcut list |
-| `q` or `Esc` | Quit |
+| `Esc` | Quit |
 
-The bottom input box dispatches a new session in the current working directory: typing any text focuses the box, and `Enter` creates the session with that text as its first prompt. Two slash commands are available there as prefixes — `/model <alias>` and `/agent <profile>` stage a model or agent override for the new session's first prompt (e.g. `/agent reviewer Review the changes on this branch`); `/help` shows its help.
+The bottom input box dispatches a new session in the current working directory: typing any text focuses the box, and `Enter` creates the session with that text as its first prompt. Two slash commands are available there as prefixes — `/model <alias>` and `/agent <profile>` stage a model or agent override for the new session's first prompt (e.g. `/agent reviewer Review the changes on this branch`); `/help` shows its help. Pressing `Space` on a session row switches this same box to reply mode instead: `Enter` sends the text straight to that session (no new session, no slash overrides), and `Esc` returns to dispatching a new one.
 
 #### Server Lifecycle
 
