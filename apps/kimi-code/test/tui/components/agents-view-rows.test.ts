@@ -9,7 +9,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { AgentsRosterRow } from '@/tui/agents/roster';
-import { formatRelativeTime, renderRosterRow, spinnerFrames } from '@/tui/components/agents-view/rows';
+import { formatRelativeTime, renderGroupHeader, renderRosterRow, spinnerFrames } from '@/tui/components/agents-view/rows';
 
 // This file asserts exact lengths and column offsets, so (unlike the
 // sibling test files' substring-only checks) the ESC byte has to be
@@ -261,6 +261,36 @@ describe('spinnerFrames — ping-pong asterisk bloom', () => {
   it('the second half mirrors the first half in reverse (ping-pong, not a forward loop)', () => {
     const frames = spinnerFrames('darwin');
     expect(frames.slice(6)).toEqual(frames.slice(0, 6).toReversed());
+  });
+});
+
+describe('renderGroupHeader', () => {
+  it('an expanded header (collapsedCount undefined) shows the label alone, no count', () => {
+    const out = strip(renderGroupHeader('Completed', undefined, false, 40));
+    expect(out.trim()).toBe('Completed');
+  });
+
+  it('a collapsed header appends the hidden count in parens, on the same line as the label', () => {
+    const out = strip(renderGroupHeader('Completed', 9, false, 40));
+    const line = out.trim();
+    expect(line).toBe('Completed (9)');
+    // Single rendered line, no embedded newline — this is the regression
+    // this test locks down: the label and count must never be split apart.
+    expect(line).not.toContain('\n');
+  });
+
+  it('a collapsed header with zero hidden rows still renders "(0)", not a bare label', () => {
+    // 0 is a real, distinct-from-undefined count — a group can be manually
+    // collapsed down to an empty bucket (e.g. its last row got archived
+    // while collapsed), and that's a different state from never-collapsed.
+    const out = strip(renderGroupHeader('Completed', 0, false, 40));
+    expect(out.trim()).toBe('Completed (0)');
+  });
+
+  it('the selection pointer still renders ahead of the label + count', () => {
+    const out = strip(renderGroupHeader('Completed', 9, true, 40));
+    expect(out.trimEnd().startsWith('❯')).toBe(true);
+    expect(out).toContain('Completed (9)');
   });
 });
 

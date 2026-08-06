@@ -588,7 +588,7 @@ export class AgentsViewController {
       .groups(view.completedExpanded ? Number.MAX_SAFE_INTEGER : undefined)
       .map((group): AgentsGroup => {
         if (!view.collapsedGroups.has(group.id)) return group;
-        return { id: group.id, label: group.label, rows: [] };
+        return { id: group.id, label: group.label, rows: [], collapsedCount: group.rows.length };
       });
     return {
       groups,

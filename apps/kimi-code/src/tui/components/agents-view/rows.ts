@@ -182,17 +182,22 @@ function reservedMetaParts(row: AgentsRosterRow, budget: number): string[] {
 }
 
 /**
- * Group header line: `<ptr><label>` — counts live only in the top summary
- * line, not the group heading. `count` is kept in the signature for call-site
- * stability even though the label itself no longer renders it.
+ * Group header line: `<ptr><label>`, or `<ptr><label> (N)` while manually
+ * collapsed. An *expanded* header never shows a count — that lives only in
+ * the top summary line, matching the reference layout. `collapsedCount` is
+ * the one exception: collapsing a group empties its row list, so without a
+ * count here a collapsed group would look like it lost its contents rather
+ * than just hiding them. Always rendered on the single header line, never
+ * wrapped onto its own line.
  */
 export function renderGroupHeader(
   label: string,
-  count: number,
+  collapsedCount: number | undefined,
   selected: boolean,
   width: number,
 ): string {
-  const line = pointer(selected) + currentTheme.boldFg('textStrong', label);
+  const suffix = collapsedCount === undefined ? '' : ` (${String(collapsedCount)})`;
+  const line = pointer(selected) + currentTheme.boldFg('textStrong', label + suffix);
   return fitExactly(line, width);
 }
 

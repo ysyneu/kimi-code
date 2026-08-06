@@ -26,6 +26,14 @@ export interface AgentsGroup {
   readonly id: AgentsGroupId;
   readonly label: string;
   readonly rows: readonly AgentsRosterRow[];
+  /**
+   * Set only by the agents-view controller's collapse transform, which
+   * empties `rows` for a manually-collapsed group and stashes its true size
+   * here so the header can still show it. `AgentsRoster.groups()` never
+   * sets this — a roster-sourced group is always expanded from the model's
+   * own point of view; undefined means "not collapsed, show no count".
+   */
+  readonly collapsedCount?: number;
 }
 
 export interface AgentsRosterCounts {

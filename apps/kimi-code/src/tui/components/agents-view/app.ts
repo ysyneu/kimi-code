@@ -544,7 +544,7 @@ export class AgentsViewApp extends Container implements Focusable {
       return ' '.repeat(width);
     }
     if (item.kind === 'header') {
-      return renderGroupHeader(item.group.label, item.group.rows.length, selected, width);
+      return renderGroupHeader(item.group.label, item.group.collapsedCount, selected, width);
     }
     if (item.kind === 'more') {
       return renderMoreRow(this.hiddenCompletedCount(), selected, width);

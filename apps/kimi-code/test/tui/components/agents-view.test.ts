@@ -358,6 +358,33 @@ describe('AgentsViewApp — full-screen rendering', () => {
   });
 });
 
+describe('AgentsViewApp — collapsed group header shows its hidden count', () => {
+  it('an expanded group header renders the label alone, on one line, no count', () => {
+    // The first group's header is auto-selected on boot (parity spec), so
+    // strip the leading pointer the same way the row layout tests do.
+    const lines = makeApp({
+      groups: [group('completed', [row('done-1'), row('done-2')])],
+    })
+      .render(120)
+      .map(strip);
+    const headerLine = lines.find((l) => l.includes('Completed'));
+    expect(headerLine?.replace(/^[❯\s]+/, '').trim()).toBe('Completed');
+  });
+
+  it('a manually-collapsed group header renders label + hidden count together, on one line', () => {
+    // Mirrors what the controller's collapse transform actually produces:
+    // rows emptied, the true size stashed in collapsedCount.
+    const collapsedGroup: AgentsGroup = { id: 'completed', label: 'Completed', rows: [], collapsedCount: 9 };
+    const lines = makeApp({ groups: [collapsedGroup] }).render(120).map(strip);
+    const headerLine = lines.find((l) => l.includes('Completed'));
+    expect(headerLine?.replace(/^[❯\s]+/, '').trim()).toBe('Completed (9)');
+    // Regression guard: the count must never land on the line below the
+    // label — the very bug this test was written to catch.
+    const headerIdx = lines.findIndex((l) => l.includes('Completed'));
+    expect(lines[headerIdx + 1]?.trim()).not.toMatch(/^\d/);
+  });
+});
+
 describe('AgentsViewApp — footer hints follow the selection target', () => {
   const completedRows = Array.from({ length: 10 }, (_, i) => row(`done-${String(i)}`));
   const groups = [
