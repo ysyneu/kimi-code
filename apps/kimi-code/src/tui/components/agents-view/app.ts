@@ -198,11 +198,20 @@ export class AgentsViewApp extends Container implements Focusable {
   //    the controller between frames, so never cache them) ──────────────
 
   private hiddenCompletedCount(): number {
-    const pinnedRows = this.props.groups.find((g) => g.id === 'pinned')?.rows.length ?? 0;
-    const shownCompleted = this.props.groups.find((g) => g.id === 'completed')?.rows.length ?? 0;
+    const completedGroup = this.props.groups.find((g) => g.id === 'completed');
+    // A collapsed completed group already shows its own hidden count in the
+    // header (" (N)") — the "more" row is a windowed-pagination affordance
+    // for an EXPANDED group, a different mechanism from manual collapse.
+    // Reporting both at once produced two numbers, neither of them real.
+    if (completedGroup?.collapsedCount !== undefined) return 0;
+    const pinnedGroup = this.props.groups.find((g) => g.id === 'pinned');
+    // A collapsed pinned group also empties its rows, so its count has to
+    // come from collapsedCount too — otherwise pinnedRows silently reads 0
+    // and the remainder phantom-inflates by however many rows are pinned.
+    const pinnedRows = pinnedGroup?.collapsedCount ?? pinnedGroup?.rows.length ?? 0;
     // counts.completed covers both the pinned and completed buckets, so the
     // pinned rows must come out of the remainder or they phantom-inflate it.
-    return Math.max(0, this.props.counts.completed - pinnedRows - shownCompleted);
+    return Math.max(0, this.props.counts.completed - pinnedRows - (completedGroup?.rows.length ?? 0));
   }
 
   private deriveItems(): ViewItem[] {
@@ -312,8 +321,7 @@ export class AgentsViewApp extends Container implements Focusable {
     }
 
     // Once the dispatch editor holds text, printable chars belong to it —
-    // the printable shortcuts below (j/k/q/?) only act on an empty
-    // editor.
+    // the printable shortcut below (?) only acts on an empty editor.
     if (this.props.dispatchEditor.getText().length > 0 && isPrintableChar(k)) {
       this.routeToDispatch(data);
       return;

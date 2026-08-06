@@ -286,6 +286,39 @@ describe('AgentsViewApp — full-screen rendering', () => {
     expect(oneMore).toContain('… 1 more');
   });
 
+  it('a manually-collapsed Completed group shows its real hidden count, never a contradicting "… N more" row', () => {
+    // Mirrors the controller's collapse transform: rows emptied, the
+    // window's true size (10, not the group's full 13) stashed in
+    // collapsedCount. Before the fix, hiddenCompletedCount() still read the
+    // now-empty rows.length and derived a second, different number for a
+    // phantom "more" row underneath an already-collapsed header.
+    const collapsedCompleted: AgentsGroup = {
+      id: 'completed',
+      label: 'Completed',
+      rows: [],
+      collapsedCount: 10,
+    };
+    const out = render(makeApp({ groups: [collapsedCompleted], counts: { awaiting: 0, working: 0, completed: 13 } }));
+    expect(out).toContain('Completed (10)');
+    expect(out).not.toContain('more');
+  });
+
+  it('a manually-collapsed Pinned group does not inflate the Completed "… N more" remainder', () => {
+    // Collapsing Pinned also empties its rows — hiddenCompletedCount() must
+    // still subtract the real pinned count (from collapsedCount, not the
+    // now-empty rows.length) or the remainder phantom-inflates by however
+    // many rows are pinned.
+    const collapsedPinned: AgentsGroup = { id: 'pinned', label: 'Pinned', rows: [], collapsedCount: 2 };
+    const completedRows = Array.from({ length: 10 }, (_, i) => row(`done-${String(i)}`));
+    const out = render(
+      makeApp({
+        groups: [collapsedPinned, group('completed', completedRows)],
+        counts: { awaiting: 0, working: 0, completed: 13 },
+      }),
+    );
+    expect(out).toContain('… 1 more');
+  });
+
   it('renders freshly derived rows after setProps (no stale row cache)', () => {
     const app = makeApp({ groups: [group('completed', [row('s1', { title: 'old title' })])] });
     app.setProps(makeProps({ groups: [group('completed', [row('s1', { title: 'new title' })])] }));
