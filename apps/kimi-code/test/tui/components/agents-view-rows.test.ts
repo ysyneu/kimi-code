@@ -274,11 +274,11 @@ describe('renderRosterRow — status glyph (busy / unseen / seen)', () => {
 });
 
 describe('renderRosterRow — selected vs isOrigin (independent styling flags)', () => {
-  // R4 parity: Claude Code's roster bolds the title on `isOrigin` ("the
-  // session you came from"), never on cursor `selected` — the two used to
-  // be conflated onto `selected` here. Selection instead drives its own
-  // full-row `surfaceSelected` background fill. Both flags are independent
-  // and compose on the same row.
+  // The roster bolds the title on `isOrigin` ("the session you came from"),
+  // never on cursor `selected` — the two used to be conflated onto
+  // `selected` here. Selection instead drives its own full-row
+  // `surfaceSelected` background fill. Both flags are independent and
+  // compose on the same row.
 
   it('selected alone (isOrigin false) renders the name in the plain "text" token, not bold', () => {
     const line = renderRosterRow(row({ title: 'abc' }), true, false, 120);

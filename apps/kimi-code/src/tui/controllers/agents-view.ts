@@ -101,7 +101,7 @@ export interface AgentsViewState {
    * Scoped to this `AgentsViewState` object's lifetime (reset only by a
    * fresh `close()` + re-`show()`), not persisted across process restarts.
    * Attaching TO a session (`detachForAttach`) never touches this — it only
-   * changes on the way back, mirroring Claude Code's own `isOrigin` flag.
+   * changes on the way back. Drives the row-level `isOrigin` bold marker.
    */
   originSessionId: string | undefined;
   confirmDeleteId: string | undefined;
