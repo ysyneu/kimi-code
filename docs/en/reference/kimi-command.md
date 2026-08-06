@@ -224,7 +224,7 @@ This subcommand has no flags.
 | `?` | Show the shortcut list |
 | `Esc` | Quit |
 
-The bottom input box dispatches a new session in the current working directory: typing any text focuses the box, and `Enter` creates the session with that text as its first prompt. Two slash commands are available there as prefixes — `/model <alias>` and `/agent <profile>` stage a model or agent override for the new session's first prompt (e.g. `/agent reviewer Review the changes on this branch`); `/help` shows its help. Pressing `Space` on a session row switches this same box to reply mode instead: `Enter` sends the text straight to that session (no new session, no slash overrides), and `Esc` returns to dispatching a new one.
+The bottom input box dispatches a new session in the current working directory: typing any text focuses the box, and `Enter` creates the session with that text as its first prompt. Two slash commands are available there as prefixes — `/model <alias>` and `/agent <profile>` stage a model or agent override for the new session's first prompt (e.g. `/agent reviewer Review the changes on this branch`); `/help` shows its help. Typing exactly `exit` or `/exit` there and pressing `Enter` closes the agents view instead, the same as `Esc`. Pressing `Space` on a session row switches this same box to reply mode instead: `Enter` sends the text straight to that session as typed — no new session, and no slash interpretation, so a leading `/model` or `/agent` in a reply goes through as plain text rather than being treated as an override — and `Esc` returns to dispatching a new one.
 
 #### Server Lifecycle
 
