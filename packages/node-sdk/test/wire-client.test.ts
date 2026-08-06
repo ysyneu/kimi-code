@@ -1243,4 +1243,43 @@ describe('createKimiHarnessWire', () => {
     expect((await http.getSession(session.id)).archived).toBe(true);
     await harness.close();
   });
+
+  /**
+   * Regression for the agents-view "dispatch then immediately attach" bug:
+   * `createSession()` registers the session in `activeSessions` with
+   * `resumeState` undefined (a create-time summary has no
+   * `sessionMetadata`/`agents`). Attaching right after dispatch calls
+   * `resumeSession` on that same, still-cached id with no `kaos`/
+   * `agentProfile` — the exact shape agents-view's attach uses. The cache
+   * hit must not hand back the untouched, unhydrated Session: it needs a
+   * real resume (snapshot + subscribe) merged in, so the attached view can
+   * render history and receive live events instead of "Session history is
+   * unavailable for this session."
+   */
+  it('hydrates resume state on an immediate resume after createSession', async () => {
+    const harness = await createKimiHarnessWire({
+      serverUrl: base,
+      token,
+      homeDir: home,
+      identity: TEST_IDENTITY,
+    });
+    try {
+      const session = await harness.createSession({ workDir: cwd });
+      expect(session.getResumeState()).toBeUndefined();
+      await session.prompt('hi');
+
+      const resumed = await harness.resumeSession({ id: session.id });
+
+      // Identity is preserved (kaos-rebind / matching-profile callers rely
+      // on getting the SAME Session object back on a cache hit) …
+      expect(resumed).toBe(session);
+      // … but it must now carry real resume state instead of the stale
+      // create-time summary.
+      expect(resumed.getResumeState()?.agents['main']).toBeDefined();
+
+      await harness.deleteSession(session.id);
+    } finally {
+      await harness.close();
+    }
+  });
 });

@@ -84,6 +84,19 @@ export class Session {
     return summary;
   }
 
+  /** @internal
+   * Merge a real resume RPC result into this already-cached `Session`,
+   * preserving its identity. `KimiHarness.resumeSession` calls this on an
+   * `activeSessions` cache hit whose `resumeState` is still undefined
+   * (e.g. a session that has only been through `createSession()`, never an
+   * actual resume) instead of handing the object back untouched.
+   */
+  applyResumedState(summary: ResumedSessionSummary): void {
+    this.ensureOpen();
+    this.summary = summary;
+    this.resumeState = resumeStateFromSummary(summary);
+  }
+
   onEvent(listener: (event: Event) => void): Unsubscribe {
     this.ensureOpen();
     return this.rpc.onEvent((event) => {

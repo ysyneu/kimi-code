@@ -155,10 +155,25 @@ export class KimiHarness {
     const active = this.activeSessions.get(id);
     const { kaos, persistenceKaos, sessionStartedProperties, ...resumeInput } = input;
     if (active !== undefined) {
+      // A cache hit only skips the real resume when `active` already
+      // carries resume state from one. A `Session` that has only ever
+      // been through `createSession()` (e.g. agents-view dispatch,
+      // attached moments later while its id is still hot in this map) has
+      // `resumeState` undefined — handing it back untouched would silently
+      // return a session with no history and no live subscription. Do the
+      // real resume and merge it into the SAME object so identity-sensitive
+      // callers (kaos rebind, profile checks) keep getting `active` back.
+      const needsResume = active.getResumeState() === undefined;
       if (kaos !== undefined || persistenceKaos !== undefined) {
-        await this.rpc.resumeSessionWithKaos({ ...resumeInput, id }, kaos ?? persistenceKaos as Kaos, persistenceKaos);
-      } else if (input.agentProfile !== undefined) {
-        await this.rpc.resumeSession({ ...resumeInput, id });
+        const summary = await this.rpc.resumeSessionWithKaos({ ...resumeInput, id }, kaos ?? persistenceKaos as Kaos, persistenceKaos);
+        if (needsResume) active.applyResumedState(summary);
+      } else if (input.agentProfile !== undefined || needsResume) {
+        const summary = await this.rpc.resumeSession({ ...resumeInput, id });
+        if (needsResume) active.applyResumedState(summary);
+      }
+      if (needsResume) {
+        this.trackSessionStarted(id, true, sessionStartedProperties);
+        this.trackSessionEvent(id, 'session_resume');
       }
       return active;
     }
