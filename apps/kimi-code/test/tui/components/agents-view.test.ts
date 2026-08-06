@@ -92,6 +92,7 @@ function makeProps(overrides: Partial<AgentsViewProps> = {}): AgentsViewProps {
     flashMessage: undefined,
     dispatchFocused: false,
     dispatchEditor: makeDispatchEditor(),
+    replyTargetId: undefined,
     onSelect: vi.fn(),
     onOpen: vi.fn(),
     onDeleteRequest: vi.fn(),
@@ -99,6 +100,8 @@ function makeProps(overrides: Partial<AgentsViewProps> = {}): AgentsViewProps {
     onRenameBegin: vi.fn(),
     onRenameSubmit: vi.fn(),
     onPinToggle: vi.fn(),
+    onReplyRequest: vi.fn(),
+    onReorderPinned: vi.fn(),
     onHelpToggle: vi.fn(),
     onQuit: vi.fn(),
     onDispatchFocusChange: vi.fn(),
@@ -363,9 +366,10 @@ describe('AgentsViewApp — footer hints follow the selection target', () => {
   ];
   const counts = { awaiting: 0, working: 1, completed: 11 };
 
-  it('session row footer mentions open/delete — rename/pin moved into the ? grid', () => {
+  it('session row footer mentions open/reply/delete — rename/pin moved into the ? grid', () => {
     const out = render(makeApp({ groups, counts, selectedId: 'work-1' }));
     expect(out).toContain('enter to open');
+    expect(out).toContain('space to reply');
     expect(out).toContain('ctrl+x to delete');
     expect(out).not.toContain('rename');
     expect(out).not.toContain('pin');
@@ -620,6 +624,14 @@ describe('AgentsViewApp — pin / help / quit', () => {
     expect(opened).toContain('? to close');
     expect(opened).toContain('ctrl+r to rename');
     expect(opened).toContain('ctrl+j for newline');
+    // gap 10 + 12: the previously-missing keys now have grid copy.
+    expect(opened).toContain('shift+↑↓ to reorder');
+    expect(opened).toContain('alt+1-9 to open');
+    expect(opened).toContain('space to reply');
+    expect(opened).toContain('@ to mention');
+    // ctrl+s (switch views) is deliberately absent — no second view mode
+    // exists to switch to, and the brief bans inventing one.
+    expect(opened).not.toContain('ctrl+s');
 
     app.handleInput('?');
     expect(onHelpToggle).toHaveBeenCalledTimes(2);
@@ -689,11 +701,12 @@ describe('AgentsViewApp — dispatch editor mount', () => {
     expect(onDispatchFocusChange).toHaveBeenCalledWith(true);
   });
 
-  it('j/k/space/q route to the editor once it holds text (no navigation/quit)', () => {
+  it('j/k/space/q route to the editor once it holds text (no navigation/quit/reply)', () => {
     const editor = makeDispatchEditor();
     editor.setText('fix');
     const onSelect = vi.fn();
     const onQuit = vi.fn();
+    const onReplyRequest = vi.fn();
     const onDispatchFocusChange = vi.fn();
     const app = makeApp({
       groups: [group('working', [row('a', { busy: true }), row('b', { busy: true })])],
@@ -701,6 +714,7 @@ describe('AgentsViewApp — dispatch editor mount', () => {
       dispatchEditor: editor,
       onSelect,
       onQuit,
+      onReplyRequest,
       onDispatchFocusChange,
     });
     app.handleInput('j');
@@ -709,6 +723,7 @@ describe('AgentsViewApp — dispatch editor mount', () => {
     expect(editor.getText()).toBe('fixjk');
     app.handleInput(' ');
     expect(editor.getText()).toBe('fixjk ');
+    expect(onReplyRequest).not.toHaveBeenCalled();
     app.handleInput('q');
     expect(onQuit).not.toHaveBeenCalled();
     expect(onDispatchFocusChange).toHaveBeenCalledWith(true);
@@ -738,6 +753,139 @@ describe('AgentsViewApp — dispatch editor mount', () => {
     const out = render(makeApp({ dispatchFocused: true }));
     expect(out).toContain('dispatch');
     expect(out).toContain('back to list');
+  });
+
+  it('the footer shows send/cancel while reply mode is focused, not dispatch/back-to-list', () => {
+    const out = render(makeApp({ dispatchFocused: true, replyTargetId: 's1' }));
+    expect(out).toContain('enter to send');
+    expect(out).toContain('esc to cancel');
+    // Narrower than a bare 'to dispatch' substring check: the empty-roster
+    // banner ("type below to dispatch a new session") legitimately contains
+    // that phrase too — only the footer's own hint text is under test here.
+    expect(out).not.toContain('enter to dispatch');
+    expect(out).not.toContain('back to list');
+  });
+});
+
+// ── R3-4: space to reply, shift+↑↓ reorder, alt+1-9 quick-open (gap 10 + 12) ──
+
+describe('AgentsViewApp — space to reply (gap 10)', () => {
+  it('space on a selected session row fires onReplyRequest with the row id', () => {
+    const onReplyRequest = vi.fn();
+    const app = makeApp({
+      groups: [group('working', [row('s1', { busy: true })])],
+      selectedId: 's1',
+      onReplyRequest,
+    });
+    app.handleInput(' ');
+    expect(onReplyRequest).toHaveBeenCalledWith('s1');
+  });
+
+  it('space on a group header is a no-op for reply — falls through and types into the composer', () => {
+    const editor = makeDispatchEditor();
+    const onReplyRequest = vi.fn();
+    const onDispatchFocusChange = vi.fn();
+    const app = makeApp({
+      groups: [group('working', [row('s1', { busy: true })])],
+      selectedId: 'group:working',
+      dispatchEditor: editor,
+      onReplyRequest,
+      onDispatchFocusChange,
+    });
+    app.handleInput(' ');
+    expect(onReplyRequest).not.toHaveBeenCalled();
+    expect(editor.getText()).toBe(' ');
+    expect(onDispatchFocusChange).toHaveBeenCalledWith(true);
+  });
+
+  it('Kitty CSI-u encoded space also fires onReplyRequest on a row', () => {
+    const onReplyRequest = vi.fn();
+    const app = makeApp({
+      groups: [group('working', [row('s1', { busy: true })])],
+      selectedId: 's1',
+      onReplyRequest,
+    });
+    app.handleInput('[32u');
+    expect(onReplyRequest).toHaveBeenCalledWith('s1');
+  });
+});
+
+describe('AgentsViewApp — shift+↑↓ reorder pinned rows (gap 12)', () => {
+  const pinnedGroups = [
+    group('pinned', [row('p1', { pinned: true }), row('p2', { pinned: true })]),
+  ];
+
+  it('shift+↑ on a pinned row fires onReorderPinned with delta -1', () => {
+    const onReorderPinned = vi.fn();
+    const app = makeApp({ groups: pinnedGroups, selectedId: 'p2', onReorderPinned });
+    app.handleInput('[a'); // shift+up
+    expect(onReorderPinned).toHaveBeenCalledWith('p2', -1);
+  });
+
+  it('shift+↓ on a pinned row fires onReorderPinned with delta +1', () => {
+    const onReorderPinned = vi.fn();
+    const app = makeApp({ groups: pinnedGroups, selectedId: 'p1', onReorderPinned });
+    app.handleInput('[b'); // shift+down
+    expect(onReorderPinned).toHaveBeenCalledWith('p1', 1);
+  });
+
+  it('shift+↑↓ on a non-pinned row is a no-op — no reorder and no plain-arrow navigation either', () => {
+    const onReorderPinned = vi.fn();
+    const onSelect = vi.fn();
+    const groups = [group('completed', [row('a'), row('b')])];
+    const app = makeApp({ groups, selectedId: 'a', onReorderPinned, onSelect });
+    app.handleInput('[a');
+    app.handleInput('[b');
+    expect(onReorderPinned).not.toHaveBeenCalled();
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it('shift+↑↓ on a group header is a no-op', () => {
+    const onReorderPinned = vi.fn();
+    const app = makeApp({ groups: pinnedGroups, selectedId: 'group:pinned', onReorderPinned });
+    app.handleInput('[a');
+    expect(onReorderPinned).not.toHaveBeenCalled();
+  });
+});
+
+describe('AgentsViewApp — alt+1-9 quick-open (gap 12)', () => {
+  const threeRowGroups = [
+    group('working', [row('a', { busy: true }), row('b', { busy: true })]),
+    group('completed', [row('c')]),
+  ];
+
+  it('alt+1 opens the first visible session row', () => {
+    const onOpen = vi.fn();
+    const app = makeApp({ groups: threeRowGroups, onOpen });
+    app.handleInput('1'); // alt+1 (legacy ESC-prefixed)
+    expect(onOpen).toHaveBeenCalledWith('a');
+  });
+
+  it('alt+3 opens the third row, counting across group headers/spacers', () => {
+    const onOpen = vi.fn();
+    const app = makeApp({ groups: threeRowGroups, onOpen });
+    app.handleInput('3'); // alt+3
+    expect(onOpen).toHaveBeenCalledWith('c');
+  });
+
+  it('alt+N beyond the row count is a no-op', () => {
+    const onOpen = vi.fn();
+    const app = makeApp({ groups: threeRowGroups, onOpen });
+    app.handleInput('9'); // alt+9, only 3 rows exist
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it('alt+1 is a global shortcut — fires regardless of the current selection', () => {
+    const onOpen = vi.fn();
+    const app = makeApp({ groups: threeRowGroups, selectedId: 'group:completed', onOpen });
+    app.handleInput('1');
+    expect(onOpen).toHaveBeenCalledWith('a');
+  });
+
+  it('no number badges are rendered on rows', () => {
+    const out = render(makeApp({ groups: threeRowGroups }));
+    // Row text is `<ptr><glyph> <name>...` — no leading digit/index prefix.
+    expect(out).not.toMatch(/[▸ ]\s*[1-9][.)]/);
   });
 });
 

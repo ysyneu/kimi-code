@@ -103,6 +103,16 @@ function summaryText(row: AgentsRosterRow, name: string): string {
 }
 
 /**
+ * The name shown for a row: its title, falling back to the last prompt,
+ * then a static placeholder for a row with neither. Shared by the row
+ * renderer and the reply-mode composer placeholder (`reply to <name>`) so
+ * the two copies never drift apart.
+ */
+export function rosterRowName(row: AgentsRosterRow): string {
+  return singleLine(row.title) || singleLine(row.lastPrompt ?? '') || '(untitled)';
+}
+
+/**
  * `<ptr><symbol> <name padded/truncated to 42 cols><summary><meta>`.
  *
  * Three independently-fitted zones, in this order:
@@ -122,7 +132,7 @@ function summaryText(row: AgentsRosterRow, name: string): string {
  */
 export function renderRosterRow(row: AgentsRosterRow, selected: boolean, width: number): string {
   const symbol = statusSymbol(row);
-  const name = singleLine(row.title) || singleLine(row.lastPrompt ?? '') || '(untitled)';
+  const name = rosterRowName(row);
   const prefix = pointer(selected) + currentTheme.fg(symbol.color, symbol.glyph) + ' ';
   const prefixWidth = visibleWidth(prefix);
 

@@ -176,7 +176,11 @@ export class CustomEditor extends Editor {
   public borderHighlighted = false;
   public readonly frameVariant: 'box' | 'rules';
   public readonly promptSymbol: string;
-  public readonly placeholder: string | undefined;
+  /** Dimmed placeholder shown while the buffer is empty — mutable via
+   *  {@link setPlaceholder} so a host can retarget the same editor instance
+   *  (e.g. the agents-view composer swapping "new session" for "reply to
+   *  <row>" without mounting a second editor). */
+  public placeholder: string | undefined;
   /**
    * Called when the user triggers "paste image" (Ctrl-V on Unix,
    * Alt-V on Windows — Ctrl-V is terminal-reserved there). Return
@@ -194,6 +198,10 @@ export class CustomEditor extends Editor {
 
   setArgumentHints(hints: ReadonlyMap<string, string>): void {
     this.argumentHints = hints;
+  }
+
+  setPlaceholder(text: string | undefined): void {
+    this.placeholder = text;
   }
 
   constructor(tui: TUI, options: CustomEditorOptions = {}) {

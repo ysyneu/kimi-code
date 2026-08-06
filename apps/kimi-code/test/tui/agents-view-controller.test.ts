@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -336,6 +336,12 @@ const DOWN = '\u001B[B';
 const LEFT = '\u001B[D';
 const RIGHT = '\u001B[C';
 const ENTER = '\r';
+const UP = '\u001B[A';
+const SPACE = ' ';
+const SHIFT_UP = '\u001B[a';
+const SHIFT_DOWN = '\u001B[b';
+const ALT_1 = '\u001B1';
+const ALT_3 = '\u001B3';
 
 describe('AgentsViewController — mount / unmount', () => {
   let dir: string | undefined;
@@ -600,6 +606,88 @@ describe('AgentsViewController — pin', () => {
   });
 });
 
+describe('AgentsViewController — reorder pinned rows (shift+↑↓)', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) {
+      // maxRetries: a fire-and-forget persistState can still be mid-write
+      // (ENOTEMPTY on rmdir) when the test body returns.
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
+    dir = undefined;
+  });
+
+  it('shift+↓ on the top pinned row moves it down and persists the new order; selection follows it', async () => {
+    const b = await boot([summary('p1'), summary('p2')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN); // p1
+    b.component().handleInput(CTRL_T); // pin p1
+    b.component().handleInput(DOWN); // completed header
+    b.component().handleInput(DOWN); // p2
+    b.component().handleInput(CTRL_T); // pin p2
+    await waitForViewState(b.homeDir, { pins: new Set(['p1', 'p2']), sessions: new Set(['p1', 'p2']) });
+    b.component().handleInput(UP); // back onto p1 (top of the pinned group)
+    expect(b.view().selectedId).toBe('p1');
+
+    b.component().handleInput(SHIFT_DOWN);
+
+    // Selection follows the row it acted on, not the position it moved to.
+    expect(b.view().selectedId).toBe('p1');
+    await vi.waitFor(async () => {
+      const state = await loadAgentsViewState(b.homeDir);
+      expect([...state.pins]).toEqual(['p2', 'p1']);
+    });
+    const out = b.render();
+    expect(out.indexOf('p2 title')).toBeLessThan(out.indexOf('p1 title'));
+  });
+
+  it('shift+↑ at the top of the pinned order is a no-op', async () => {
+    const b = await boot([summary('p1'), summary('p2')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(CTRL_T);
+    b.component().handleInput(DOWN);
+    b.component().handleInput(DOWN);
+    b.component().handleInput(CTRL_T);
+    await waitForViewState(b.homeDir, { pins: new Set(['p1', 'p2']), sessions: new Set(['p1', 'p2']) });
+    b.component().handleInput(UP); // p1, already first in the pinned group
+
+    b.component().handleInput(SHIFT_UP);
+
+    await flush();
+    const state = await loadAgentsViewState(b.homeDir);
+    expect([...state.pins]).toEqual(['p1', 'p2']);
+    expect(b.view().selectedId).toBe('p1');
+  });
+
+  it('shift+↑↓ on a non-pinned row is a no-op — no reorder, no persistence, selection unaffected', async () => {
+    const b = await boot([summary('a'), summary('b')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN); // a
+    b.component().handleInput(SHIFT_UP);
+    b.component().handleInput(SHIFT_DOWN);
+    expect(b.view().selectedId).toBe('a');
+    await flush();
+    const state = await loadAgentsViewState(b.homeDir);
+    expect(state.pins).toEqual(new Set());
+  });
+
+  it('shift+↑↓ on a group header is a no-op', async () => {
+    const b = await boot([summary('p1'), summary('p2')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(CTRL_T); // pin p1
+    await waitForViewState(b.homeDir, { pins: new Set(['p1']), sessions: new Set(['p1', 'p2']) });
+    b.component().handleInput(UP); // onto the "Pinned" group header
+
+    b.component().handleInput(SHIFT_DOWN);
+
+    await flush();
+    const state = await loadAgentsViewState(b.homeDir);
+    expect([...state.pins]).toEqual(['p1']);
+  });
+});
+
 describe('AgentsViewController — rename', () => {
   let dir: string | undefined;
   afterEach(async () => {
@@ -767,6 +855,47 @@ describe('AgentsViewController — open', () => {
   });
 });
 
+describe('AgentsViewController — quick-open (alt+1-9)', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) {
+      // maxRetries: a fire-and-forget persistState can still be mid-write
+      // (ENOTEMPTY on rmdir) when the test body returns.
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
+    dir = undefined;
+  });
+
+  it('alt+1 opens the first visible session row via onOpenSession — same effect as Enter', async () => {
+    const onOpenSession = vi.fn();
+    const b = await boot(
+      [summary('s1', { updatedAt: 300 }), summary('s2', { updatedAt: 200 })],
+      { onOpenSession },
+    );
+    dir = b.homeDir;
+    b.component().handleInput(ALT_1);
+    expect(onOpenSession).toHaveBeenCalledWith('s1');
+  });
+
+  it('alt+N beyond the visible row count is a no-op', async () => {
+    const onOpenSession = vi.fn();
+    const b = await boot([summary('s1')], { onOpenSession });
+    dir = b.homeDir;
+    b.component().handleInput(ALT_3); // only 1 row exists
+    expect(onOpenSession).not.toHaveBeenCalled();
+  });
+
+  it('alt+1 fires regardless of the current selection (global shortcut)', async () => {
+    const onOpenSession = vi.fn();
+    const b = await boot([summary('s1'), summary('s2')], { onOpenSession });
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(DOWN);
+    b.component().handleInput(ALT_1);
+    expect(onOpenSession).toHaveBeenCalledWith('s1');
+  });
+});
+
 // ── Dispatch editor + whitelist autocomplete + submission parsing ──
 
 describe('parseDispatchInput', () => {
@@ -892,6 +1021,49 @@ describe('AgentsViewDispatch — editor wiring', () => {
   });
 });
 
+describe('AgentsViewDispatch — @ mention autocomplete (functional verification)', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
+    dir = undefined;
+  });
+
+  async function flushAutocomplete(): Promise<void> {
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+
+  // Gap 11's open question: does `@` already trigger file-mention
+  // completion in this exact composer, or does it need new wiring? This
+  // constructs the dispatch composer exactly as `AgentsViewController.show`
+  // does (`installAutocomplete(dispatchSlashCommands())` against a real
+  // workDir) and types `@` into it — functional proof, not a code-reading
+  // assumption. It already works: `CustomEditor` auto-triggers on `@`/`#`
+  // (pi-tui's `DEFAULT_AUTOCOMPLETE_TRIGGER_CHARACTERS`) and
+  // `FileMentionProvider` falls back to a real filesystem scan whenever
+  // `fdPath` is `null`, which is exactly how this composer is configured.
+  it('typing @ triggers file-mention suggestions in the same configuration the controller wires up', async () => {
+    const workDir = await mkdtemp(join(tmpdir(), 'agents-view-dispatch-mention-'));
+    dir = workDir;
+    await writeFile(join(workDir, 'readme.md'), '# hi');
+    const tui = {
+      requestRender: vi.fn(),
+      render: vi.fn(() => []),
+      terminal: { rows: 40, cols: 120 },
+    } as unknown as TUI;
+    const dispatch = new AgentsViewDispatch(tui, workDir);
+    dispatch.installAutocomplete(dispatchSlashCommands());
+
+    dispatch.editor.handleInput('@');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await flushAutocomplete();
+
+    expect(dispatch.editor.isShowingAutocomplete()).toBe(true);
+  });
+});
+
 describe('AgentsViewController — dispatch', () => {
   let dir: string | undefined;
   afterEach(async () => {
@@ -1014,6 +1186,120 @@ describe('AgentsViewController — dispatch', () => {
     await flush();
     expect(b.render()).toContain('Dispatch failed: workspace rejected');
     b.controller.close(); // clear the pending flash timer
+  });
+});
+
+describe('AgentsViewController — reply mode (space)', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) {
+      // maxRetries: a fire-and-forget persistState can still be mid-write
+      // (ENOTEMPTY on rmdir) when the test body returns.
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
+    dir = undefined;
+  });
+
+  it('space on a row focuses the composer on that session — placeholder and footer switch to reply mode', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(SPACE);
+    expect(b.view().replyTargetId).toBe('s1');
+    expect(b.view().dispatchFocused).toBe(true);
+    expect(b.view().dispatch.editor.focused).toBe(true);
+    expect(b.view().dispatch.editor.placeholder).toBe('reply to s1 title');
+    const out = b.render();
+    expect(out).toContain('enter to send');
+    expect(out).toContain('esc to cancel');
+  });
+
+  it('submitting reply text prompts the EXISTING session over the wire rpc, not createSession', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(SPACE);
+    b.view().dispatch.editor.onSubmit?.('here is more context');
+    await flush();
+    expect(b.fake.wirePrompt).toHaveBeenCalledWith({
+      sessionId: 's1',
+      input: [{ type: 'text', text: 'here is more context' }],
+    });
+    expect(b.fake.createSession).not.toHaveBeenCalled();
+    // Reply mode unwinds back to the "new session" composer on submit.
+    expect(b.view().replyTargetId).toBeUndefined();
+    expect(b.view().dispatchFocused).toBe(false);
+    expect(b.view().dispatch.editor.placeholder).toBe('describe a task for a new session');
+  });
+
+  it('a non-wire transport flashes an error and never falls back to creating a new session', async () => {
+    const b = await boot([summary('s1')]); // no wire
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(SPACE);
+    b.view().dispatch.editor.onSubmit?.('here is more context');
+    await flush();
+    expect(b.fake.createSession).not.toHaveBeenCalled();
+    expect(b.render()).toContain('requires the wire transport');
+    expect(b.view().replyTargetId).toBeUndefined();
+    b.controller.close(); // clear the pending flash timer
+  });
+
+  it('Esc during reply mode exits back to the dispatch composer without submitting', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(SPACE);
+    b.component().handleInput(ESC);
+    expect(b.view().replyTargetId).toBeUndefined();
+    expect(b.view().dispatchFocused).toBe(false);
+    expect(b.view().dispatch.editor.placeholder).toBe('describe a task for a new session');
+    expect(b.fake.wirePrompt).not.toHaveBeenCalled();
+  });
+
+  it('a parse error during reply mode also exits reply mode instead of leaving it stuck', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(SPACE);
+    b.view().dispatch.editor.onSubmit?.('ab'); // too short
+    await flush();
+    expect(b.view().replyTargetId).toBeUndefined();
+    expect(b.render()).toContain('Too short — describe the task');
+    b.controller.close(); // clear the pending flash timer
+  });
+
+  it('after a reply submit, a subsequent plain submission creates a NEW session (round-trip proof)', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(SPACE);
+    b.view().dispatch.editor.onSubmit?.('reply text here');
+    await flush();
+    b.view().dispatch.editor.onSubmit?.('a brand new task');
+    await flush();
+    expect(b.fake.createSession).toHaveBeenCalledWith({ workDir: '/home/user/project' });
+    expect(b.fake.createdSession.prompt).toHaveBeenCalledWith('a brand new task');
+  });
+
+  it('space on a group header does not enter reply mode — falls through into the composer as a character', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    // selection starts on the Completed group header
+    b.component().handleInput(SPACE);
+    expect(b.view().replyTargetId).toBeUndefined();
+    expect(b.view().dispatchFocused).toBe(true);
+    expect(b.view().dispatch.editor.getText()).toBe(' ');
+  });
+
+  it('space on a row clears a pending delete confirm', async () => {
+    const b = await boot([summary('s1'), summary('s2')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN); // s1
+    b.component().handleInput(CTRL_X);
+    expect(b.view().confirmDeleteId).toBe('s1');
+    b.component().handleInput(SPACE);
+    expect(b.view().confirmDeleteId).toBeUndefined();
   });
 });
 

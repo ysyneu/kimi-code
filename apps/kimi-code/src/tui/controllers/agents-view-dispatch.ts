@@ -31,6 +31,14 @@ export type DispatchParseResult = DispatchSubmission | { readonly error: string 
 const MIN_NON_SPACE_CHARS = 3;
 
 /**
+ * Default composer placeholder — the dispatch target is "a new session".
+ * Reply mode (agents-view controller) swaps this per-row via
+ * `CustomEditor.setPlaceholder` and restores this exact string on
+ * submit/Esc, so the two never drift out of sync.
+ */
+export const DISPATCH_PLACEHOLDER = 'describe a task for a new session';
+
+/**
  * Parses raw dispatch input. Plain text becomes the first prompt of a new
  * session; a leading `/model <name>` or `/agent <profile>` stages that
  * override for the first prompt. Any other leading slash command only exists
@@ -88,7 +96,7 @@ export class AgentsViewDispatch {
       disablePasteBurst: true,
       frameVariant: 'rules',
       promptSymbol: '❯',
-      placeholder: 'describe a task for a new session',
+      placeholder: DISPATCH_PLACEHOLDER,
     });
     this.editor.onSubmit = (raw) => {
       this.handleEditorSubmit(raw);

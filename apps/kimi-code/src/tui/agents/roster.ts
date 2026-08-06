@@ -228,7 +228,16 @@ export class AgentsRoster {
     for (const id of GROUP_ORDER) {
       const rows = buckets[id];
       if (rows.length === 0) continue;
-      rows.sort((a, b) => b.updatedAt - a.updatedAt);
+      if (id === 'pinned') {
+        // Manually reorderable (shift+↑↓ — see `reorderPinned`): display
+        // order follows the pins Set's insertion order, not recency.
+        const order = new Map<string, number>();
+        let i = 0;
+        for (const pinnedId of this.pins) order.set(pinnedId, i++);
+        rows.sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
+      } else {
+        rows.sort((a, b) => b.updatedAt - a.updatedAt);
+      }
       groups.push({
         id,
         label: GROUP_LABELS[id],
@@ -236,6 +245,30 @@ export class AgentsRoster {
       });
     }
     return groups;
+  }
+
+  /**
+   * Moves a pinned row by `delta` (-1 up / +1 down) within the pins Set's
+   * insertion order — the pinned group's display order (see `groups`
+   * above). No-op for a row that is not pinned/known, or a move that would
+   * run off either end. Rebuilds `pins` in place (same object reference the
+   * constructor received — Sets have no splice), so the controller's
+   * existing "persist the pins set after every mutation" flow picks up the
+   * new order unchanged.
+   */
+  reorderPinned(id: string, delta: -1 | 1): void {
+    const row = this.rows.get(id);
+    if (row === undefined || !row.pinned) return;
+    const order = [...this.pins];
+    const from = order.indexOf(id);
+    if (from === -1) return;
+    const to = from + delta;
+    if (to < 0 || to >= order.length) return;
+    const swap = order[to]!;
+    order[to] = order[from]!;
+    order[from] = swap;
+    this.pins.clear();
+    for (const pinnedId of order) this.pins.add(pinnedId);
   }
 
   /**

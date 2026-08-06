@@ -272,6 +272,56 @@ describe('AgentsRoster', () => {
     expect(roster.counts()).toEqual({ awaiting: 0, working: 0, completed: 2 });
   });
 
+  it('the pinned group displays in pins-Set insertion order, not updatedAt recency', () => {
+    const pins = new Set(['p1', 'p2', 'p3']);
+    const roster = new AgentsRoster(pins);
+    // updatedAt is DELIBERATELY the reverse of pin order — recency would
+    // flip this if `groups()` still sorted the pinned bucket like every
+    // other group.
+    roster.setAll([
+      summary('p1', { updatedAt: 100 }),
+      summary('p2', { updatedAt: 200 }),
+      summary('p3', { updatedAt: 300 }),
+    ]);
+    expect(groupRows(roster, 'pinned').map((row) => row.id)).toEqual(['p1', 'p2', 'p3']);
+  });
+
+  it('reorderPinned swaps a row with its neighbor and persists through the same pins Set reference', () => {
+    const pins = new Set(['p1', 'p2', 'p3']);
+    const roster = new AgentsRoster(pins);
+    roster.setAll([summary('p1'), summary('p2'), summary('p3')]);
+
+    roster.reorderPinned('p2', -1);
+    expect(groupRows(roster, 'pinned').map((row) => row.id)).toEqual(['p2', 'p1', 'p3']);
+    // Same object identity — the controller persists exactly this Set.
+    expect([...pins]).toEqual(['p2', 'p1', 'p3']);
+
+    roster.reorderPinned('p2', 1);
+    expect(groupRows(roster, 'pinned').map((row) => row.id)).toEqual(['p1', 'p2', 'p3']);
+  });
+
+  it('reorderPinned is a no-op at either end of the pinned order', () => {
+    const pins = new Set(['p1', 'p2']);
+    const roster = new AgentsRoster(pins);
+    roster.setAll([summary('p1'), summary('p2')]);
+
+    roster.reorderPinned('p1', -1); // already first
+    expect(groupRows(roster, 'pinned').map((row) => row.id)).toEqual(['p1', 'p2']);
+    roster.reorderPinned('p2', 1); // already last
+    expect(groupRows(roster, 'pinned').map((row) => row.id)).toEqual(['p1', 'p2']);
+  });
+
+  it('reorderPinned is a no-op for a non-pinned or unknown row', () => {
+    const pins = new Set(['p1']);
+    const roster = new AgentsRoster(pins);
+    roster.setAll([summary('p1'), summary('a')]);
+
+    roster.reorderPinned('a', -1); // exists but not pinned
+    expect([...pins]).toEqual(['p1']);
+    roster.reorderPinned('nope', -1); // unknown id
+    expect([...pins]).toEqual(['p1']);
+  });
+
   it('groups() truncates the completed group to the page size while counts stay total', () => {
     const roster = new AgentsRoster(new Set());
     roster.setAll(

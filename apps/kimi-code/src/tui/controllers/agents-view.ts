@@ -6,10 +6,11 @@ import { loadAgentsViewState, saveAgentsViewState } from '../agents/roster-persi
 import { BUILTIN_SLASH_COMMANDS } from '../commands/registry';
 import type { KimiSlashCommand } from '../commands/types';
 import { AgentsViewApp, type AgentsViewProps } from '../components/agents-view/app';
+import { rosterRowName } from '../components/agents-view/rows';
 import type { CustomEditor } from '../components/editor/custom-editor';
 import type { Theme } from '#/tui/theme';
 
-import { AgentsViewDispatch, type DispatchSubmission } from './agents-view-dispatch';
+import { AgentsViewDispatch, DISPATCH_PLACEHOLDER, type DispatchSubmission } from './agents-view-dispatch';
 
 export interface AgentsViewHost {
   readonly state: {
@@ -85,6 +86,14 @@ export interface AgentsViewState {
   permissionHintShown: boolean;
   /** Focus split between the roster list and the dispatch editor. */
   dispatchFocused: boolean;
+  /**
+   * Set while the composer targets an EXISTING session (space on a row)
+   * instead of a new one. Always paired with `dispatchFocused === true` —
+   * entering and leaving reply mode toggles both together (see
+   * `onReplyRequest` and `exitReplyMode`) so the component never has to
+   * reconcile a composer that's "replying" but unfocused.
+   */
+  replyTargetId: string | undefined;
   selectedId: string | undefined;
   confirmDeleteId: string | undefined;
   renameDraft: { sessionId: string; text: string } | undefined;
@@ -209,6 +218,7 @@ export class AgentsViewController {
         roster,
         dispatch,
         dispatchFocused: false,
+        replyTargetId: undefined,
         selectedId: undefined,
         confirmDeleteId: undefined,
         renameDraft: undefined,
@@ -226,16 +236,29 @@ export class AgentsViewController {
     state.ui.requestRender(true);
 
     dispatch.onSubmit = (submission) => {
+      const view = this.host.state.agentsView;
+      const replyTarget = view?.replyTargetId;
+      if (view !== undefined) this.exitReplyMode(view);
       this.unfocusDispatch();
+      if (view !== undefined && replyTarget !== undefined) {
+        void this.handleReply(view, replyTarget, submission.text);
+        return;
+      }
       void this.handleDispatch(submission);
     };
     dispatch.onError = (message) => {
+      const view = this.host.state.agentsView;
+      if (view !== undefined) this.exitReplyMode(view);
       this.unfocusDispatch();
       this.flash(message);
     };
     // Esc inside the focused editor returns focus to the list (the editor's
     // own autocomplete-cancel wins over this when a dropdown is open).
+    // Reply mode is exited the same way as a submit: back to the "new
+    // session" composer, not a second escape stage.
     dispatch.editor.onEscape = () => {
+      const view = this.host.state.agentsView;
+      if (view !== undefined) this.exitReplyMode(view);
       this.unfocusDispatch();
     };
 
@@ -250,6 +273,7 @@ export class AgentsViewController {
       detached: false,
       permissionHintShown: false,
       dispatchFocused: false,
+      replyTargetId: undefined,
       selectedId: undefined,
       confirmDeleteId: undefined,
       renameDraft: undefined,
@@ -480,6 +504,42 @@ export class AgentsViewController {
     }
   }
 
+  /**
+   * Reply flow (space on a row): prompts an EXISTING session directly
+   * through the wire rpc — the same primitive `handleDispatch`'s override
+   * branch already uses for model/profile, minus the overrides and minus
+   * creating anything. Wire-only, same restriction as those overrides: a
+   * background reply from the roster has no client-side `Session` object
+   * to fall back to (the target row may never have been resumed in this
+   * process — it could be listed straight from a persisted summary).
+   */
+  private async handleReply(view: AgentsViewState, targetId: string, text: string): Promise<void> {
+    const rpc = this.host.harness.wireRpc();
+    if (rpc === undefined) {
+      this.flash('Reply failed: replying from the list requires the wire transport');
+      return;
+    }
+    try {
+      await rpc.prompt({ sessionId: targetId, input: [{ type: 'text', text }] });
+    } catch (error) {
+      if (this.host.state.agentsView !== view) return;
+      this.flash(`Reply failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * Clears reply-mode state (placeholder + `replyTargetId`) — called on
+   * every editor submit round trip (success or parse-error) and on Esc.
+   * Reply is the same composer as dispatch; only its momentary target and
+   * placeholder differ, so "leaving reply mode" is just resetting those
+   * two fields back to the dispatch defaults.
+   */
+  private exitReplyMode(view: AgentsViewState): void {
+    if (view.replyTargetId === undefined) return;
+    view.replyTargetId = undefined;
+    view.dispatch.editor.setPlaceholder(DISPATCH_PLACEHOLDER);
+  }
+
   private handleGlobalEvent(event: Event): void {
     const view = this.host.state.agentsView;
     if (view === undefined) return;
@@ -508,6 +568,7 @@ export class AgentsViewController {
     roster: AgentsRoster;
     dispatch: AgentsViewDispatch;
     dispatchFocused: boolean;
+    replyTargetId: string | undefined;
     selectedId: string | undefined;
     confirmDeleteId: string | undefined;
     renameDraft: { sessionId: string; text: string } | undefined;
@@ -532,6 +593,7 @@ export class AgentsViewController {
       flashMessage: view.flashMessage,
       dispatchFocused: view.dispatchFocused,
       dispatchEditor: view.dispatch.editor,
+      replyTargetId: view.replyTargetId,
       ...this.buildCallbacks(),
     };
   }
@@ -568,6 +630,8 @@ export class AgentsViewController {
     | 'onRenameBegin'
     | 'onRenameSubmit'
     | 'onPinToggle'
+    | 'onReplyRequest'
+    | 'onReorderPinned'
     | 'onHelpToggle'
     | 'onQuit'
     | 'onDispatchFocusChange'
@@ -647,6 +711,26 @@ export class AgentsViewController {
         if (view === undefined) return;
         this.clearConfirm(view);
         void this.handlePinToggle(id);
+      },
+      onReplyRequest: (id) => {
+        const view = this.host.state.agentsView;
+        if (view === undefined) return;
+        this.clearConfirm(view);
+        const row = view.roster.get(id);
+        if (row === undefined) return;
+        view.replyTargetId = id;
+        view.dispatchFocused = true;
+        view.dispatch.editor.focused = true;
+        view.dispatch.editor.setPlaceholder(`reply to ${rosterRowName(row)}`);
+        this.pushProps();
+      },
+      onReorderPinned: (id, delta) => {
+        const view = this.host.state.agentsView;
+        if (view === undefined) return;
+        this.clearConfirm(view);
+        view.roster.reorderPinned(id, delta);
+        this.pushProps();
+        void this.persistState(view);
       },
       onHelpToggle: () => {
         const view = this.host.state.agentsView;

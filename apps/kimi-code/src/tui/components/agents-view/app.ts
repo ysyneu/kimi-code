@@ -30,6 +30,14 @@
  *   EMPTY, once it holds text every printable char belongs to it.
  * - Open: Enter and → both fire `onOpen` on a row — opening always hands
  *   off to the session's own full-screen chat, never an in-view detail.
+ * - Reply mode: `space` on a row fires `onReplyRequest`, which the
+ *   controller answers by setting `replyTargetId` AND `dispatchFocused`
+ *   together (this component never mounts a second composer — reply
+ *   reuses `dispatchEditor`, only its target and placeholder differ).
+ *   `onOpen`/submit/Esc are the controller's job to unwind that pairing.
+ * - Reorder: `shift+↑↓` fires `onReorderPinned` only for a PINNED row;
+ *   the callback is a no-op signal for anything else, so the controller
+ *   need not re-check `pinned` itself.
  */
 
 import {
@@ -68,6 +76,14 @@ export interface AgentsViewProps {
   readonly dispatchFocused: boolean;
   /** The assembled dispatch editor (controller-owned); rendered into the bottom box. */
   readonly dispatchEditor: CustomEditor;
+  /**
+   * Set while the composer targets an EXISTING session (space on a row)
+   * instead of a new one — always paired with `dispatchFocused === true`,
+   * cleared together by the controller on submit/Esc. Only read here to
+   * pick the reply-vs-dispatch footer copy; the placeholder swap itself is
+   * a controller-owned side effect on `dispatchEditor`, not a render path.
+   */
+  readonly replyTargetId: string | undefined;
   onSelect(id: string): void;
   onOpen(id: string): void;
   onDeleteRequest(id: string): void;
@@ -75,6 +91,10 @@ export interface AgentsViewProps {
   onRenameBegin(id: string): void;
   onRenameSubmit(id: string, text: string): void;
   onPinToggle(id: string): void;
+  /** `space` on a session row: enter reply mode targeting that session. No-op on anything else (the caller only invokes this for a `row`-kind selection). */
+  onReplyRequest(id: string): void;
+  /** `shift+↑↓` on a PINNED row: reorder it within the pins array. No-op on a non-pinned row (the caller only invokes this for a pinned `row`-kind selection). */
+  onReorderPinned(id: string, delta: -1 | 1): void;
   onHelpToggle(): void;
   onQuit(): void;
   onDispatchFocusChange(focused: boolean): void;
@@ -119,26 +139,37 @@ interface RenameState {
 /**
  * `?` help overlay: a 2-row key/hint grid replacing the single-line footer
  * (the roster list itself stays visible and scrollable behind it — see
- * `render`). Column-aligned per row; `undefined` is a blank cell. Only keys
- * that exist today — the reorder / switch-views / mention / quick-open keys
- * from the Claude Code reference are a later task's addition.
+ * `render`). Column-aligned per row; `undefined` is a blank cell.
+ *
+ * `ctrl+s to switch views` is in Claude Code's own reference grid, but its
+ * interaction was never observable read-only (no second view mode exists
+ * to switch to here) — deliberately absent, not a gap. Every other cell
+ * from the reference grid is present.
  */
 type HelpCell = readonly [key: string, hint: string];
 
 const HELP_GRID: readonly (readonly (HelpCell | undefined)[])[] = [
   [
     ['↑↓', 'to select'],
-    ['ctrl+r', 'to rename'],
-    ['ctrl+t', 'to pin/unpin'],
+    ['shift+↑↓', 'to reorder'],
+    ['alt+1-9', 'to open'],
+    ['space', 'to reply'],
+    ['@', 'to mention'],
     ['esc', 'to quit'],
   ],
   [
+    ['ctrl+r', 'to rename'],
+    ['ctrl+t', 'to pin/unpin'],
     ['ctrl+j', 'for newline'],
     ['ctrl+x', 'to delete'],
     undefined,
     ['?', 'to close'],
   ],
 ];
+
+/** alt+1..9 quick-open key literals — `Key.alt` needs a `Digit`-typed
+ *  argument, so this stays a typed tuple rather than a plain string loop. */
+const ALT_QUICK_OPEN_DIGITS = ['1', '2', '3', '4', '5', '6', '7', '8', '9'] as const;
 
 export class AgentsViewApp extends Container implements Focusable {
   focused = false;
@@ -295,6 +326,29 @@ export class AgentsViewApp extends Container implements Focusable {
       return;
     }
 
+    // shift+↑↓: reorder a PINNED row within the pins array. No-op (but
+    // still consumed — never falls through to plain arrow navigation) on
+    // any other selection: non-pinned rows sort by recency/status, where
+    // manual reordering has no meaning.
+    if (matchesKey(data, Key.shift(Key.up)) || matchesKey(data, Key.shift(Key.down))) {
+      const delta = matchesKey(data, Key.shift(Key.up)) ? -1 : 1;
+      const item = this.deriveItems()[this.selectedIndex];
+      if (item !== undefined && item.kind === 'row' && item.row?.pinned === true) {
+        this.props.onReorderPinned(item.id, delta);
+      }
+      return;
+    }
+
+    // alt+1..9: open the Nth visible session row (same effect as Enter).
+    // Checked before plain navigation since it's a global shortcut, not
+    // gated by the current selection.
+    for (const digit of ALT_QUICK_OPEN_DIGITS) {
+      if (matchesKey(data, Key.alt(digit))) {
+        this.openNthRow(Number(digit));
+        return;
+      }
+    }
+
     if (matchesKey(data, Key.up)) {
       this.moveSelection(-1);
       return;
@@ -344,6 +398,13 @@ export class AgentsViewApp extends Container implements Focusable {
         if (item.kind === 'row') this.props.onPinToggle(item.id);
         return;
       }
+      // space: reply to a selected ROW; on a group header it is deliberately
+      // NOT consumed here — falls through to the printable-dispatch
+      // fallback below, same as today (space types into the composer).
+      if ((matchesKey(data, Key.space) || k === ' ') && item.kind === 'row') {
+        this.props.onReplyRequest(item.id);
+        return;
+      }
     }
 
     // Empty editor, no shortcut matched: start typing a dispatch.
@@ -371,6 +432,25 @@ export class AgentsViewApp extends Container implements Focusable {
     this.selectedIndex = next;
     this.props.onSelect(items[this.selectedIndex]?.id ?? '');
     this.invalidate();
+  }
+
+  /**
+   * alt+1..9: opens the Nth session ROW in the current visible-item order
+   * (group headers, spacers and the collapsed "more" row do not count).
+   * Same effect as Enter on that row (`onOpen`). `n` beyond the row count
+   * is a no-op — no number badges are rendered (Claude's own view shows
+   * none either, per the parity spec).
+   */
+  private openNthRow(n: number): void {
+    let count = 0;
+    for (const item of this.deriveItems()) {
+      if (item.kind !== 'row') continue;
+      count += 1;
+      if (count === n) {
+        this.props.onOpen(item.id);
+        return;
+      }
+    }
   }
 
   // ── render ───────────────────────────────────────────────────────────
@@ -541,7 +621,10 @@ export class AgentsViewApp extends Container implements Focusable {
     if (this.draftFor(this.props.renameDraft?.sessionId ?? this.rename?.id ?? '') !== undefined) {
       left = compose(hint('enter', 'to submit'), hint('esc', 'to cancel'));
     } else if (this.props.dispatchFocused) {
-      left = compose(hint('enter', 'to dispatch'), hint('esc', 'to back to list'));
+      left =
+        this.props.replyTargetId !== undefined
+          ? compose(hint('enter', 'to send'), hint('esc', 'to cancel'))
+          : compose(hint('enter', 'to dispatch'), hint('esc', 'to back to list'));
     } else if (this.props.confirmDeleteId !== undefined) {
       left = compose(
         currentTheme.boldFg('warning', this.deleteConfirmCopy(this.props.confirmDeleteId)),
@@ -557,7 +640,12 @@ export class AgentsViewApp extends Container implements Focusable {
       } else if (item.kind === 'more') {
         left = compose(hint('enter', 'to expand'), hint('?', 'for shortcuts'));
       } else {
-        left = compose(hint('enter', 'to open'), hint('ctrl+x', 'to delete'), hint('?', 'for shortcuts'));
+        left = compose(
+          hint('enter', 'to open'),
+          hint('space', 'to reply'),
+          hint('ctrl+x', 'to delete'),
+          hint('?', 'for shortcuts'),
+        );
       }
     }
 
