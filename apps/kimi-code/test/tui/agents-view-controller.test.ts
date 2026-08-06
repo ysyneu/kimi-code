@@ -841,6 +841,27 @@ describe('AgentsViewController — open', () => {
     expect(b.render()).toContain('s1 title');
   });
 
+  it('collapsing a group header through the real buildProps chain shows its hidden count on the same line, expanding drops it again', async () => {
+    // Same round trip as above, but asserts on the count — driven through
+    // the actual controller (buildProps → renderItem → renderGroupHeader),
+    // not a hand-built AgentsGroup fixture like the component-level test.
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+
+    b.component().handleInput(ENTER); // collapse
+    const collapsedLines = b.render().split('\n');
+    const collapsedHeaderIdx = collapsedLines.findIndex((l) => l.includes('Completed'));
+    expect(collapsedLines[collapsedHeaderIdx]).toContain('Completed (1)');
+    // The count must land on the header's own line, never wrapped onto the
+    // next one.
+    expect(collapsedLines[collapsedHeaderIdx + 1]?.trim()).not.toMatch(/^\d/);
+
+    b.component().handleInput(ENTER); // re-expand
+    const expandedLines = b.render().split('\n');
+    const expandedHeaderIdx = expandedLines.findIndex((l) => l.includes('Completed'));
+    expect(expandedLines[expandedHeaderIdx]).not.toContain('(1)');
+  });
+
   it('Enter on the more row expands the completed group', async () => {
     const rows = Array.from({ length: 12 }, (_, i) =>
       summary(`s${String(i)}`, { updatedAt: 1_000 + i }),
