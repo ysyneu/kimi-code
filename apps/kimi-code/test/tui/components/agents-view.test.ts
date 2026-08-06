@@ -39,7 +39,7 @@ function fakeTerminal(rows: number, columns = 120): Terminal {
 }
 
 const GROUP_LABELS: Record<AgentsGroupId, string> = {
-  awaiting: 'Awaiting input',
+  awaiting: 'Needs input',
   working: 'Working',
   pinned: 'Pinned',
   completed: 'Completed',
@@ -54,6 +54,7 @@ function row(id: string, overrides: Partial<AgentsRosterRow> = {}): AgentsRoster
     busy: false,
     pendingInteraction: 'none',
     pinned: false,
+    unseen: false,
     ...overrides,
   };
 }
@@ -144,7 +145,7 @@ describe('AgentsViewApp — full-screen rendering', () => {
         ],
       }),
     );
-    const awaitingHeader = out.indexOf('Awaiting input');
+    const awaitingHeader = out.indexOf('Needs input');
     const workingHeader = out.indexOf('Working');
     const completedHeader = out.indexOf('Completed');
     expect(awaitingHeader).toBeGreaterThan(-1);
@@ -165,7 +166,7 @@ describe('AgentsViewApp — full-screen rendering', () => {
       ],
     });
     const lines = app.render(120).map(strip);
-    const awaitingHeaderIdx = lines.findIndex((l) => l.includes('Awaiting input'));
+    const awaitingHeaderIdx = lines.findIndex((l) => l.includes('Needs input'));
     const workingHeaderIdx = lines.findIndex((l) => l.includes('Working'));
     // The line right above the second group's header is a blank spacer.
     expect(lines[workingHeaderIdx - 1]?.trim()).toBe('');
@@ -174,7 +175,7 @@ describe('AgentsViewApp — full-screen rendering', () => {
     expect(lines[awaitingHeaderIdx - 1]).toContain('KIMI AGENTS');
   });
 
-  it('renders the awaiting marker and untrusted badge on rows, without the cwd', () => {
+  it('renders the untrusted badge on rows, without the cwd', () => {
     const out = render(
       makeApp({
         groups: [
@@ -184,7 +185,6 @@ describe('AgentsViewApp — full-screen rendering', () => {
         ],
       }),
     );
-    expect(out).toContain('!');
     expect(out).not.toContain('secretproj');
     expect(out).toContain('untrusted');
   });
@@ -281,13 +281,22 @@ describe('AgentsViewApp — full-screen rendering', () => {
     expect(out).toContain('summarize the logs');
   });
 
-  it('a failed last turn renders the ✗ marker', () => {
-    const out = render(
+  it('a failed last turn renders the same seen/unseen glyph as any other idle row — no ✗ marker', () => {
+    const seen = render(
       makeApp({
-        groups: [group('completed', [row('s1', { lastTurnReason: 'failed' })])],
+        groups: [group('completed', [row('s1', { lastTurnReason: 'failed', unseen: false })])],
       }),
     );
-    expect(out).toContain('✗');
+    expect(seen).not.toContain('✗');
+    expect(seen).toContain('∙');
+
+    const unseen = render(
+      makeApp({
+        groups: [group('completed', [row('s1', { lastTurnReason: 'failed', unseen: true })])],
+      }),
+    );
+    expect(unseen).not.toContain('✗');
+    expect(unseen).toContain('✻');
   });
 
   it('renders flash messages in the footer', () => {

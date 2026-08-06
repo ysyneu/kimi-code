@@ -253,7 +253,7 @@ describe('AgentsRoster', () => {
     expect(groupRows(roster, 'pinned').map((row) => row.id)).toEqual(['p2', 'p3']);
 
     roster.applyEvent(workChanged('p2', { busy: true, pending_interaction: 'question' }));
-    expect(groupIds(roster)).toEqual(['awaiting', 'working', 'pinned', 'completed']);
+    expect(groupIds(roster)).toEqual(['pinned', 'awaiting', 'working', 'completed']);
     expect(groupRows(roster, 'awaiting').map((row) => row.id)).toEqual(['p2']);
   });
 
@@ -333,48 +333,162 @@ describe('agents view state persistence', () => {
   });
 
   it('saveAgentsViewState / loadAgentsViewState round-trips pins and the view-session registry', async () => {
-    await saveAgentsViewState(dir, { pins: new Set(['a', 'b']), sessions: new Set(['s1']) });
+    await saveAgentsViewState(dir, { pins: new Set(['a', 'b']), sessions: new Set(['s1']), seenAt: new Map() });
 
     const raw = JSON.parse(await readFile(join(dir, 'agents-view.json'), 'utf-8')) as unknown;
     expect(raw).toEqual({
       pins: expect.arrayContaining(['a', 'b']),
       sessions: expect.arrayContaining(['s1']),
+      seen: {},
     });
 
     const loaded = await loadAgentsViewState(dir);
     expect([...loaded.pins].toSorted()).toEqual(['a', 'b']);
     expect([...loaded.sessions].toSorted()).toEqual(['s1']);
+    expect(loaded.seenAt).toEqual(new Map());
+  });
+
+  it('saveAgentsViewState / loadAgentsViewState round-trips the seenAt map', async () => {
+    await saveAgentsViewState(dir, {
+      pins: new Set(),
+      sessions: new Set(['s1', 's2']),
+      seenAt: new Map([
+        ['s1', 1_000],
+        ['s2', 2_000],
+      ]),
+    });
+
+    const raw = JSON.parse(await readFile(join(dir, 'agents-view.json'), 'utf-8')) as unknown;
+    expect(raw).toEqual({
+      pins: [],
+      sessions: expect.arrayContaining(['s1', 's2']),
+      seen: { s1: 1_000, s2: 2_000 },
+    });
+
+    const loaded = await loadAgentsViewState(dir);
+    expect(loaded.seenAt).toEqual(
+      new Map([
+        ['s1', 1_000],
+        ['s2', 2_000],
+      ]),
+    );
   });
 
   it('loadAgentsViewState returns empty sets when the file is missing', async () => {
     const loaded = await loadAgentsViewState(dir);
     expect(loaded.pins).toEqual(new Set());
     expect(loaded.sessions).toEqual(new Set());
+    expect(loaded.seenAt).toEqual(new Map());
   });
 
   it('loadAgentsViewState returns empty sets for corrupt JSON or a wrong shape', async () => {
     await writeFile(join(dir, 'agents-view.json'), '{ not json', 'utf-8');
-    expect(await loadAgentsViewState(dir)).toEqual({ pins: new Set(), sessions: new Set() });
+    expect(await loadAgentsViewState(dir)).toEqual({ pins: new Set(), sessions: new Set(), seenAt: new Map() });
 
     await writeFile(join(dir, 'agents-view.json'), JSON.stringify({ pins: 'a', sessions: 1 }), 'utf-8');
-    expect(await loadAgentsViewState(dir)).toEqual({ pins: new Set(), sessions: new Set() });
+    expect(await loadAgentsViewState(dir)).toEqual({ pins: new Set(), sessions: new Set(), seenAt: new Map() });
+
+    await writeFile(join(dir, 'agents-view.json'), JSON.stringify({ pins: [], sessions: [], seen: 'nope' }), 'utf-8');
+    expect((await loadAgentsViewState(dir)).seenAt).toEqual(new Map());
+
+    await writeFile(
+      join(dir, 'agents-view.json'),
+      JSON.stringify({ pins: [], sessions: [], seen: { a: 'not-a-number', b: 5 } }),
+      'utf-8',
+    );
+    expect((await loadAgentsViewState(dir)).seenAt).toEqual(new Map([['b', 5]]));
   });
 
-  it('loadAgentsViewState reads a legacy pins-only file with an empty registry', async () => {
+  it('loadAgentsViewState reads a legacy pins-only file with an empty registry and no seenAt', async () => {
     await writeFile(join(dir, 'agents-view.json'), JSON.stringify({ pins: ['a'] }), 'utf-8');
     const loaded = await loadAgentsViewState(dir);
     expect([...loaded.pins]).toEqual(['a']);
     expect(loaded.sessions).toEqual(new Set());
+    expect(loaded.seenAt).toEqual(new Map());
+  });
+
+  it('a file written by this version still round-trips pins/sessions once seen is ignored by an older reader', async () => {
+    // Backward-compat in the other direction: readIdSet only ever reads the
+    // 'pins'/'sessions' keys, so the additive 'seen' key never interferes.
+    await saveAgentsViewState(dir, { pins: new Set(['a']), sessions: new Set(['s1']), seenAt: new Map([['s1', 42]]) });
+    const raw = JSON.parse(await readFile(join(dir, 'agents-view.json'), 'utf-8')) as Record<string, unknown>;
+    expect(Object.keys(raw).toSorted()).toEqual(['pins', 'seen', 'sessions']);
   });
 
   it('saveAgentsViewState leaves no tmp files behind', async () => {
-    await saveAgentsViewState(dir, { pins: new Set(['a']), sessions: new Set() });
-    await saveAgentsViewState(dir, { pins: new Set(['a', 'b']), sessions: new Set(['s1']) });
+    await saveAgentsViewState(dir, { pins: new Set(['a']), sessions: new Set(), seenAt: new Map() });
+    await saveAgentsViewState(dir, { pins: new Set(['a', 'b']), sessions: new Set(['s1']), seenAt: new Map([['s1', 5]]) });
     const loaded = await loadAgentsViewState(dir);
     expect(loaded.pins).toEqual(new Set(['a', 'b']));
     expect(loaded.sessions).toEqual(new Set(['s1']));
+    expect(loaded.seenAt).toEqual(new Map([['s1', 5]]));
     const files = await readdir(dir);
     expect(files).toEqual(['agents-view.json']);
+  });
+});
+
+describe('AgentsRoster — unseen bit', () => {
+  it('a row with no seenAt entry starts unseen', () => {
+    const roster = new AgentsRoster(new Set());
+    roster.setAll([summary('a', { updatedAt: 1_000 })]);
+    expect(roster.get('a')?.unseen).toBe(true);
+  });
+
+  it('a row seeded with a seenAt at or after its updatedAt starts seen', () => {
+    const roster = new AgentsRoster(new Set(), new Map([['a', 1_000]]));
+    roster.setAll([summary('a', { updatedAt: 1_000 })]);
+    expect(roster.get('a')?.unseen).toBe(false);
+  });
+
+  it('markSeen clears unseen and records the row updatedAt', () => {
+    const roster = new AgentsRoster(new Set());
+    roster.setAll([summary('a', { updatedAt: 1_000 })]);
+    expect(roster.get('a')?.unseen).toBe(true);
+
+    roster.markSeen('a');
+    expect(roster.get('a')?.unseen).toBe(false);
+  });
+
+  it('markSeen on an unknown id is a no-op', () => {
+    const roster = new AgentsRoster(new Set());
+    roster.setAll([summary('a')]);
+    expect(() => {
+      roster.markSeen('missing');
+    }).not.toThrow();
+  });
+
+  it('a new event after markSeen flips the row back to unseen', () => {
+    const roster = new AgentsRoster(new Set());
+    roster.setAll([summary('a', { updatedAt: 1_000 })]);
+    roster.markSeen('a');
+    expect(roster.get('a')?.unseen).toBe(false);
+
+    roster.applyEvent(metaUpdated('a', { title: 'server renamed it' }));
+    expect(roster.get('a')?.unseen).toBe(true);
+  });
+
+  it('work_changed after markSeen also flips the row back to unseen', () => {
+    const roster = new AgentsRoster(new Set());
+    roster.setAll([summary('a', { updatedAt: 1_000 })]);
+    roster.markSeen('a');
+
+    roster.applyEvent(workChanged('a', { busy: true }));
+    expect(roster.get('a')?.unseen).toBe(true);
+  });
+
+  it('a freshly created session starts unseen', () => {
+    const roster = new AgentsRoster(new Set());
+    roster.setAll([summary('a')]);
+    roster.applyEvent(sessionCreated('b'));
+    expect(roster.get('b')?.unseen).toBe(true);
+  });
+
+  it('the seenAt map handed to the constructor is mutated in place by markSeen (persistable by reference)', () => {
+    const seenAt = new Map<string, number>();
+    const roster = new AgentsRoster(new Set(), seenAt);
+    roster.setAll([summary('a', { updatedAt: 1_000 })]);
+    roster.markSeen('a');
+    expect(seenAt.get('a')).toBe(1_000);
   });
 });
 

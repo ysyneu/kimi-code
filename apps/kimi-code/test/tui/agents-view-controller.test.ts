@@ -283,6 +283,7 @@ async function boot(
   await saveAgentsViewState(homeDir, {
     pins: new Set(),
     sessions: new Set(opts.registered ?? summaries.map((s) => s.id)),
+    seenAt: new Map(),
   });
   await controller.show();
   return {
@@ -721,6 +722,22 @@ describe('AgentsViewController — open', () => {
     b.component().handleInput(ENTER);
     expect(onOpenSession).toHaveBeenCalledWith('s1');
     expect(b.showStatus).not.toHaveBeenCalled();
+  });
+
+  it('Enter on a row clears its unseen bit and persists the seen timestamp', async () => {
+    const onOpenSession = vi.fn();
+    const b = await boot([summary('s1', { updatedAt: 1_000 })], { onOpenSession });
+    dir = b.homeDir;
+    expect(b.view().roster.get('s1')?.unseen).toBe(true);
+
+    b.component().handleInput(DOWN);
+    b.component().handleInput(ENTER);
+
+    expect(b.view().roster.get('s1')?.unseen).toBe(false);
+    await vi.waitFor(async () => {
+      const state = await loadAgentsViewState(b.homeDir);
+      expect(state.seenAt).toEqual(new Map([['s1', 1_000]]));
+    });
   });
 
   it('Enter on a group header collapses and re-expands its rows', async () => {
@@ -1413,7 +1430,7 @@ describe('AgentsViewController — wire row seeding (I1)', () => {
     expect(b.view().roster.get('s1')?.busy).toBe(true);
     expect(b.view().roster.get('s2')?.pendingInteraction).toBe('approval');
     const out = b.render();
-    expect(out).toContain('Awaiting input');
+    expect(out).toContain('Needs input');
     expect(out).toContain('Working');
     expect(out).toContain('1 awaiting input');
     expect(out).toContain('1 working');

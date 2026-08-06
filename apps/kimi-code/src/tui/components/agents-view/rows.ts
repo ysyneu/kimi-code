@@ -13,8 +13,32 @@ import { currentTheme } from '#/tui/theme';
 
 const ELLIPSIS = '…';
 
-/** Braille frames for the working spinner; advances whenever a render lands. */
-const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/** Fixed left-aligned width of the name column (see `renderRosterRow`). */
+const NAME_WIDTH = 42;
+
+/** Idle-row glyphs: has new output since last viewed vs. already seen. */
+const TEARDROP_ASTERISK = '✻';
+const BULLET_OPERATOR = '∙';
+
+/**
+ * Busy-row spinner charset: an asterisk bloom rather than a braille dial.
+ * `platform` is injectable for tests; production calls always default to
+ * `process.platform`. macOS terminals render the fifth glyph as its own
+ * asterisk; other platforms substitute a plain `*` there.
+ */
+export function spinnerFrames(platform: NodeJS.Platform = process.platform): readonly string[] {
+  const charset = platform === 'darwin' ? ['·', '✢', '✳', '✶', '✻', '✽'] : ['·', '✢', '*', '✶', '✻', '✽'];
+  // Ping-pong: forward through the charset, then back — a 12-frame bounce.
+  return [...charset, ...charset.toReversed()];
+}
+
+const SPINNER_FRAME_MS = 120;
+
+function spinnerFrame(nowMs: number): string {
+  const frames = spinnerFrames();
+  const index = Math.floor(nowMs / SPINNER_FRAME_MS) % frames.length;
+  return frames[index] ?? frames[0]!;
+}
 
 export function padToWidth(line: string, width: number): string {
   const w = visibleWidth(line);
@@ -50,19 +74,17 @@ function pointer(selected: boolean): string {
   return currentTheme.fg(selected ? 'primary' : 'textDim', selected ? `${SELECT_POINTER} ` : '  ');
 }
 
-type StatusColor = 'warning' | 'success' | 'textMuted' | 'error';
+type StatusColor = 'success' | 'textMuted';
 
+/**
+ * Busy rows show the ping-pong spinner. Idle rows carry an orthogonal
+ * "unseen" bit — independent of group/busy/last-turn-reason — that flips to
+ * the bullet the moment the row is opened (`AgentsRoster.markSeen`).
+ */
 function statusSymbol(row: AgentsRosterRow): { glyph: string; color: StatusColor } {
-  if (row.pendingInteraction !== 'none') return { glyph: '!', color: 'warning' };
-  if (row.busy) {
-    const frame = Math.floor(Date.now() / 120) % SPINNER_FRAMES.length;
-    return { glyph: SPINNER_FRAMES[frame] ?? '⠋', color: 'success' };
-  }
-  if (row.lastTurnReason === 'failed' || row.lastTurnReason === 'cancelled') {
-    return { glyph: '✗', color: 'error' };
-  }
-  if (row.lastTurnReason === 'completed') return { glyph: '✻', color: 'textMuted' };
-  return { glyph: '∙', color: 'textMuted' };
+  if (row.busy) return { glyph: spinnerFrame(Date.now()), color: 'success' };
+  if (row.unseen) return { glyph: TEARDROP_ASTERISK, color: 'textMuted' };
+  return { glyph: BULLET_OPERATOR, color: 'textMuted' };
 }
 
 /**
@@ -81,45 +103,86 @@ function summaryText(row: AgentsRosterRow, name: string): string {
 }
 
 /**
- * `<ptr><symbol> <name> <assistant summary> <relative time> [untrusted]`.
+ * `<ptr><symbol> <name padded/truncated to 42 cols><summary><meta>`.
+ *
+ * Three independently-fitted zones, in this order:
+ * - `name`: fixed 42-column left-aligned slot, space-padded or
+ *   ellipsis-truncated — never affected by how long the summary or meta is.
+ * - `summary` (the assistant reply / fallback prompt): fills whatever space
+ *   remains between the name and the reserved meta zone, itself
+ *   ellipsis-truncated when it doesn't fit.
+ * - `meta` (untrusted badge + relative time): right-flush to the row's last
+ *   column, reserved ahead of the summary budget so it never truncates —
+ *   a long summary only ever eats into its own space.
  *
  * One name per row: the server auto-titles a session with its first prompt
  * verbatim, so rendering `lastPrompt` next to the title reads as the same
  * message twice. The title wins; the prompt is only the untitled fallback.
- * No cwd — the row's elements are name, assistant summary, and time.
+ * No cwd — the row's elements are name, assistant summary, and meta.
  */
 export function renderRosterRow(row: AgentsRosterRow, selected: boolean, width: number): string {
   const symbol = statusSymbol(row);
   const name = singleLine(row.title) || singleLine(row.lastPrompt ?? '') || '(untitled)';
-  const prefix =
-    pointer(selected) +
-    currentTheme.fg(symbol.color, symbol.glyph) +
-    ' ' +
-    (selected ? currentTheme.boldFg('textStrong', name) : currentTheme.fg('text', name));
+  const prefix = pointer(selected) + currentTheme.fg(symbol.color, symbol.glyph) + ' ';
+  const prefixWidth = visibleWidth(prefix);
+
+  const styledName = selected ? currentTheme.boldFg('textStrong', name) : currentTheme.fg('text', name);
+  const nameSlot = truncateToWidth(styledName, NAME_WIDTH, ELLIPSIS, true);
+
+  const metaBudget = Math.max(0, width - prefixWidth - NAME_WIDTH);
+  const metaParts = reservedMetaParts(row, metaBudget);
+  const metaText = metaParts.join(' · ');
+  const metaWidth = metaText.length > 0 ? 1 + visibleWidth(metaText) : 0;
+  const metaSegment = metaText.length > 0 ? currentTheme.fg('textMuted', ` ${metaText}`) : '';
 
   const summary = summaryText(row, name);
-  const summarySuffix = summary.length > 0 ? currentTheme.fg('textMuted', ` ${summary}`) : '';
+  const summaryBudget = Math.max(0, width - prefixWidth - NAME_WIDTH - metaWidth);
+  const summarySegment =
+    summary.length > 0 && summaryBudget > 1
+      ? currentTheme.fg('textMuted', ` ${truncateToWidth(summary, summaryBudget - 1, ELLIPSIS)}`)
+      : '';
 
-  const metaParts: string[] = [];
-  const rel = formatRelativeTime(row.updatedAt);
-  if (rel.length > 0) metaParts.push(rel);
-  if (row.trusted === false) metaParts.push('untrusted');
-  const metaSuffix = metaParts.length > 0 ? currentTheme.fg('textMuted', ` ${metaParts.join(' · ')}`) : '';
-
-  return fitExactly(prefix + summarySuffix + metaSuffix, width);
+  const left = prefix + nameSlot + summarySegment;
+  const fillWidth = Math.max(0, width - visibleWidth(left) - metaWidth);
+  // The 42-col name slot is fixed regardless of `width`; fitExactly is a
+  // last-resort safety net for terminals narrower than prefix+name (46
+  // cols) can hold — below the app's own minimum width, in practice.
+  return fitExactly(left + ' '.repeat(fillWidth) + metaSegment, width);
 }
 
-/** Group header line: `<ptr><label> (N)`. */
+/**
+ * Picks the richest meta content (untrusted badge + relative time) that
+ * fits in `budget` columns. The relative time is the element the parity
+ * spec calls out as never-truncating; the untrusted badge is what a narrow
+ * terminal loses first so the time keeps its guarantee as long as possible.
+ */
+function reservedMetaParts(row: AgentsRosterRow, budget: number): string[] {
+  const time = formatRelativeTime(row.updatedAt);
+  const badge = row.trusted === false ? 'untrusted' : '';
+  const widthOf = (parts: readonly string[]): number => {
+    const text = parts.join(' · ');
+    return text.length > 0 ? 1 + visibleWidth(text) : 0;
+  };
+  if (badge.length > 0 && time.length > 0) {
+    const both = [badge, time];
+    if (widthOf(both) <= budget) return both;
+  }
+  if (time.length > 0 && widthOf([time]) <= budget) return [time];
+  return [];
+}
+
+/**
+ * Group header line: `<ptr><label>` — counts live only in the top summary
+ * line, not the group heading. `count` is kept in the signature for call-site
+ * stability even though the label itself no longer renders it.
+ */
 export function renderGroupHeader(
   label: string,
   count: number,
   selected: boolean,
   width: number,
 ): string {
-  const line =
-    pointer(selected) +
-    currentTheme.boldFg('textStrong', label) +
-    currentTheme.fg('textMuted', ` (${String(count)})`);
+  const line = pointer(selected) + currentTheme.boldFg('textStrong', label);
   return fitExactly(line, width);
 }
 

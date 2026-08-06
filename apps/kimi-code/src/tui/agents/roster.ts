@@ -12,6 +12,12 @@ export interface AgentsRosterRow {
   readonly lastTurnReason?: 'completed' | 'cancelled' | 'failed';
   readonly pinned: boolean;
   readonly trusted?: boolean;
+  /**
+   * Has new output since the row was last opened/attached — orthogonal to
+   * `busy`/`pendingInteraction`/group membership. Derived from comparing
+   * `updatedAt` against the roster's `seenAt` map; cleared by `markSeen`.
+   */
+  readonly unseen: boolean;
 }
 
 export type AgentsGroupId = 'awaiting' | 'working' | 'pinned' | 'completed';
@@ -30,12 +36,12 @@ export interface AgentsRosterCounts {
 
 type MutableRow = { -readonly [K in keyof AgentsRosterRow]: AgentsRosterRow[K] };
 
-const GROUP_ORDER: readonly AgentsGroupId[] = ['awaiting', 'working', 'pinned', 'completed'];
+const GROUP_ORDER: readonly AgentsGroupId[] = ['pinned', 'awaiting', 'working', 'completed'];
 
 const GROUP_LABELS: Record<AgentsGroupId, string> = {
-  awaiting: 'Awaiting input',
-  working: 'Working',
   pinned: 'Pinned',
+  awaiting: 'Needs input',
+  working: 'Working',
   completed: 'Completed',
 };
 
@@ -58,14 +64,29 @@ function groupOf(row: AgentsRosterRow): AgentsGroupId {
  *
  * The roster mutates the pins set handed to the constructor (it is the same
  * `Set` `loadPins` returned), so the controller can persist that same set
- * after every `setPinned`.
+ * after every `setPinned`. `seenAt` is mutated the same way for `markSeen`.
  */
 export class AgentsRoster {
   private readonly rows = new Map<string, MutableRow>();
   private readonly pins: Set<string>;
+  private readonly seenAt: Map<string, number>;
 
-  constructor(pins: ReadonlySet<string>) {
+  constructor(pins: ReadonlySet<string>, seenAt: ReadonlyMap<string, number> = new Map()) {
     this.pins = pins as Set<string>;
+    this.seenAt = seenAt as Map<string, number>;
+  }
+
+  /** unseen = the row's latest activity is newer than the last time it was opened. */
+  private isUnseen(id: string, updatedAt: number): boolean {
+    return updatedAt > (this.seenAt.get(id) ?? -Infinity);
+  }
+
+  /** Clears the unseen bit for `id` and records the moment it was viewed. */
+  markSeen(id: string): void {
+    const row = this.rows.get(id);
+    if (row === undefined) return;
+    this.seenAt.set(id, row.updatedAt);
+    row.unseen = false;
   }
 
   setAll(summaries: readonly SessionSummary[]): void {
@@ -82,6 +103,7 @@ export class AgentsRoster {
         busy: false,
         pendingInteraction: 'none',
         pinned: this.pins.has(session.id),
+        unseen: this.isUnseen(session.id, session.updatedAt),
       });
     }
   }
@@ -102,18 +124,20 @@ export class AgentsRoster {
     this.rows.clear();
     for (const session of rows) {
       if (session.archived === true) continue;
+      const updatedAt = Date.parse(session.updated_at);
       this.rows.set(session.id, {
         id: session.id,
         title: session.title,
         lastPrompt: session.last_prompt,
         lastAssistantText: session.last_assistant_text,
         workDir: session.metadata.cwd,
-        updatedAt: Date.parse(session.updated_at),
+        updatedAt,
         busy: session.busy,
         pendingInteraction: session.pending_interaction ?? 'none',
         lastTurnReason: session.last_turn_reason,
         pinned: this.pins.has(session.id),
         trusted: trusted.get(session.id),
+        unseen: this.isUnseen(session.id, updatedAt),
       });
     }
   }
@@ -132,6 +156,7 @@ export class AgentsRoster {
           row.lastAssistantText = patch['lastAssistantText'];
         }
         row.updatedAt = Date.now();
+        row.unseen = this.isUnseen(row.id, row.updatedAt);
         return;
       }
       case 'event.session.work_changed': {
@@ -141,21 +166,24 @@ export class AgentsRoster {
         row.pendingInteraction = event.pending_interaction ?? 'none';
         if (event.last_turn_reason !== undefined) row.lastTurnReason = event.last_turn_reason;
         row.updatedAt = Date.now();
+        row.unseen = this.isUnseen(row.id, row.updatedAt);
         return;
       }
       case 'event.session.created': {
         const session = event.session;
+        const updatedAt = Date.parse(session.updated_at);
         this.rows.set(session.id, {
           id: session.id,
           title: session.title,
           lastPrompt: session.last_prompt,
           lastAssistantText: session.last_assistant_text,
           workDir: session.metadata.cwd,
-          updatedAt: Date.parse(session.updated_at),
+          updatedAt,
           busy: session.busy,
           pendingInteraction: session.pending_interaction ?? 'none',
           lastTurnReason: session.last_turn_reason,
           pinned: this.pins.has(session.id),
+          unseen: this.isUnseen(session.id, updatedAt),
         });
         return;
       }

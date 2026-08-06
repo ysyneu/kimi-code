@@ -64,6 +64,8 @@ export interface AgentsViewState {
    * every mutation.
    */
   viewSessions: Set<string>;
+  /** The same Map the roster mutates in place via `markSeen`; persisted alongside pins. */
+  seenAt: Map<string, number>;
   dispatch: AgentsViewDispatch;
   /**
    * True while the user is attached to a session: the component is unmounted
@@ -189,9 +191,9 @@ export class AgentsViewController {
       return;
     }
     if (state.agentsView !== undefined) return;
-    const { pins, sessions: viewSessions } = persisted;
+    const { pins, sessions: viewSessions, seenAt } = persisted;
 
-    const roster = new AgentsRoster(pins);
+    const roster = new AgentsRoster(pins, seenAt);
     if (wireRows !== undefined) roster.setAllRows(wireRows.filter((row) => viewSessions.has(row.id)));
     else if (summaries !== undefined) roster.setAll(summaries.filter((row) => viewSessions.has(row.id)));
 
@@ -241,6 +243,7 @@ export class AgentsViewController {
       roster,
       pins,
       viewSessions,
+      seenAt,
       dispatch,
       detached: false,
       permissionHintShown: false,
@@ -593,6 +596,8 @@ export class AgentsViewController {
           // Attaching a row reaffirms its registry membership (in practice it
           // is already registered — the roster only lists registry rows).
           view.viewSessions.add(id);
+          // Opening a row is the only thing that clears its unseen bit.
+          view.roster.markSeen(id);
           void this.persistState(view);
           this.host.onOpenSession(id);
         } else {
@@ -744,6 +749,7 @@ export class AgentsViewController {
         await saveAgentsViewState(this.host.harness.homeDir, {
           pins: view.pins,
           sessions: view.viewSessions,
+          seenAt: view.seenAt,
         });
       } catch (error) {
         if (this.host.state.agentsView !== view) return;
