@@ -16,6 +16,7 @@ import {
   AgentsViewController,
   dispatchSlashCommands,
   hintDeferredPermissionOnce,
+  REPLY_RPC_TIMEOUT_MS,
   type AgentsViewHost,
   type AgentsViewState,
 } from '@/tui/controllers/agents-view';
@@ -1782,6 +1783,83 @@ describe('AgentsViewController — reply mode (space)', () => {
     expect(b.view().replyTargetId).toBeUndefined();
     expect(b.view().dispatchFocused).toBe(false);
     expect(b.view().dispatch.editor.placeholder).toBe('describe a task for a new session');
+  });
+
+  it('a reply shows a pending send state on the row until the RPC settles, then clears it — never the busy spinner', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    let resolvePrompt: (() => void) | undefined;
+    b.fake.wirePrompt!.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolvePrompt = resolve;
+        }),
+    );
+    b.component().handleInput(DOWN);
+    b.component().handleInput(SPACE);
+    b.view().dispatch.editor.onSubmit?.('here is more context');
+    await flush();
+
+    expect(b.view().pendingReplyIds.has('s1')).toBe(true);
+    // The pending glyph is distinct from the busy spinner — the row is not
+    // yet acknowledged, so it must not read as "the agent is responding".
+    expect(b.render()).toContain('○');
+
+    resolvePrompt?.();
+    await flush();
+
+    expect(b.view().pendingReplyIds.has('s1')).toBe(false);
+    expect(b.view().replyFailures.has('s1')).toBe(false);
+  });
+
+  it('a rejected reply persists a failure state on the row, and re-entering reply mode restores the lost text', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    b.fake.wirePrompt!.mockRejectedValueOnce(new Error('network down'));
+    b.component().handleInput(DOWN);
+    b.component().handleInput(SPACE);
+    b.view().dispatch.editor.onSubmit?.('here is more context');
+    await flush();
+
+    expect(b.view().pendingReplyIds.has('s1')).toBe(false);
+    expect(b.view().replyFailures.get('s1')).toEqual({ text: 'here is more context' });
+    expect(b.render()).toContain('reply failed');
+
+    // Re-entering reply mode on the failed row (space again) restores the
+    // lost text and clears the persistent failure — no retyping.
+    b.component().handleInput(SPACE);
+    expect(b.view().replyTargetId).toBe('s1');
+    expect(b.view().dispatch.editor.getText()).toBe('here is more context');
+    expect(b.view().replyFailures.has('s1')).toBe(false);
+
+    b.controller.close(); // clear the pending flash timer
+  });
+
+  it('a reply exceeding the bounded client-side wait shows the same persistent failure state, without waiting for the underlying RPC', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    // Never resolves within the test — the resume/materialize chain hang
+    // this timeout guards against.
+    b.fake.wirePrompt!.mockImplementationOnce(() => new Promise<void>(() => {}));
+    vi.useFakeTimers();
+    try {
+      b.component().handleInput(DOWN);
+      b.component().handleInput(SPACE);
+      b.view().dispatch.editor.onSubmit?.('here is more context');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(b.view().pendingReplyIds.has('s1')).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(REPLY_RPC_TIMEOUT_MS - 1);
+      expect(b.view().pendingReplyIds.has('s1')).toBe(true);
+      expect(b.view().replyFailures.has('s1')).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(b.view().pendingReplyIds.has('s1')).toBe(false);
+      expect(b.view().replyFailures.get('s1')).toEqual({ text: 'here is more context' });
+    } finally {
+      vi.useRealTimers();
+      b.controller.close(); // clear the pending flash timer
+    }
   });
 
   it('reply text starting with /model or /agent is sent verbatim, not parsed as a dispatch override', async () => {

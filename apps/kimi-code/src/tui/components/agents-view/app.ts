@@ -107,6 +107,18 @@ export interface AgentsViewProps {
    */
   readonly replyTargetId: string | undefined;
   /**
+   * Rows whose `space`-reply RPC is currently outstanding — renders a
+   * distinct "sending" glyph, never the busy spinner, until the RPC settles.
+   */
+  readonly pendingReplyIds: ReadonlySet<string>;
+  /**
+   * Rows whose last reply attempt failed — rejected, or exceeded the
+   * controller's bounded client-side wait. Persists until the user
+   * re-enters reply mode on that row (which restores the lost text) or a
+   * later send for the same row succeeds.
+   */
+  readonly replyFailureIds: ReadonlySet<string>;
+  /**
    * True while a first Ctrl+C is armed, waiting on a confirming second press
    * within the controller's exit-confirm window — drives the footer's
    * two-stage hint. Controller-owned state (see `onCtrlC`): the component
@@ -625,7 +637,12 @@ export class AgentsViewApp extends Container implements Focusable {
       // selectable stop gets, for visual consistency.
       return withSelectedBg(fitExactly(line, width), selected);
     }
-    return renderRosterRow(row, selected, row.id === this.props.originId, width);
+    const sendState = this.props.replyFailureIds.has(row.id)
+      ? 'failed'
+      : this.props.pendingReplyIds.has(row.id)
+        ? 'sending'
+        : undefined;
+    return renderRosterRow(row, selected, row.id === this.props.originId, width, sendState);
   }
 
   private draftFor(id: string): string | undefined {

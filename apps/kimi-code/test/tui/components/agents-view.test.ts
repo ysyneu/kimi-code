@@ -99,6 +99,8 @@ function makeProps(overrides: Partial<AgentsViewProps> = {}): AgentsViewProps {
     dispatchFocused: false,
     dispatchEditor: makeDispatchEditor(),
     replyTargetId: undefined,
+    pendingReplyIds: new Set(),
+    replyFailureIds: new Set(),
     pendingExitArmed: false,
     onSelect: vi.fn(),
     onOpen: vi.fn(),

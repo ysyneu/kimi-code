@@ -268,6 +268,30 @@ describe('renderRosterRow — status glyph (busy / unseen / seen)', () => {
     expect(spinnerFrames()).toContain(glyphAt(line));
   });
 
+  it('sendState "sending" overrides busy/unseen/seen with a distinct glyph — never the busy spinner', () => {
+    const line = strip(renderRosterRow(row({ busy: true }), false, false, 80, 'sending'));
+    expect(glyphAt(line)).toBe('○');
+    expect(spinnerFrames()).not.toContain(glyphAt(line));
+  });
+
+  it('sendState "failed" overrides busy/unseen/seen with a distinct glyph and the retry hint replaces the summary', () => {
+    const line = strip(
+      renderRosterRow(row({ busy: true, lastAssistantText: 'the answer is 42' }), false, false, 120, 'failed'),
+    );
+    expect(glyphAt(line)).toBe('✕');
+    expect(line).toContain('reply failed — space to retry');
+    expect(line).not.toContain('the answer is 42');
+  });
+
+  it('a send-failed glyph is distinct from the retired turn-outcome ✗ this surface deliberately never rendered', () => {
+    // U+2715 (sendState), not U+2717 (the retired lastTurnReason glyph the
+    // test below asserts stays gone) — two different characters, two
+    // different concepts (reply-send outcome vs. agent-turn outcome).
+    const line = strip(renderRosterRow(row(), false, false, 80, 'failed'));
+    expect(line).toContain('✕');
+    expect(line).not.toContain('✗');
+  });
+
   it('never renders the retired ✗ (failed) or ! (pending-interaction) glyphs', () => {
     const failed = strip(renderRosterRow(row({ lastTurnReason: 'failed', unseen: false }), false, false, 80));
     expect(failed).not.toContain('✗');

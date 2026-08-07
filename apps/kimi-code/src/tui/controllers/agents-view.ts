@@ -125,6 +125,20 @@ export interface AgentsViewState {
    * reconcile a composer that's "replying" but unfocused.
    */
   replyTargetId: string | undefined;
+  /**
+   * Row ids whose `space`-reply RPC is currently outstanding — renders a
+   * distinct "sending" glyph (never the busy spinner) until the RPC settles.
+   * See {@link handleReply}.
+   */
+  pendingReplyIds: Set<string>;
+  /**
+   * One entry per row whose last reply attempt failed — rejected, or
+   * exceeded the bounded client-side wait ({@link raceTimeout}). Carries the
+   * lost text back so re-entering reply mode on that row restores it
+   * instead of dropping it (see `onReplyRequest`). Cleared on the next send
+   * attempt for that row (success or failure) and on a fresh re-entry.
+   */
+  replyFailures: Map<string, { text: string }>;
   selectedId: string | undefined;
   /**
    * The session id this SAME roster-attach lifecycle was last backed out of
@@ -160,6 +174,39 @@ export interface AgentsViewState {
   /** WS connection-state subscription (wire transport only) — drives the
    *  post-reconnect roster reconciliation. Dies with the view on close(). */
   connectionUnsubscribe: Unsubscribe | undefined;
+}
+
+/**
+ * Bounds how long the view waits for a reply RPC before treating it as
+ * failed, independent of whatever the server's own resume-chain timeout
+ * does (or doesn't) do. Same order of magnitude as the server-side bound
+ * applied to the resume/materialize chain this RPC funnels through
+ * (`KIMI_SNAPSHOT_TIMEOUT_MS`'s default, `packages/kap-server/src/services/
+ * snapshot/snapshotConfig.ts`) — this is a client-only, per-request backstop
+ * on top of that, not a substitute for it, so it stays a plain local
+ * constant rather than importing server config into the TUI process (the
+ * connected kap-server may be a remote host, not this build).
+ */
+export const REPLY_RPC_TIMEOUT_MS = 4000;
+
+/**
+ * Bounds `promise` to `ms`: rejects with a timeout error if it hasn't
+ * settled in time. Losing race leaves `promise` to settle in the
+ * background, unobserved — same `Promise.race` + timer shape already used
+ * for client-side RPC waits elsewhere in this codebase (`commands/config.
+ * ts`'s `withTimeout`, `cli/run-prompt.ts`'s `raceWithTimeout`).
+ */
+function raceTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`timed out after ${String(ms)}ms`));
+    }, ms);
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
 }
 
 /** The only event types the roster reduces; everything else is dropped here. */
@@ -306,6 +353,8 @@ export class AgentsViewController {
         dispatch,
         dispatchFocused: false,
         replyTargetId: undefined,
+        pendingReplyIds: new Set(),
+        replyFailures: new Map(),
         selectedId: undefined,
         originSessionId: undefined,
         confirmDeleteId: undefined,
@@ -369,6 +418,8 @@ export class AgentsViewController {
       permissionHintShown: false,
       dispatchFocused: false,
       replyTargetId: undefined,
+      pendingReplyIds: new Set(),
+      replyFailures: new Map(),
       selectedId: undefined,
       originSessionId: undefined,
       confirmDeleteId: undefined,
@@ -659,6 +710,15 @@ export class AgentsViewController {
    * background reply from the roster has no client-side `Session` object
    * to fall back to (the target row may never have been resumed in this
    * process — it could be listed straight from a persisted summary).
+   *
+   * The call is fire-and-forget from `dispatch.onSubmit`'s point of view —
+   * reply mode has already exited and focus has already returned to the
+   * list by the time this runs — so the row itself carries the truth of
+   * whether the send landed: `pendingReplyIds` while outstanding, then
+   * either nothing (success — the roster's own `work_changed` fan-out picks
+   * up the change) or `replyFailures` (rejection, or the bounded wait in
+   * {@link raceTimeout} was exceeded), which persists until the user
+   * re-enters reply mode on that row.
    */
   private async handleReply(view: AgentsViewState, targetId: string, text: string): Promise<void> {
     const rpc = this.host.harness.wireRpc();
@@ -666,11 +726,23 @@ export class AgentsViewController {
       this.flash('Reply failed: replying from the list requires the wire transport');
       return;
     }
+    view.replyFailures.delete(targetId);
+    view.pendingReplyIds.add(targetId);
+    this.pushProps();
     try {
-      await rpc.prompt({ sessionId: targetId, input: [{ type: 'text', text }] });
+      await raceTimeout(
+        rpc.prompt({ sessionId: targetId, input: [{ type: 'text', text }] }),
+        REPLY_RPC_TIMEOUT_MS,
+      );
     } catch (error) {
       if (this.host.state.agentsView !== view) return;
-      this.flash(`Reply failed: ${error instanceof Error ? error.message : String(error)}`);
+      const row = view.roster.get(targetId);
+      const name = row === undefined ? targetId : rosterRowName(row);
+      view.replyFailures.set(targetId, { text });
+      this.flash(`Reply to "${name}" failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      if (this.host.state.agentsView === view) view.pendingReplyIds.delete(targetId);
+      this.pushProps();
     }
   }
 
@@ -718,6 +790,8 @@ export class AgentsViewController {
     dispatch: AgentsViewDispatch;
     dispatchFocused: boolean;
     replyTargetId: string | undefined;
+    pendingReplyIds: ReadonlySet<string>;
+    replyFailures: ReadonlyMap<string, { text: string }>;
     selectedId: string | undefined;
     originSessionId: string | undefined;
     confirmDeleteId: string | undefined;
@@ -746,6 +820,8 @@ export class AgentsViewController {
       dispatchFocused: view.dispatchFocused,
       dispatchEditor: view.dispatch.editor,
       replyTargetId: view.replyTargetId,
+      pendingReplyIds: view.pendingReplyIds,
+      replyFailureIds: new Set(view.replyFailures.keys()),
       pendingExitArmed: view.pendingExitTimer !== undefined,
       ...this.buildCallbacks(),
     };
@@ -890,6 +966,13 @@ export class AgentsViewController {
         view.dispatchFocused = true;
         view.dispatch.editor.focused = true;
         view.dispatch.editor.setPlaceholder(`reply to ${rosterRowName(row)}`);
+        // A row re-entered from its failed state recovers the text that
+        // never made it through instead of forcing the user to retype it.
+        const failure = view.replyFailures.get(id);
+        if (failure !== undefined) {
+          view.replyFailures.delete(id);
+          view.dispatch.editor.setText(failure.text);
+        }
         this.pushProps();
       },
       onReorderPinned: (id, delta) => {

@@ -21,6 +21,14 @@ const TEARDROP_ASTERISK = '✻';
 const BULLET_OPERATOR = '∙';
 
 /**
+ * Reply send-in-flight / send-failed glyphs — deliberately distinct from the
+ * busy spinner: a "sending" row has NOT been acknowledged by the server yet,
+ * so it must never read as "the agent is responding".
+ */
+const SEND_PENDING_GLYPH = '○';
+const SEND_FAILED_GLYPH = '✕';
+
+/**
  * Busy-row spinner charset: an asterisk bloom rather than a braille dial.
  * `platform` is injectable for tests; production calls always default to
  * `process.platform`. macOS terminals render the fifth glyph as its own
@@ -88,14 +96,24 @@ function pointer(selected: boolean): string {
   return currentTheme.fg(selected ? 'primary' : 'textDim', selected ? `${SELECT_POINTER} ` : '  ');
 }
 
-type StatusColor = 'success' | 'textMuted';
+type StatusColor = 'success' | 'textMuted' | 'primary' | 'error';
+
+/** A row's reply send state: set only while its `space`-reply RPC is
+ *  outstanding or has failed — orthogonal to `busy`/`unseen`, which track
+ *  the agent's own turn state, not the send itself. */
+export type RowSendState = 'sending' | 'failed' | undefined;
 
 /**
  * Busy rows show the ping-pong spinner. Idle rows carry an orthogonal
  * "unseen" bit — independent of group/busy/last-turn-reason — that flips to
- * the bullet the moment the row is opened (`AgentsRoster.markSeen`).
+ * the bullet the moment the row is opened (`AgentsRoster.markSeen`). A send
+ * state, when set, wins over both: a failed send needs to stay visible even
+ * on an otherwise-busy row, and a sending row must never borrow the busy
+ * spinner before the server has acknowledged anything.
  */
-function statusSymbol(row: AgentsRosterRow): { glyph: string; color: StatusColor } {
+function statusSymbol(row: AgentsRosterRow, sendState: RowSendState): { glyph: string; color: StatusColor } {
+  if (sendState === 'failed') return { glyph: SEND_FAILED_GLYPH, color: 'error' };
+  if (sendState === 'sending') return { glyph: SEND_PENDING_GLYPH, color: 'primary' };
   if (row.busy) return { glyph: spinnerFrame(Date.now()), color: 'success' };
   if (row.unseen) return { glyph: TEARDROP_ASTERISK, color: 'textMuted' };
   return { glyph: BULLET_OPERATOR, color: 'textMuted' };
@@ -150,14 +168,20 @@ export function rosterRowName(row: AgentsRosterRow): string {
  * and a full-row `surfaceSelected` background fill — not bold; `isOrigin` is
  * what bolds the name — not a background. The two compose freely on the
  * same row.
+ *
+ * `sendState` overrides the status glyph and, while `'failed'`,
+ * replaces the summary line with a persistent recovery hint — the row must
+ * stay visibly wrong until the user re-enters reply mode (which restores
+ * the lost text) or a later send for the same row succeeds.
  */
 export function renderRosterRow(
   row: AgentsRosterRow,
   selected: boolean,
   isOrigin: boolean,
   width: number,
+  sendState?: RowSendState,
 ): string {
-  const symbol = statusSymbol(row);
+  const symbol = statusSymbol(row, sendState);
   const name = rosterRowName(row);
   const prefix = pointer(selected) + currentTheme.fg(symbol.color, symbol.glyph) + ' ';
   const prefixWidth = visibleWidth(prefix);
@@ -171,11 +195,12 @@ export function renderRosterRow(
   const metaWidth = metaText.length > 0 ? 1 + visibleWidth(metaText) : 0;
   const metaSegment = metaText.length > 0 ? currentTheme.fg('textMuted', ` ${metaText}`) : '';
 
-  const summary = summaryText(row, name);
+  const summary = sendState === 'failed' ? 'reply failed — space to retry' : summaryText(row, name);
+  const summaryColor = sendState === 'failed' ? 'error' : 'textMuted';
   const summaryBudget = Math.max(0, width - prefixWidth - NAME_WIDTH - metaWidth);
   const summarySegment =
     summary.length > 0 && summaryBudget > 1
-      ? currentTheme.fg('textMuted', ` ${truncateToWidth(summary, summaryBudget - 1, ELLIPSIS)}`)
+      ? currentTheme.fg(summaryColor, ` ${truncateToWidth(summary, summaryBudget - 1, ELLIPSIS)}`)
       : '';
 
   const left = prefix + nameSlot + summarySegment;
