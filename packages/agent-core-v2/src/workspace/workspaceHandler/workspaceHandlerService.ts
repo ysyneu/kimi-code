@@ -73,6 +73,8 @@ import {
 } from '#/_base/di/scope';
 import { unwrapErrorCause } from '#/_base/errors/errors';
 import { Emitter, type Event } from '#/_base/event';
+import { parseIntegerEnv } from '#/_base/utils/env';
+import { raceTimeout } from '#/_base/utils/promise';
 import { DEFAULT_PLAN_MODE_SECTION } from '#/agent/plan/configSection';
 import { IAgentPlanService } from '#/agent/plan/plan';
 import { IBootstrapService } from '#/app/bootstrap/bootstrap';
@@ -731,49 +733,33 @@ function withoutGoal(value: Record<string, unknown> | undefined): Record<string,
 const DEFAULT_MCP_READY_TIMEOUT_MS = 4000;
 
 /**
- * Env-driven ceiling on the workspace MCP manager's readiness wait — the one
- * step in `materializeSession` most exposed to an external, unbounded
- * process/network handshake (a stdio server whose `initialize` never
- * completes, or a network MCP endpoint with no connect timeout). Reads
- * `KIMI_SNAPSHOT_TIMEOUT_MS` directly rather than importing kap-server's
- * `loadSnapshotConfig` — this package has no dependency on kap-server (the
- * connected server may not even be this process) — but reuses the exact
- * same env var and default so operators get one knob for the whole
- * resume/materialize hang class, not a second one for this call site.
- */
-function mcpReadyTimeoutMs(): number {
-  const raw = process.env['KIMI_SNAPSHOT_TIMEOUT_MS'];
-  if (raw === undefined) return DEFAULT_MCP_READY_TIMEOUT_MS;
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed >= 100 ? parsed : DEFAULT_MCP_READY_TIMEOUT_MS;
-}
-
-/**
  * Bounds the workspace MCP manager's `ready` wait so a stuck server
  * handshake fails this session's materialize with a clear, structured error
  * instead of hanging the caller (and every later resume of the SAME
  * session/workspace, since `ready` is a memoized promise that never
- * rejects on its own — see `WorkspaceMcpService.initialize`) forever.
- * `ready` itself is left to settle in the background on a timeout — the
- * `Promise.race` never touches or cancels it, only bounds THIS wait.
+ * rejects on its own — see `WorkspaceMcpService.initialize`) forever. This
+ * is the one step in `materializeSession` most exposed to an external,
+ * unbounded process/network handshake (a stdio server whose `initialize`
+ * never completes, or a network MCP endpoint with no connect timeout).
+ * `ready` itself is left to settle in the background on a timeout — see
+ * {@link raceTimeout}.
+ *
+ * Reads `KIMI_SNAPSHOT_TIMEOUT_MS` directly rather than importing
+ * kap-server's `loadSnapshotConfig` — this package has no dependency on
+ * kap-server (the connected server may not even be this process) — but
+ * reuses the exact same env var and default so operators get one knob for
+ * the whole resume/materialize hang class, not a second one for this call
+ * site.
  */
 async function withMcpReadyTimeout(ready: Promise<void>, sessionId: string): Promise<void> {
-  const timeoutMs = mcpReadyTimeoutMs();
-  let timer: NodeJS.Timeout | undefined;
-  const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      reject(
-        new Error2(
-          ErrorCodes.SESSION_RESUME_TIMEOUT,
-          `session ${sessionId} materialize timed out waiting on workspace MCP connections after ${String(timeoutMs)}ms`,
-        ),
-      );
-    }, timeoutMs);
-    timer.unref?.();
-  });
-  try {
-    await Promise.race([ready, timeout]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
+  const timeoutMs = parseIntegerEnv(process.env['KIMI_SNAPSHOT_TIMEOUT_MS'], DEFAULT_MCP_READY_TIMEOUT_MS, 100);
+  await raceTimeout(
+    ready,
+    timeoutMs,
+    () =>
+      new Error2(
+        ErrorCodes.SESSION_RESUME_TIMEOUT,
+        `session ${sessionId} materialize timed out waiting on workspace MCP connections after ${String(timeoutMs)}ms`,
+      ),
+  );
 }

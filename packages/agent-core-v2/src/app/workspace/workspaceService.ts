@@ -61,9 +61,11 @@
 import { basename, isAbsolute } from 'pathe';
 
 import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
+import { parseIntegerEnv } from '#/_base/utils/env';
+import { raceTimeout } from '#/_base/utils/promise';
 import { encodeWorkDirKey, workspaceRootKey } from '#/_base/utils/workdir-slug';
 import { ErrorCodes, Error2, unwrapErrorCause } from '#/errors';
-import { IHostFileSystem } from '#/os/interface/hostFileSystem';
+import { IHostFileSystem, type HostFileStat } from '#/os/interface/hostFileSystem';
 import { IFileSystemStorageService } from '#/persistence/interface/storage';
 
 import { IWorkspaceService, type Workspace, type WorkspaceUpdate } from './workspace';
@@ -107,26 +109,7 @@ export class WorkspaceService implements IWorkspaceService {
 
   createOrTouch(root: string, name?: string): Promise<Workspace> {
     return this.runExclusive(async () => {
-      let stat;
-      try {
-        stat = await this.hostFs.stat(root);
-      } catch (error) {
-        const code = (unwrapErrorCause(error) as NodeJS.ErrnoException | undefined)?.code;
-        if (code === 'ENOENT' || code === 'ENOTDIR') {
-          throw new Error2(ErrorCodes.FS_PATH_NOT_FOUND, `workspace root ${root} does not exist`);
-        }
-        throw error;
-      }
-      if (!stat.isDirectory) {
-        try {
-          stat = await this.hostFs.stat(await this.hostFs.realpath(root));
-        } catch {
-          // Fall through to the not-a-directory error below.
-        }
-      }
-      if (!stat.isDirectory) {
-        throw new Error2(ErrorCodes.FS_PATH_NOT_FOUND, `workspace root ${root} is not a directory`);
-      }
+      await this.resolveRootIsDirectory(root);
       await this.ensureMerged();
       const catalog = await this.loadCatalog();
       const byId = new Map(catalog.workspaces.map((ws) => [ws.id, ws]));
@@ -164,6 +147,56 @@ export class WorkspaceService implements IWorkspaceService {
       await this.store.save({ workspaces: [...byId.values()], deletedIds: [...deletedIds] });
       return ws;
     });
+  }
+
+  /**
+   * Resolves whether `root` — an arbitrary, caller-supplied path, unlike
+   * every other read/write this service does (all of which stay under
+   * `homeDir`) — is a directory, throwing `FS_PATH_NOT_FOUND` if not. Bounded
+   * as a whole (both the initial `stat` and the symlink-resolution fallback)
+   * because `runExclusive`'s queue is process-wide and un-timed: a `root` on
+   * a stale/disconnected mount would otherwise stall this `stat` forever and,
+   * since the queue is (correctly, see the class doc comment) global,
+   * permanently wedge every OTHER workspace's queued operation behind it —
+   * the same hang class {@link raceTimeout}'s other call site guards against
+   * in `workspaceHandlerService.ts`. On timeout this op rejects with a clear
+   * error and the queue advances to whatever is next — it does not retry
+   * and does not touch or cancel the underlying `stat`/`realpath` calls.
+   */
+  private async resolveRootIsDirectory(root: string): Promise<void> {
+    const timeoutMs = parseIntegerEnv(process.env['KIMI_SNAPSHOT_TIMEOUT_MS'], DEFAULT_ROOT_STAT_TIMEOUT_MS, 100);
+    await raceTimeout(
+      this.resolveRootIsDirectoryUnbounded(root),
+      timeoutMs,
+      () =>
+        new Error2(
+          ErrorCodes.WORKSPACE_ROOT_TIMEOUT,
+          `workspace root ${root} did not respond within ${String(timeoutMs)}ms`,
+        ),
+    );
+  }
+
+  private async resolveRootIsDirectoryUnbounded(root: string): Promise<void> {
+    let stat: HostFileStat;
+    try {
+      stat = await this.hostFs.stat(root);
+    } catch (error) {
+      const code = (unwrapErrorCause(error) as NodeJS.ErrnoException | undefined)?.code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        throw new Error2(ErrorCodes.FS_PATH_NOT_FOUND, `workspace root ${root} does not exist`);
+      }
+      throw error;
+    }
+    if (!stat.isDirectory) {
+      try {
+        stat = await this.hostFs.stat(await this.hostFs.realpath(root));
+      } catch {
+        // Fall through to the not-a-directory error below.
+      }
+    }
+    if (!stat.isDirectory) {
+      throw new Error2(ErrorCodes.FS_PATH_NOT_FOUND, `workspace root ${root} is not a directory`);
+    }
   }
 
   update(id: string, patch: WorkspaceUpdate): Promise<Workspace | undefined> {
@@ -312,3 +345,13 @@ registerScopedService(
   ScopeActivation.OnScopeCreated,
   'workspace',
 );
+
+/**
+ * Fallback ceiling for {@link WorkspaceService.resolveRootIsDirectory} when
+ * `KIMI_SNAPSHOT_TIMEOUT_MS` is unset — same env var and default as the
+ * `materializeSession` MCP-ready bound (`workspaceHandlerService.ts`), so
+ * this is one operator knob for the whole class of "an external path/process
+ * this service has no control over never responds" hangs, not a second one
+ * for this call site.
+ */
+const DEFAULT_ROOT_STAT_TIMEOUT_MS = 4000;

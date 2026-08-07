@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { promises as fsp } from 'node:fs';
 import os from 'node:os';
@@ -408,6 +408,87 @@ describe('WorkspaceService (file-backed)', () => {
     await fsp.writeFile(file, 'hi', 'utf8');
     await expect(build().createOrTouch(join(file, 'child'))).rejects.toMatchObject({
       code: ErrorCodes.FS_PATH_NOT_FOUND,
+    });
+  });
+
+  /**
+   * hostFs stub whose `stat` never resolves for exactly `hangingRoot` — every
+   * other path stats as an existing directory (same shape as
+   * `allDirsHostFs`). Models a root on a stale/disconnected mount.
+   */
+  function hangingStatHostFs(hangingRoot: string): IHostFileSystem {
+    return {
+      stat: (path: string) =>
+        path === hangingRoot
+          ? new Promise<never>(() => {})
+          : Promise.resolve({ isFile: false, isDirectory: true, size: 0 }),
+    } as unknown as IHostFileSystem;
+  }
+
+  describe('createOrTouch — bounded root stat (runExclusive hang guard)', () => {
+    let previousTimeoutEnv: string | undefined;
+
+    beforeEach(() => {
+      previousTimeoutEnv = process.env['KIMI_SNAPSHOT_TIMEOUT_MS'];
+      process.env['KIMI_SNAPSHOT_TIMEOUT_MS'] = '4000';
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+      if (previousTimeoutEnv === undefined) delete process.env['KIMI_SNAPSHOT_TIMEOUT_MS'];
+      else process.env['KIMI_SNAPSHOT_TIMEOUT_MS'] = previousTimeoutEnv;
+    });
+
+    it('a stuck root stat rejects with a clear timeout error at the bound, not before', async () => {
+      const hangingRoot = join(homeDir, 'stuck-mount');
+      const registry = build(hangingStatHostFs(hangingRoot));
+
+      vi.useFakeTimers();
+      let settled = false;
+      const create = registry.createOrTouch(hangingRoot);
+      void create.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+
+      await vi.advanceTimersByTimeAsync(3999);
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(create).rejects.toMatchObject({ code: ErrorCodes.WORKSPACE_ROOT_TIMEOUT });
+      expect(settled).toBe(true);
+    });
+
+    it('a stuck root does not block a later createOrTouch for a DIFFERENT workspace — the shared exclusive queue still drains', async () => {
+      const hangingRoot = join(homeDir, 'stuck-mount');
+      const otherRoot = join(homeDir, 'other-project');
+      // Same registry (same `runExclusive` queue) for both calls — the point
+      // under test is queue draining, not per-registry isolation.
+      const registry = build(hangingStatHostFs(hangingRoot));
+
+      vi.useFakeTimers();
+      const stuck = registry.createOrTouch(hangingRoot).catch(() => undefined);
+      let otherSettled = false;
+      const other = registry.createOrTouch(otherRoot).then((ws) => {
+        otherSettled = true;
+        return ws;
+      });
+
+      await vi.advanceTimersByTimeAsync(3999);
+      // Still queued behind the stuck op — this is what a global,
+      // un-timed mutex would do forever without the bound.
+      expect(otherSettled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await stuck;
+      const ws = await other;
+
+      expect(otherSettled).toBe(true);
+      expect(ws.root).toBe(otherRoot);
     });
   });
 

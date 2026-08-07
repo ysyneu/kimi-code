@@ -12,3 +12,11 @@ export function parseBooleanEnv(value: string | undefined): boolean | undefined 
   if (FALSE_BOOLEAN_ENV_VALUES.has(normalized)) return false;
   return undefined;
 }
+
+/** Parses an integer env var; falls back to `fallback` when unset,
+ *  non-numeric, or below `min`. */
+export function parseIntegerEnv(value: string | undefined, fallback: number, min = 0): number {
+  if (value === undefined) return fallback;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed >= min ? parsed : fallback;
+}
