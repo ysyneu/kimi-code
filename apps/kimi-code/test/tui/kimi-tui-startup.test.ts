@@ -2356,6 +2356,125 @@ describe('KimiTUI agents-view attach', () => {
     expect(driver.state.appState.streamingPhase).toBe('waiting');
   });
 
+  it('attach to a session whose turn already ended before the listener registered self-heals via the post-subscribe recheck (F2b)', async () => {
+    const session = makeAttachSession('ses-attached');
+    // First call: syncRuntimeState's busy-seed, taken BEFORE the session's
+    // event listener is registered (startSubscription runs last in
+    // switchToSession) — reports busy, so the seed fires.
+    session.getStatus.mockResolvedValueOnce({
+      model: 'k2',
+      thinkingEffort: 'off',
+      permission: 'manual',
+      planMode: false,
+      contextTokens: 10,
+      maxContextTokens: 100,
+      contextUsage: 0.1,
+      busy: true,
+    });
+    // Second call: the F2b reconcile, taken AFTER the listener is live. The
+    // turn's own turn.started/thinking.delta/turn.ended all happened inside
+    // the pre-registration gap — receiveEvent() has no buffering, so this
+    // client never saw a single one of them (simulated here by delivering
+    // zero events on the listener). By the time the reconcile checks, the
+    // server correctly reports the turn is over.
+    session.getStatus.mockResolvedValue({
+      model: 'k2',
+      thinkingEffort: 'off',
+      permission: 'manual',
+      planMode: false,
+      contextTokens: 10,
+      maxContextTokens: 100,
+      contextUsage: 0.1,
+      busy: false,
+    });
+    let sessionEventListener: ((event: Event) => void) | undefined;
+    session.onEvent.mockImplementation((listener) => {
+      sessionEventListener = listener;
+      return () => {
+        sessionEventListener = undefined;
+      };
+    });
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(sessionEventListener).toBeDefined();
+
+    // No event ever arrives for this turn — it's entirely behind the
+    // pre-registration gap. Without the F2b recheck, nothing would ever flip
+    // the busy-seeded phase back to idle: assert it self-heals instead. (The
+    // seed and the recheck both resolve on already-settled mock promises, so
+    // asserting the intermediate 'waiting' state here would be a race
+    // against the recheck's own microtask — the meaningful, deterministic
+    // assertion is the settled end state.)
+    await vi.waitFor(() => {
+      expect(driver.state.appState.streamingPhase).toBe('idle');
+    });
+    expect(session.getStatus).toHaveBeenCalledTimes(2);
+    expect(
+      (
+        driver as unknown as { streamingUI: { hasActiveThinkingComponent(): boolean } }
+      ).streamingUI.hasActiveThinkingComponent(),
+    ).toBe(false);
+  });
+
+  it('attach to a session that is still busy on the post-subscribe recheck leaves the real turn.ended to finalize exactly once (F2b)', async () => {
+    const session = makeAttachSession('ses-attached');
+    session.getStatus.mockResolvedValue({
+      model: 'k2',
+      thinkingEffort: 'off',
+      permission: 'manual',
+      planMode: false,
+      contextTokens: 10,
+      maxContextTokens: 100,
+      contextUsage: 0.1,
+      // Busy on BOTH the pre-attach seed and the post-subscribe recheck —
+      // the turn is genuinely still running.
+      busy: true,
+    });
+    let sessionEventListener: ((event: Event) => void) | undefined;
+    session.onEvent.mockImplementation((listener) => {
+      sessionEventListener = listener;
+      return () => {
+        sessionEventListener = undefined;
+      };
+    });
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(driver.state.appState.streamingPhase).toBe('waiting');
+
+    // Give the post-subscribe recheck a turn to run and confirm it left the
+    // seeded phase alone (still busy, so it must not finalize speculatively).
+    await vi.waitFor(() => {
+      expect(session.getStatus).toHaveBeenCalledTimes(2);
+    });
+    expect(driver.state.appState.streamingPhase).toBe('waiting');
+
+    // The real turn now genuinely ends, through the listener the recheck
+    // correctly left untouched.
+    sessionEventListener?.({
+      type: 'turn.ended',
+      agentId: 'main',
+      sessionId: 'ses-attached',
+      turnId: 0,
+      reason: 'completed',
+    } as Event);
+
+    expect(driver.state.appState.streamingPhase).toBe('idle');
+  });
+
   it('attach with a pending roster reply to the same row awaits its settlement before resuming, then renders the reply bubble (R9 Q1a)', async () => {
     const session = makeAttachSession('ses-attached');
     session.getResumeState.mockReturnValue(

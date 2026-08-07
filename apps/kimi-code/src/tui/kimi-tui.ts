@@ -2148,12 +2148,56 @@ export class KimiTUI {
     } finally {
       this.sessionEventHandler.startSubscription();
     }
+    void this.reconcileStreamingPhaseAfterAttach(session);
     const resumeState = session.getResumeState();
     if (resumeState?.warning !== undefined) {
       this.showStatus(`Warning: ${resumeState.warning}`, 'warning');
     }
     this.showStatus(statusMessage);
     void this.showSessionWarnings(session);
+  }
+
+  /**
+   * Closes the gap between syncRuntimeState's busy-seed (streamingPhase set
+   * from a getStatus() snapshot taken BEFORE the session's event listener is
+   * registered — startSubscription() is the last step of switchToSession(),
+   * behind clearTranscriptAndRedraw + hydrateFromReplay) and events for that
+   * in-flight turn landing inside that gap: SDKRpcClientBase.receiveEvent()
+   * has no buffering, so anything — including the turn's own turn.ended — that
+   * arrives before the listener exists is lost forever, and nothing else
+   * will ever flip a seeded 'waiting' phase back to idle. Re-checks
+   * getStatus() now that the listener is live: if the turn already ended,
+   * runs the same finalize path a live turn.ended would have run
+   * (finalizeTurn's own idle-guard makes this a no-op if a real turn.ended
+   * already got through normally in the meantime — double-firing is safe).
+   * Skips entirely once any real, turn-scoped event has arrived
+   * (hasActiveTurn()): that means the listener is genuinely receiving this
+   * turn's events, so the real turn.ended will finalize it normally and a
+   * stale status snapshot must not race ahead of it.
+   */
+  private async reconcileStreamingPhaseAfterAttach(session: Session): Promise<void> {
+    // Read through a function reference (not a direct property comparison)
+    // so TS's control-flow narrowing doesn't treat the field as unchanged
+    // across the `await` below — other code genuinely mutates it in between.
+    const isIdle = (): boolean => this.state.appState.streamingPhase === 'idle';
+    if (isIdle()) return;
+    if (this.streamingUI.hasActiveTurn()) return;
+    let status: Awaited<ReturnType<Session['getStatus']>>;
+    try {
+      status = await session.getStatus();
+    } catch {
+      // Best-effort: a real turn.ended will still arrive normally if the
+      // turn is genuinely still in flight.
+      return;
+    }
+    if (this.session !== session || this.state.appState.sessionId !== session.id) return;
+    if (isIdle()) return;
+    if (this.streamingUI.hasActiveTurn()) return;
+    if (status.busy) return;
+    this.streamingUI.flushNow();
+    this.streamingUI.finalizeTurn((item) => {
+      this.sendQueuedMessage(session, item);
+    });
   }
 
   async reloadCurrentSessionView(session: Session, statusMessage: string): Promise<void> {
