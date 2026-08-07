@@ -1860,6 +1860,26 @@ export class KimiTUI {
 
   async syncRuntimeState(session: Session = this.requireSession()): Promise<void> {
     const [status, goalResult] = await Promise.all([session.getStatus(), session.getGoal()]);
+    // R9 I1: every switch/attach path calls this right after resetSessionRuntime
+    // forced streamingPhase to 'idle' — so on a session that is ALREADY busy
+    // (attaching to a live spinner row is a primary agents-view use case, not
+    // an edge case), that idle baseline is wrong: it exposes the exact same
+    // no-backlog-subscribe gap Q1a/Q1b diagnosed, from a different trigger.
+    // turn.started/turn.step.started for the in-progress turn necessarily
+    // already fired before this client's subscription existed; if the
+    // remainder is a tool-only tail with no further delta or step boundary,
+    // the only event this client ever sees is turn.ended arriving against a
+    // phase this reset just forced idle — finalizeTurn's own idle-guard then
+    // silently skips its entire body (queued-message dispatch included) for
+    // that turn. Seed from the real status instead of assuming idle: 'waiting'
+    // is the same placeholder phase turn.started/turn.step.started themselves
+    // set before any delta narrows it further, so it self-heals to
+    // 'thinking'/'composing' on the very next delta exactly like a normal
+    // turn start would. Guarded on currently-idle so this only ever seeds,
+    // never downgrades a phase a delta already narrowed.
+    if (status.busy === true && this.state.appState.streamingPhase === 'idle') {
+      this.setAppState({ streamingPhase: 'waiting', streamingStartTime: Date.now() });
+    }
     this.setAppState({
       sessionId: session.id,
       model: status.model ?? '',
@@ -2005,6 +2025,11 @@ export class KimiTUI {
     // replay complete) can leave the phase permanently wedged non-idle —
     // finalizeTurn's own idle-guard then silently no-ops forever for that
     // session, since no later `turn.ended` for the SAME turn ever arrives.
+    // (R9 I1: this idle baseline is provisional — syncRuntimeState, always
+    // the very next call in every switch path, re-seeds it from the target
+    // session's REAL busy status before the live subscription starts, so an
+    // attach to an already-busy session doesn't inherit the same gap from a
+    // different trigger.)
     this.setAppState({ mcpServersSummary: null, streamingPhase: 'idle' });
     this.streamingUI.setStep(0);
     this.streamingUI.resetLiveText();

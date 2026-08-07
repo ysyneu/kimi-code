@@ -127,6 +127,7 @@ function makeSession(overrides: Record<string, unknown> = {}) {
       contextTokens: 10,
       maxContextTokens: 100,
       contextUsage: 0.1,
+      busy: false,
     })),
     setApprovalHandler: vi.fn(),
     setQuestionHandler: vi.fn(),
@@ -135,7 +136,8 @@ function makeSession(overrides: Record<string, unknown> = {}) {
     setPermission: vi.fn(async () => {}),
     setPlanMode: vi.fn(async () => {}),
     getGoal: vi.fn(async () => ({ goal: null })),
-    onEvent: vi.fn(() => () => {}),
+    prompt: vi.fn(async () => {}),
+    onEvent: vi.fn((_listener: (event: Event) => void) => () => {}),
     getResumeState: vi.fn(() => null),
     listSkills: vi.fn(async () => []),
     close: vi.fn(async () => {}),
@@ -218,6 +220,7 @@ function makeHarness(session = makeSession(), overrides: Record<string, unknown>
     close: vi.fn(async () => {}),
     track: vi.fn(),
     setTelemetryContext: vi.fn(),
+    withInteractiveAgent: vi.fn(<T>(_agentId: string, fn: () => T): T => fn()),
     getExperimentalFeatures: vi.fn(async () => []),
     // No fixture here runs the wire transport — the agents view's
     // wire-only narrowing (AgentsViewController.show) must see "unavailable".
@@ -2284,6 +2287,73 @@ describe('KimiTUI agents-view attach', () => {
       expect(driver.state.appState.sessionId).toBe('ses-attached');
     });
     expect(driver.state.appState.streamingPhase).toBe('idle');
+  });
+
+  it('attach to an already-busy session seeds streamingPhase from the real status, so a turn.ended with no further delta still runs finalizeTurn instead of being swallowed (R9 I1)', async () => {
+    const session = makeAttachSession('ses-attached');
+    session.getStatus.mockResolvedValue({
+      model: 'k2',
+      thinkingEffort: 'off',
+      permission: 'manual',
+      planMode: false,
+      contextTokens: 10,
+      maxContextTokens: 100,
+      contextUsage: 0.1,
+      // The turn that's already running server-side when this client
+      // attaches — its own turn.started already fired before this
+      // subscription existed, same "already happened" gap Q1a/Q1b diagnosed
+      // for the reply case, just from attaching to a busy row instead.
+      busy: true,
+    });
+    let sessionEventListener: ((event: Event) => void) | undefined;
+    session.onEvent.mockImplementation((listener) => {
+      sessionEventListener = listener;
+      return () => {
+        sessionEventListener = undefined;
+      };
+    });
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    // Seeded from the real busy status, not the unconditional idle Q1b's own
+    // fix forces — this is what closes the gap at its source, before any
+    // turn.ended for the in-progress turn ever arrives.
+    expect(driver.state.appState.streamingPhase).toBe('waiting');
+    expect(sessionEventListener).toBeDefined();
+
+    // The user typed a follow-up while watching this already-in-progress
+    // turn from the roster.
+    driver.state.queuedMessages = [{ text: 'queued while busy', agentId: 'main' }];
+
+    // The ONLY event this freshly-subscribed client ever sees for the
+    // in-progress turn: no preceding delta, no step boundary — a tool-only
+    // tail, an ordinary agentic pattern.
+    sessionEventListener?.({
+      type: 'turn.ended',
+      agentId: 'main',
+      sessionId: 'ses-attached',
+      turnId: 0,
+      reason: 'completed',
+    } as Event);
+
+    // Synchronous half of finalizeTurn's body: the queued message is shifted
+    // out immediately — proving the idle-guard did NOT swallow the call
+    // whole, the way it would have against the unconditional-idle baseline.
+    expect(driver.state.queuedMessages).toEqual([]);
+
+    await vi.waitFor(() => {
+      expect(session.prompt).toHaveBeenCalledWith('queued while busy');
+    });
+    // beginSessionRequest (inside sendMessageInternal, on the dispatch path)
+    // moved the phase to 'waiting' again for the new turn — settled, not
+    // left dangling.
+    expect(driver.state.appState.streamingPhase).toBe('waiting');
   });
 
   it('attach with a pending roster reply to the same row awaits its settlement before resuming, then renders the reply bubble (R9 Q1a)', async () => {

@@ -213,6 +213,7 @@ function wireStatusToSessionStatus(status: WireSessionStatus): SessionStatus {
     contextUsage: status.context_usage,
     // The wire status surface carries no token-usage breakdown.
     usage: undefined,
+    busy: status.busy,
   };
 }
 
