@@ -120,10 +120,13 @@ export interface AgentsViewState {
   dispatchFocused: boolean;
   /**
    * Set while the composer targets an EXISTING session (space on a row)
-   * instead of a new one. Always paired with `dispatchFocused === true` —
-   * entering and leaving reply mode toggles both together (see
-   * `onReplyRequest` and `exitReplyMode`) so the component never has to
-   * reconcile a composer that's "replying" but unfocused.
+   * instead of a new one — this is also the reply PANEL's own open flag
+   * (`AgentsViewApp` renders the bordered preview panel instead of the
+   * plain composer whenever it's set; see `renderReplyPanel`). Always
+   * paired with `dispatchFocused === true` — entering and leaving the panel
+   * toggles both together (see `onReplyRequest` and `closeReplyPanel`) so
+   * the component never has to reconcile a composer that's "replying" but
+   * unfocused.
    */
   replyTargetId: string | undefined;
   /**
@@ -441,8 +444,7 @@ export class AgentsViewController {
     dispatch.onSubmit = (submission) => {
       const view = this.host.state.agentsView;
       const replyTarget = view?.replyTargetId;
-      if (view !== undefined) this.exitReplyMode(view);
-      this.unfocusDispatch();
+      if (view !== undefined) this.closeReplyPanel(view);
       if (view !== undefined && replyTarget !== undefined) {
         // Bounded (replyRpcTimeoutMs) regardless of how long the underlying
         // RPC actually takes — see replyBarriers' own doc. The attach
@@ -459,8 +461,7 @@ export class AgentsViewController {
     };
     dispatch.onError = (message) => {
       const view = this.host.state.agentsView;
-      if (view !== undefined) this.exitReplyMode(view);
-      this.unfocusDispatch();
+      if (view !== undefined) this.closeReplyPanel(view);
       this.flash(message);
     };
     // `exit` / `/exit` submitted from the dispatch composer — dispatch mode
@@ -471,12 +472,13 @@ export class AgentsViewController {
     };
     // Esc inside the focused editor returns focus to the list (the editor's
     // own autocomplete-cancel wins over this when a dropdown is open).
-    // Reply mode is exited the same way as a submit: back to the "new
-    // session" composer, not a second escape stage.
+    // The reply panel is closed the same way as a submit: back to the "new
+    // session" composer, not a second escape stage — and (unlike a submit,
+    // which the editor already emptied on its own) this is the path that
+    // discards an unsent draft (see `exitReplyMode`).
     dispatch.editor.onEscape = () => {
       const view = this.host.state.agentsView;
-      if (view !== undefined) this.exitReplyMode(view);
-      this.unfocusDispatch();
+      if (view !== undefined) this.closeReplyPanel(view);
     };
 
     this.host.setAgentsView({
@@ -885,18 +887,36 @@ export class AgentsViewController {
   }
 
   /**
-   * Clears reply-mode state (placeholder + `replyTargetId` + the dispatch's
-   * `replying` parse-mode flag) — called on every editor submit round trip
-   * (success or parse-error) and on Esc. Reply is the same composer as
-   * dispatch; only its momentary target, placeholder and input parsing
-   * differ, so "leaving reply mode" is just resetting those back to the
-   * dispatch defaults.
+   * Clears reply-panel state (placeholder + `replyTargetId` + the dispatch's
+   * `replying` parse-mode flag + any unsent draft text) — called on every
+   * editor submit round trip (success or parse-error) and on every panel
+   * close. Reply is the same composer as dispatch; only its momentary
+   * target, placeholder and input parsing differ, so "leaving the panel" is
+   * just resetting those back to the dispatch defaults. The `setText('')`
+   * is a no-op after a submit (pi-tui already emptied the editor before
+   * calling back) but is what makes a non-submit close (Esc, space-on-empty,
+   * Ctrl+X, ↑/↓ — see `closeReplyPanel`) discard an unsent draft instead of
+   * leaking it into the next "new session" dispatch.
    */
   private exitReplyMode(view: AgentsViewState): void {
     if (view.replyTargetId === undefined) return;
     view.replyTargetId = undefined;
     view.dispatch.replying = false;
     view.dispatch.editor.setPlaceholder(DISPATCH_PLACEHOLDER);
+    view.dispatch.editor.setText('');
+  }
+
+  /**
+   * The reply panel's single "close" primitive: exits reply mode and returns
+   * focus from the (now-unmounted) panel composer to the roster list. Shared
+   * by every way of leaving the panel — a submit (`dispatch.onSubmit`), a
+   * parse error (`dispatch.onError`), Esc (the editor's own `onEscape`,
+   * wired above), and the component's `onReplyClose` prop callback (space on
+   * an empty input, Ctrl+X, ↑/↓ — see `AgentsViewApp.handleReplyPanelKey`).
+   */
+  private closeReplyPanel(view: AgentsViewState): void {
+    this.exitReplyMode(view);
+    this.unfocusDispatch();
   }
 
   private handleGlobalEvent(event: Event): void {
@@ -1011,6 +1031,7 @@ export class AgentsViewController {
     | 'onRenameSubmit'
     | 'onPinToggle'
     | 'onReplyRequest'
+    | 'onReplyClose'
     | 'onReorderPinned'
     | 'onHelpToggle'
     | 'onQuit'
@@ -1103,7 +1124,10 @@ export class AgentsViewController {
         view.dispatch.replying = true;
         view.dispatchFocused = true;
         view.dispatch.editor.focused = true;
-        view.dispatch.editor.setPlaceholder(`reply to ${rosterRowName(row)}`);
+        // Fixed literal, not `reply to <name>` — the panel itself already
+        // shows the row's preview/age content (see `renderReplyPanel`), so
+        // the composer placeholder doesn't need to repeat the name too.
+        view.dispatch.editor.setPlaceholder('reply');
         // A row re-entered from its failed state recovers the text that
         // never made it through instead of forcing the user to retype it.
         const failure = view.replyFailures.get(id);
@@ -1112,6 +1136,11 @@ export class AgentsViewController {
           view.dispatch.editor.setText(failure.text);
         }
         this.pushProps();
+      },
+      onReplyClose: () => {
+        const view = this.host.state.agentsView;
+        if (view === undefined) return;
+        this.closeReplyPanel(view);
       },
       onReorderPinned: (id, delta) => {
         const view = this.host.state.agentsView;

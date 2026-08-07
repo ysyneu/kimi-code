@@ -136,9 +136,11 @@ function summaryText(row: AgentsRosterRow, name: string): string {
 
 /**
  * The name shown for a row: its title, falling back to the last prompt,
- * then a static placeholder for a row with neither. Shared by the row
- * renderer and the reply-mode composer placeholder (`reply to <name>`) so
- * the two copies never drift apart.
+ * then a static placeholder for a row with neither. Used by the row
+ * renderer, and by the reply flow's own flash messages (e.g. "Reply to
+ * ... failed") — the reply panel's composer placeholder is the fixed
+ * literal `reply` instead (the panel itself already shows the row's
+ * content/age, so the name doesn't need repeating there).
  */
 export function rosterRowName(row: AgentsRosterRow): string {
   return singleLine(row.title) || singleLine(row.lastPrompt ?? '') || '(untitled)';

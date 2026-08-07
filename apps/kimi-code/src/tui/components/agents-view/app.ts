@@ -30,11 +30,17 @@
  *   EMPTY, once it holds text every printable char belongs to it.
  * - Open: Enter and → both fire `onOpen` on a row — opening always hands
  *   off to the session's own full-screen chat, never an in-view detail.
- * - Reply mode: `space` on a row fires `onReplyRequest`, which the
- *   controller answers by setting `replyTargetId` AND `dispatchFocused`
- *   together (this component never mounts a second composer — reply
- *   reuses `dispatchEditor`, only its target and placeholder differ).
- *   `onOpen`/submit/Esc are the controller's job to unwind that pairing.
+ * - Reply panel: `space` on a row (main composer empty) fires
+ *   `onReplyRequest`, which the controller answers by setting
+ *   `replyTargetId` AND `dispatchFocused` together (this component never
+ *   mounts a second composer — the panel reuses `dispatchEditor`, only its
+ *   target and placeholder differ; `renderReplyPanel` wraps it with the
+ *   row's preview/age content). While the panel is open, `handleInput`
+ *   intercepts space-on-empty-input (toggle close), Ctrl+X (close + start
+ *   the row's delete flow), ↑/↓ (close + move selection) and Enter-on-empty
+ *   (close + attach, same path as Enter on the row) BEFORE forwarding to the
+ *   editor — Esc and Enter-with-text still fall through to the editor's own
+ *   `onEscape`/`onSubmit`, which the controller wires to close/submit.
  * - Reorder: `shift+↑↓` fires `onReorderPinned` only for a PINNED row;
  *   the callback is a no-op signal for anything else, so the controller
  *   need not re-check `pinned` itself.
@@ -72,6 +78,7 @@ import { CTRL_C_HINT } from '#/tui/constant/kimi-tui';
 import { currentTheme } from '#/tui/theme';
 import { printableChar, isPrintableChar } from '@/tui/utils/printable-key';
 
+import { renderReplyPanel } from './reply-panel';
 import { fitExactly, renderGroupHeader, renderMoreRow, renderRosterRow, withSelectedBg } from './rows';
 
 export interface AgentsViewProps {
@@ -102,9 +109,12 @@ export interface AgentsViewProps {
   /**
    * Set while the composer targets an EXISTING session (space on a row)
    * instead of a new one — always paired with `dispatchFocused === true`,
-   * cleared together by the controller on submit/Esc. Only read here to
-   * pick the reply-vs-dispatch footer copy; the placeholder swap itself is
-   * a controller-owned side effect on `dispatchEditor`, not a render path.
+   * cleared together by the controller on submit/Esc/close. Doubles as the
+   * reply PANEL's own open flag: non-`undefined` is what makes `render()`
+   * swap the plain dispatch composer for `renderReplyPanel` and what makes
+   * `handleInput` intercept the panel's row-scoped shortcuts (see the class
+   * docstring). The row itself is looked up from `groups` via `findRow`,
+   * not carried on this id.
    */
   readonly replyTargetId: string | undefined;
   /**
@@ -134,8 +144,16 @@ export interface AgentsViewProps {
   onRenameBegin(id: string): void;
   onRenameSubmit(id: string, text: string): void;
   onPinToggle(id: string): void;
-  /** `space` on a session row: enter reply mode targeting that session. No-op on anything else (the caller only invokes this for a `row`-kind selection). */
+  /** `space` on a session row: open the reply panel targeting that session. No-op on anything else (the caller only invokes this for a `row`-kind selection). */
   onReplyRequest(id: string): void;
+  /**
+   * Closes the reply panel and discards its draft — the controller's shared
+   * path behind Esc (via the editor's own `onEscape`), space-on-empty-input,
+   * Ctrl+X, and ↑/↓ while the panel is open (see `handleReplyPanelKey`). A
+   * no-op signal when no panel is open; the caller here only ever invokes it
+   * while `replyTargetId !== undefined`.
+   */
+  onReplyClose(): void;
   /** `shift+↑↓` on a PINNED row: reorder it within the pins array. No-op on a non-pinned row (the caller only invokes this for a pinned `row`-kind selection). */
   onReorderPinned(id: string, delta: -1 | 1): void;
   onHelpToggle(): void;
@@ -335,10 +353,16 @@ export class AgentsViewApp extends Container implements Focusable {
       return;
     }
 
-    // Dispatch editor focused: every key belongs to the editor. Esc is the
-    // editor's own onEscape (the controller wires it to unfocus); Enter is
-    // the editor's own submit.
+    // Dispatch editor focused: every key belongs to the editor EXCEPT the
+    // reply panel's own row-scoped shortcuts, intercepted below BEFORE the
+    // editor sees them (the editor has no notion of "this composer targets
+    // an existing row"). Esc still falls through to the editor's own
+    // onEscape (the controller wires it to close the panel); Enter-with-text
+    // is the editor's own submit.
     if (this.props.dispatchFocused) {
+      if (this.props.replyTargetId !== undefined && this.handleReplyPanelKey(data, k)) {
+        return;
+      }
       this.props.dispatchEditor.handleInput(data);
       this.invalidate();
       return;
@@ -489,6 +513,52 @@ export class AgentsViewApp extends Container implements Focusable {
     this.invalidate();
   }
 
+  /**
+   * Reply panel's own row-scoped shortcuts, checked before a key focused on
+   * `dispatchEditor` reaches it (see `handleInput`). Returns `true` when the
+   * key was consumed here; `false` lets the caller fall through to the
+   * editor as ordinary text/editing input (Esc and a non-empty Enter always
+   * fall through this way — the editor's own `onEscape`/`onSubmit` handle
+   * those).
+   */
+  private handleReplyPanelKey(data: string, k: string): boolean {
+    const targetId = this.props.replyTargetId;
+    if (targetId === undefined) return false;
+    const empty = this.props.dispatchEditor.getText().length === 0;
+
+    // Symmetric toggle: space closes an EMPTY reply input, same as the space
+    // that opened the panel. A non-empty input's space is an ordinary
+    // character — falls through to the editor untouched.
+    if ((matchesKey(data, Key.space) || k === ' ') && empty) {
+      this.props.onReplyClose();
+      return true;
+    }
+    if (matchesKey(data, Key.ctrl('x'))) {
+      this.props.onReplyClose();
+      this.props.onDeleteRequest(targetId);
+      return true;
+    }
+    if (matchesKey(data, Key.up)) {
+      this.props.onReplyClose();
+      this.moveSelection(-1);
+      return true;
+    }
+    if (matchesKey(data, Key.down)) {
+      this.props.onReplyClose();
+      this.moveSelection(1);
+      return true;
+    }
+    // Empty Enter closes the panel and attaches (same path as Enter on the
+    // row); a non-empty Enter is the editor's own submit — falls through to
+    // the send path unchanged.
+    if (matchesKey(data, Key.enter) && empty) {
+      this.props.onReplyClose();
+      this.props.onOpen(targetId);
+      return true;
+    }
+    return false;
+  }
+
   private moveSelection(delta: number): void {
     const items = this.deriveItems();
     if (items.length === 0) return;
@@ -536,19 +606,23 @@ export class AgentsViewApp extends Container implements Focusable {
     // rows stay fixed either way.
     const footerLines = this.renderFooter(width);
     const bodyHeight = rows - HEADER_HEIGHT - footerLines.length;
-    // The dispatch editor box (bordered CustomEditor: ≥3 lines, taller while
-    // the autocomplete dropdown is open) takes the bottom of the body; the
-    // list keeps at least 3 rows.
-    const dispatchLines = this.props.dispatchEditor.render(width);
-    const dispatchHeight = Math.min(dispatchLines.length, Math.max(3, bodyHeight - 3));
-    const listHeight = Math.max(1, bodyHeight - dispatchHeight);
+    // The composer slot: the reply panel (bordered box: preview + age +
+    // the same editor) while a panel target is set, otherwise the plain
+    // dispatch editor box — same slot, same height accounting either way.
+    // The list keeps at least 3 rows.
+    const composerLines =
+      this.props.replyTargetId !== undefined
+        ? renderReplyPanel(this.findRow(this.props.replyTargetId), this.props.dispatchEditor, width)
+        : this.props.dispatchEditor.render(width);
+    const composerHeight = Math.min(composerLines.length, Math.max(3, bodyHeight - 3));
+    const listHeight = Math.max(1, bodyHeight - composerHeight);
 
     // The roster stays visible and scrollable behind the `?` grid — it never
     // gets swapped out for a full-body help screen.
     return [
       ...this.renderHeader(width),
       ...this.renderList(width, listHeight),
-      ...dispatchLines.slice(0, dispatchHeight),
+      ...composerLines.slice(0, composerHeight),
       ...footerLines,
     ];
   }
@@ -707,10 +781,18 @@ export class AgentsViewApp extends Container implements Focusable {
     } else if (this.draftFor(this.props.renameDraft?.sessionId ?? this.rename?.id ?? '') !== undefined) {
       left = compose(hint('enter', 'to submit'), hint('esc', 'to cancel'));
     } else if (this.props.dispatchFocused) {
-      left =
-        this.props.replyTargetId !== undefined
-          ? compose(hint('enter', 'to send'), hint('esc', 'to cancel'))
-          : compose(hint('enter', 'to dispatch'), hint('esc', 'to back to list'));
+      if (this.props.replyTargetId !== undefined) {
+        // Panel open: empty input still offers "enter to open" (attach) and
+        // "space to close" (symmetric toggle); once there's text, Enter
+        // sends and Esc/space both just close (space becomes an ordinary
+        // character the moment there's text to type it into).
+        left =
+          this.props.dispatchEditor.getText().length === 0
+            ? compose(hint('enter', 'to open'), hint('space', 'to close'), hint('ctrl+x', 'to delete'))
+            : compose(hint('enter', 'to send'), hint('esc', 'to close'), hint('ctrl+x', 'to delete'));
+      } else {
+        left = compose(hint('enter', 'to dispatch'), hint('esc', 'to back to list'));
+      }
     } else if (this.props.confirmDeleteId !== undefined) {
       left = compose(
         currentTheme.boldFg('warning', this.deleteConfirmCopy(this.props.confirmDeleteId)),

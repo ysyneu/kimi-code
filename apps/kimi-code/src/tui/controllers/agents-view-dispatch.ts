@@ -65,9 +65,9 @@ const MIN_NON_SPACE_CHARS = 3;
 
 /**
  * Default composer placeholder — the dispatch target is "a new session".
- * Reply mode (agents-view controller) swaps this per-row via
- * `CustomEditor.setPlaceholder` and restores this exact string on
- * submit/Esc, so the two never drift out of sync.
+ * The reply panel (agents-view controller) swaps this to the fixed literal
+ * `'reply'` via `CustomEditor.setPlaceholder` and restores this exact string
+ * on submit/Esc/close, so the two never drift out of sync.
  */
 export const DISPATCH_PLACEHOLDER = 'describe a task for a new session';
 
