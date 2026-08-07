@@ -71,8 +71,9 @@ export async function runAgents(): Promise<void> {
   };
   const identity = createKimiCodeHostIdentity(version);
 
-  // The expected failure mode: a stale or version-mismatched kap-server is
-  // already running. Report it cleanly instead of crashing the TUI boot.
+  // Version-mismatched or dead instances are skipped during resolution, so a
+  // failure here means the embedded server itself could not start. Report it
+  // cleanly instead of crashing the TUI boot.
   let server: Awaited<ReturnType<typeof resolveAgentsServer>>;
   try {
     server = await resolveAgentsServer({ homeDir, identity, cliVersion: version });
