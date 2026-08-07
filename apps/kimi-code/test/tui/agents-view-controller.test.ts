@@ -126,7 +126,13 @@ interface FakeHarness {
     activateSkill: ReturnType<typeof vi.fn>;
     activatePluginCommand: ReturnType<typeof vi.fn>;
   };
-  wirePrompt: ReturnType<typeof vi.fn> | undefined;
+  // Explicitly Promise-returning (not the bare `ReturnType<typeof vi.fn>`
+  // other fields use): several tests below feed `mockImplementationOnce` a
+  // `() => new Promise(...)` to control settlement timing by hand, and the
+  // untyped default resolves `mockImplementationOnce`'s parameter to a
+  // void-returning signature, which no-misused-promises then flags as a
+  // Promise where a void return was expected.
+  wirePrompt: ReturnType<typeof vi.fn<(...args: unknown[]) => Promise<void>>> | undefined;
   wireTrust: ReturnType<typeof vi.fn> | undefined;
   wireRows: ReturnType<typeof vi.fn> | undefined;
   emit(event: unknown): void;
