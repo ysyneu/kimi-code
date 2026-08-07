@@ -1787,7 +1787,7 @@ describe('AgentsViewController — reply mode (space)', () => {
     dir = undefined;
   });
 
-  it('space on a row focuses the composer on that session — placeholder and footer switch to reply mode', async () => {
+  it('space on a row opens the reply panel — placeholder and footer switch to the panel state (empty input)', async () => {
     const b = await boot([summary('s1')], { wire: true });
     dir = b.homeDir;
     b.component().handleInput(DOWN);
@@ -1795,10 +1795,124 @@ describe('AgentsViewController — reply mode (space)', () => {
     expect(b.view().replyTargetId).toBe('s1');
     expect(b.view().dispatchFocused).toBe(true);
     expect(b.view().dispatch.editor.focused).toBe(true);
-    expect(b.view().dispatch.editor.placeholder).toBe('reply to s1 title');
+    expect(b.view().dispatch.editor.placeholder).toBe('reply');
+    const out = b.render();
+    // Bordered panel chrome, plus the empty-input footer state.
+    expect(out).toContain('╭');
+    expect(out).toContain('╰');
+    expect(out).toContain('enter to open');
+    expect(out).toContain('space to close');
+    expect(out).toContain('ctrl+x to delete');
+  });
+
+  it('typing in the panel switches the footer to the non-empty state', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(SPACE);
+    b.view().dispatch.editor.setText('here is more context');
     const out = b.render();
     expect(out).toContain('enter to send');
-    expect(out).toContain('esc to cancel');
+    expect(out).toContain('esc to close');
+    expect(out).toContain('ctrl+x to delete');
+    expect(out).not.toContain('enter to open');
+  });
+
+  it("the panel shows the row's latest assistant output and a relative-age line", async () => {
+    // No `wire: true`: the roster seeds from `listSessions` (plain
+    // `SessionSummary`), which carries `lastAssistantText`/`updatedAt`
+    // straight through — the wire-row seeding path used elsewhere in this
+    // file only forwards `id`/`title` by default (see `makeHarness`), which
+    // would lose the very fields this test is about.
+    const b = await boot([summary('s1', { lastAssistantText: 'the answer is 42', updatedAt: Date.now() })]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(SPACE);
+    const out = b.render();
+    expect(out).toContain('the answer is 42');
+    expect(out).toContain('just now');
+  });
+
+  it('the panel falls back to the initial prompt when no assistant output exists yet', async () => {
+    const b = await boot([summary('s1', { lastPrompt: 'please investigate the outage' })]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(SPACE);
+    expect(b.render()).toContain('please investigate the outage');
+  });
+
+  it('space closes the panel again with an empty input — symmetric toggle', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(SPACE); // open
+    expect(b.view().replyTargetId).toBe('s1');
+    b.component().handleInput(SPACE); // close (empty input)
+    expect(b.view().replyTargetId).toBeUndefined();
+    expect(b.view().dispatchFocused).toBe(false);
+  });
+
+  it('space with a non-empty input is an ordinary character, not a close', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(SPACE); // open
+    b.view().dispatch.editor.setText('fix');
+    b.component().handleInput(SPACE);
+    expect(b.view().replyTargetId).toBe('s1'); // still open
+    expect(b.view().dispatch.editor.getText()).toBe('fix ');
+  });
+
+  it('Esc discards an unsent draft, not just closes the panel', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(SPACE);
+    b.view().dispatch.editor.setText('never sent');
+    b.component().handleInput(ESC);
+    expect(b.view().replyTargetId).toBeUndefined();
+    expect(b.view().dispatch.editor.getText()).toBe('');
+  });
+
+  it('Enter with an empty input closes the panel and attaches to the session', async () => {
+    const onOpenSession = vi.fn();
+    const b = await boot([summary('s1')], { wire: true, onOpenSession });
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(SPACE);
+    b.component().handleInput(ENTER);
+    expect(b.view().replyTargetId).toBeUndefined();
+    expect(b.view().dispatchFocused).toBe(false);
+    expect(onOpenSession).toHaveBeenCalledWith('s1');
+    expect(b.fake.wirePrompt).not.toHaveBeenCalled();
+  });
+
+  it('Ctrl+X closes the panel and starts the existing delete-confirm flow for that row', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(SPACE);
+    b.component().handleInput(CTRL_X);
+    expect(b.view().replyTargetId).toBeUndefined();
+    expect(b.view().dispatchFocused).toBe(false);
+    expect(b.view().confirmDeleteId).toBe('s1');
+    // Second Ctrl+X (list-focused now) confirms the delete, same as the
+    // ordinary row flow.
+    b.component().handleInput(CTRL_X);
+    await flush();
+    expect(b.fake.deleteSession).toHaveBeenCalledWith('s1');
+  });
+
+  it('↑/↓ close the panel and move the roster selection instead of navigating inside it', async () => {
+    const b = await boot([summary('s1'), summary('s2')], { wire: true });
+    dir = b.homeDir;
+    b.component().handleInput(DOWN); // s1 (only completed row visible first)
+    b.component().handleInput(SPACE);
+    expect(b.view().replyTargetId).toBe('s1');
+    b.component().handleInput(DOWN);
+    expect(b.view().replyTargetId).toBeUndefined();
+    expect(b.view().dispatchFocused).toBe(false);
+    expect(b.view().selectedId).toBe('s2');
   });
 
   it('submitting reply text prompts the EXISTING session over the wire rpc, not createSession', async () => {

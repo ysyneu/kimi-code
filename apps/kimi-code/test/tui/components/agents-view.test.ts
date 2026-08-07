@@ -110,6 +110,7 @@ function makeProps(overrides: Partial<AgentsViewProps> = {}): AgentsViewProps {
     onRenameSubmit: vi.fn(),
     onPinToggle: vi.fn(),
     onReplyRequest: vi.fn(),
+    onReplyClose: vi.fn(),
     onReorderPinned: vi.fn(),
     onHelpToggle: vi.fn(),
     onQuit: vi.fn(),
@@ -1021,15 +1022,186 @@ describe('AgentsViewApp — dispatch editor mount', () => {
     expect(out).toContain('back to list');
   });
 
-  it('the footer shows send/cancel while reply mode is focused, not dispatch/back-to-list', () => {
+  it('the footer shows the panel-empty hints while the reply panel is focused with no text yet', () => {
     const out = render(makeApp({ dispatchFocused: true, replyTargetId: 's1' }));
-    expect(out).toContain('enter to send');
-    expect(out).toContain('esc to cancel');
+    expect(out).toContain('enter to open');
+    expect(out).toContain('space to close');
+    expect(out).toContain('ctrl+x to delete');
     // Narrower than a bare 'to dispatch' substring check: the empty-roster
     // banner ("type below to dispatch a new session") legitimately contains
     // that phrase too — only the footer's own hint text is under test here.
     expect(out).not.toContain('enter to dispatch');
     expect(out).not.toContain('back to list');
+    expect(out).not.toContain('enter to send');
+  });
+
+  it('the footer switches to send/close hints once the reply panel input holds text', () => {
+    const editor = makeDispatchEditor();
+    editor.setText('fix the flaky test');
+    const out = render(makeApp({ dispatchFocused: true, replyTargetId: 's1', dispatchEditor: editor }));
+    expect(out).toContain('enter to send');
+    expect(out).toContain('esc to close');
+    expect(out).toContain('ctrl+x to delete');
+    expect(out).not.toContain('enter to open');
+  });
+});
+
+describe('AgentsViewApp — reply panel rendering (task A1)', () => {
+  it('renders a rounded box containing the preview, a relative-age line, and the editor', () => {
+    const out = render(
+      makeApp({
+        groups: [group('completed', [row('s1', { title: 's1 title', lastAssistantText: 'the answer is 42' })])],
+        dispatchFocused: true,
+        replyTargetId: 's1',
+      }),
+    );
+    expect(out).toContain('the answer is 42');
+    expect(out).toMatch(/[╭╮╰╯│]/);
+  });
+
+  it('falls back to the initial prompt when the row has no assistant output yet', () => {
+    const out = render(
+      makeApp({
+        groups: [group('completed', [row('s1', { title: 's1 title', lastPrompt: 'investigate the outage' })])],
+        dispatchFocused: true,
+        replyTargetId: 's1',
+      }),
+    );
+    expect(out).toContain('investigate the outage');
+  });
+
+  it('clamps a multi-line preview to at most 6 lines', () => {
+    const many = Array.from({ length: 10 }, (_, i) => `preview-line-${String(i)}`).join('\n');
+    const app = makeApp({
+      groups: [group('completed', [row('s1', { lastAssistantText: many })])],
+      dispatchFocused: true,
+      replyTargetId: 's1',
+    });
+    // Isolate the panel's OWN box lines (between the rounded corners) — the
+    // roster row's own one-line summary column also renders the same
+    // (unclamped) source text next to the name, so a whole-output substring
+    // check would false-negative against that unrelated row text instead of
+    // the panel under test.
+    const lines = app.render(120).map(strip);
+    const top = lines.findIndex((l) => l.includes('╭'));
+    const bottom = lines.findIndex((l) => l.includes('╰'));
+    expect(top).toBeGreaterThanOrEqual(0);
+    expect(bottom).toBeGreaterThan(top);
+    const panelLines = lines.slice(top, bottom + 1).join('\n');
+    for (let i = 0; i < 6; i++) expect(panelLines).toContain(`preview-line-${String(i)}`);
+    for (let i = 6; i < 10; i++) expect(panelLines).not.toContain(`preview-line-${String(i)}`);
+  });
+
+  it('renders without a preview block when the target row is not in props.groups', () => {
+    // The target vanished from the roster while the panel stayed open (e.g.
+    // deleted from another client) — the panel still renders, just without
+    // preview content, and does not throw.
+    expect(() =>
+      render(makeApp({ groups: [], dispatchFocused: true, replyTargetId: 'gone' })),
+    ).not.toThrow();
+  });
+});
+
+describe('AgentsViewApp — reply panel key routing (task A1)', () => {
+  function replyProps(overrides: Partial<AgentsViewProps> = {}): Partial<AgentsViewProps> {
+    return {
+      groups: [group('completed', [row('s1', { title: 's1 title' })])],
+      dispatchFocused: true,
+      replyTargetId: 's1',
+      ...overrides,
+    };
+  }
+
+  it('space on an empty input closes the panel — symmetric toggle', () => {
+    const onReplyClose = vi.fn();
+    const app = makeApp(replyProps({ onReplyClose }));
+    app.handleInput(' ');
+    expect(onReplyClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('space with a non-empty input is an ordinary character, not a close', () => {
+    const editor = makeDispatchEditor();
+    editor.setText('fix');
+    const onReplyClose = vi.fn();
+    const app = makeApp(replyProps({ onReplyClose, dispatchEditor: editor }));
+    app.handleInput(' ');
+    expect(onReplyClose).not.toHaveBeenCalled();
+    expect(editor.getText()).toBe('fix ');
+  });
+
+  it('Enter with an empty input closes the panel and opens (attaches) the target row', () => {
+    const onReplyClose = vi.fn();
+    const onOpen = vi.fn();
+    const app = makeApp(replyProps({ onReplyClose, onOpen }));
+    app.handleInput('\r');
+    expect(onReplyClose).toHaveBeenCalledTimes(1);
+    expect(onOpen).toHaveBeenCalledWith('s1');
+  });
+
+  it('Enter with a non-empty input is the editor\'s own submit, not an attach', () => {
+    const editor = makeDispatchEditor();
+    editor.setText('here is more context');
+    const onReplyClose = vi.fn();
+    const onOpen = vi.fn();
+    const onSubmit = vi.fn();
+    editor.onSubmit = onSubmit;
+    const app = makeApp(replyProps({ onReplyClose, onOpen, dispatchEditor: editor }));
+    app.handleInput('\r');
+    expect(onReplyClose).not.toHaveBeenCalled();
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(onSubmit).toHaveBeenCalledWith('here is more context');
+  });
+
+  it('Ctrl+X closes the panel and requests delete for the target row', () => {
+    const onReplyClose = vi.fn();
+    const onDeleteRequest = vi.fn();
+    const app = makeApp(replyProps({ onReplyClose, onDeleteRequest }));
+    app.handleInput('\u0018');
+    expect(onReplyClose).toHaveBeenCalledTimes(1);
+    expect(onDeleteRequest).toHaveBeenCalledWith('s1');
+  });
+
+  it('↑ closes the panel and moves the roster selection up, not the cursor inside the editor', () => {
+    const onReplyClose = vi.fn();
+    const onSelect = vi.fn();
+    const app = makeApp(
+      replyProps({
+        onReplyClose,
+        onSelect,
+        groups: [group('completed', [row('a', { title: 'a title' }), row('b', { title: 'b title' })])],
+        selectedId: 'b',
+      }),
+    );
+    app.handleInput('\u001B[A'); // up-arrow
+    expect(onReplyClose).toHaveBeenCalledTimes(1);
+    expect(onSelect).toHaveBeenCalledWith('a');
+  });
+
+  it('↓ closes the panel and moves the roster selection down', () => {
+    const onReplyClose = vi.fn();
+    const onSelect = vi.fn();
+    const app = makeApp(
+      replyProps({
+        onReplyClose,
+        onSelect,
+        groups: [group('completed', [row('a', { title: 'a title' }), row('b', { title: 'b title' })])],
+        selectedId: 'a',
+      }),
+    );
+    app.handleInput('\u001B[B'); // down-arrow
+    expect(onReplyClose).toHaveBeenCalledTimes(1);
+    expect(onSelect).toHaveBeenCalledWith('b');
+  });
+
+  it('Esc still falls through to the editor\'s own onEscape (unaffected by the new interception)', () => {
+    const editor = makeDispatchEditor();
+    const onEscape = vi.fn();
+    editor.onEscape = onEscape;
+    const onReplyClose = vi.fn();
+    const app = makeApp(replyProps({ onReplyClose, dispatchEditor: editor }));
+    app.handleInput(ESC);
+    expect(onEscape).toHaveBeenCalledTimes(1);
+    expect(onReplyClose).not.toHaveBeenCalled();
   });
 });
 
