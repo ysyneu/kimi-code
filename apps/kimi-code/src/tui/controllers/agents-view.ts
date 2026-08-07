@@ -12,7 +12,12 @@ import type { CustomEditor } from '../components/editor/custom-editor';
 import { EXIT_CONFIRM_WINDOW_MS } from '#/tui/constant/kimi-tui';
 import type { Theme } from '#/tui/theme';
 
-import { AgentsViewDispatch, DISPATCH_PLACEHOLDER, type DispatchSubmission } from './agents-view-dispatch';
+import {
+  AgentsViewDispatch,
+  DISPATCH_PLACEHOLDER,
+  type DispatchActivatableCommands,
+  type DispatchSubmission,
+} from './agents-view-dispatch';
 
 export interface AgentsViewHost {
   readonly state: {
@@ -39,6 +44,13 @@ export interface AgentsViewHost {
    * secondary-derived-alias exclusion as the chat's model picker.
    */
   agentsViewModelCompletions(): readonly ArgCompletionSpec[];
+  /**
+   * Skill + plugin-command entries and their activation maps for the
+   * dispatch composer's staged-activation category — same source and shape
+   * the main chat's own `/` menu uses, reused as-is (see `KimiTUI.
+   * agentsViewActivatableCommands`).
+   */
+  agentsViewActivatableCommands(): DispatchActivatableCommands;
   /**
    * Attach-mode footer badge feed: live roster counts while
    * detached; `undefined` clears the badge (return / close).
@@ -171,14 +183,17 @@ const DISPATCH_BUILTIN_WHITELIST: ReadonlySet<string> = new Set(['model']);
 /**
  * The dispatch autocomplete whitelist: `/model` filtered out of
  * `BUILTIN_SLASH_COMMANDS` (its copy is not reinvented here, only its
- * argument completion is added) plus the dispatch-local `/agent` item.
- * `getModelCompletions` sources live configured-model candidates for
- * `/model`'s argument position — passed in rather than read from a captured
- * host so the closure always sees the model list as of completion time, not
- * as of this call.
+ * argument completion is added), the dispatch-local `/agent` item, and every
+ * skill + plugin command the main chat's own `/` menu would show — same
+ * source, same entries, appended in the same order the main chat uses
+ * (`[...builtins, ...skillCommands, ...pluginCommands]`, see `KimiTUI.
+ * getSlashCommands`). `getModelCompletions`/`getActivatableCommands` are
+ * getters rather than captured snapshots so the closures they feed always
+ * see live data as of completion/menu-build time, not as of this call.
  */
 export function dispatchSlashCommands(
   getModelCompletions: () => readonly ArgCompletionSpec[],
+  getActivatableCommands: () => DispatchActivatableCommands,
 ): readonly KimiSlashCommand[] {
   const builtins = BUILTIN_SLASH_COMMANDS.filter((command) =>
     DISPATCH_BUILTIN_WHITELIST.has(command.name),
@@ -190,7 +205,7 @@ export function dispatchSlashCommands(
         }
       : command,
   );
-  return [...builtins, DISPATCH_AGENT_COMMAND];
+  return [...builtins, DISPATCH_AGENT_COMMAND, ...getActivatableCommands().commands];
 }
 
 /**
@@ -262,8 +277,17 @@ export class AgentsViewController {
 
     // The dispatch editor is built before the component: it renders into the
     // component's bottom box, so the initial props already reference it.
-    const dispatch = new AgentsViewDispatch(state.ui, this.host.agentsViewWorkDir());
-    dispatch.installAutocomplete(dispatchSlashCommands(() => this.host.agentsViewModelCompletions()));
+    const dispatch = new AgentsViewDispatch(
+      state.ui,
+      this.host.agentsViewWorkDir(),
+      () => this.host.agentsViewActivatableCommands(),
+    );
+    dispatch.installAutocomplete(
+      dispatchSlashCommands(
+        () => this.host.agentsViewModelCompletions(),
+        () => this.host.agentsViewActivatableCommands(),
+      ),
+    );
 
     const component = new AgentsViewApp(
       this.buildProps({
@@ -528,10 +552,13 @@ export class AgentsViewController {
   }
 
   /**
-   * Dispatch flow: create the session in the view's workDir,
-   * then send the first prompt. Staged model/profile overrides must ride that
-   * first prompt's submission body — the wire create route drops per-session
-   * agent config, so they never reach `createSession`. The new roster row
+   * Dispatch flow: create the session in the view's workDir, then apply the
+   * first RPC call. Staged model/profile overrides ride the first `prompt`
+   * call's submission body — the wire create route drops per-session agent
+   * config, so they never reach `createSession`. A staged skill/plugin
+   * activation instead calls `activateSkill`/`activatePluginCommand` in
+   * place of `prompt` — neither is literal text the model should see
+   * verbatim (see `DispatchActivation`'s doc comment). The new roster row
    * arrives on its own via the `event.session.created` subscription.
    */
   private async handleDispatch(submission: DispatchSubmission): Promise<void> {
@@ -552,7 +579,7 @@ export class AgentsViewController {
       const session = await this.host.harness.createSession({
         workDir: this.host.agentsViewWorkDir(),
       });
-      // Register BEFORE the first prompt: the server's
+      // Register BEFORE the first RPC call: the server's
       // `event.session.created` echo only enters the roster when the id is
       // already in the view's registry. The new row is pre-selected so the
       // dispatch is visibly confirmed the moment it lands.
@@ -560,7 +587,18 @@ export class AgentsViewController {
       void this.persistState(view);
       view.selectedId = session.id;
       this.pushProps();
-      if (rpc !== undefined) {
+      const { activation } = submission;
+      if (activation !== undefined) {
+        if (activation.kind === 'skill') {
+          await session.activateSkill(activation.skillName, activation.args);
+        } else {
+          await session.activatePluginCommand(
+            activation.pluginId,
+            activation.commandName,
+            activation.args,
+          );
+        }
+      } else if (rpc !== undefined) {
         await rpc.prompt({
           sessionId: session.id,
           input: [{ type: 'text', text: submission.text }],

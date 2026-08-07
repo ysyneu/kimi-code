@@ -7,11 +7,16 @@
  * in `./agents-view`); this module only accepts the final command array.
  * Model/profile selections are staged on the parsed submission and ride the
  * first prompt's submission body (the wire create route drops
- * per-session agent config, so createSession never sees them).
+ * per-session agent config, so createSession never sees them). Skill/plugin-
+ * command selections stage a `DispatchActivation` instead — applied via
+ * `session.activateSkill`/`activatePluginCommand` in place of the first
+ * `prompt` call (see `AgentsViewController.handleDispatch`), since neither
+ * is literal prompt text the model should see verbatim.
  */
 
 import type { TUI } from '@moonshot-ai/pi-tui';
 
+import { resolveSkillCommand } from '../commands/resolve';
 import type { KimiSlashCommand } from '../commands/types';
 import { CustomEditor } from '../components/editor/custom-editor';
 import {
@@ -19,10 +24,38 @@ import {
   type SlashAutocompleteCommand,
 } from '../components/editor/file-mention-provider';
 
+/**
+ * A staged skill or plugin-command activation: resolved at parse time from
+ * the same command names / lookup rules the main chat's own dispatcher uses
+ * (`commands/resolve.ts`'s `resolveSkillCommand` and plugin-map lookup),
+ * applied on the first RPC call after `createSession()` — `session.
+ * activateSkill`/`activatePluginCommand` instead of `session.prompt` — the
+ * same "stage the choice, apply on first RPC" shape `/model`/`/agent` use.
+ */
+export type DispatchActivation =
+  | { readonly kind: 'skill'; readonly skillName: string; readonly args: string }
+  | {
+      readonly kind: 'plugin-command';
+      readonly pluginId: string;
+      readonly commandName: string;
+      readonly args: string;
+    };
+
+/** Skill/plugin-command menu entries plus their activation-lookup maps —
+ *  the exact fields `KimiTUI` already caches for the main chat's own `/`
+ *  menu (`skillCommands`/`pluginCommands`/`skillCommandMap`/
+ *  `pluginCommandMap`), threaded through unchanged. */
+export interface DispatchActivatableCommands {
+  readonly commands: readonly KimiSlashCommand[];
+  readonly skillCommandMap: ReadonlyMap<string, string>;
+  readonly pluginCommandMap: ReadonlyMap<string, string>;
+}
+
 export interface DispatchSubmission {
   readonly text: string;
   readonly model?: string;
   readonly profile?: string;
+  readonly activation?: DispatchActivation;
 }
 
 export type DispatchParseResult = DispatchSubmission | { readonly error: string };
@@ -39,14 +72,46 @@ const MIN_NON_SPACE_CHARS = 3;
 export const DISPATCH_PLACEHOLDER = 'describe a task for a new session';
 
 /**
+ * Resolves a non-`/model`/`/agent` command name against the skill/plugin
+ * activation maps, mirroring `commands/resolve.ts`'s `resolveSlashCommandInput`
+ * skill and plugin-command branches exactly (same double-lookup for skills —
+ * bare name or `skill:`-prefixed — same `pluginId:commandName` split), so a
+ * name that resolves in the main chat resolves here too. Returns `undefined`
+ * for anything that isn't a known skill or plugin command.
+ */
+function resolveDispatchActivation(
+  commandName: string,
+  args: string,
+  { skillCommandMap, pluginCommandMap }: DispatchActivatableCommands,
+): DispatchActivation | undefined {
+  const skillName = resolveSkillCommand(skillCommandMap, commandName);
+  if (skillName !== undefined) return { kind: 'skill', skillName, args };
+  if (pluginCommandMap.has(commandName)) {
+    const separator = commandName.indexOf(':');
+    const pluginId = separator === -1 ? commandName : commandName.slice(0, separator);
+    const cmdName = separator === -1 ? '' : commandName.slice(separator + 1);
+    return { kind: 'plugin-command', pluginId, commandName: cmdName, args };
+  }
+  return undefined;
+}
+
+/**
  * Parses raw dispatch input. Plain text becomes the first prompt of a new
  * session; a leading `/model <name>` or `/agent <profile>` stages that
- * override for the first prompt. Any other leading slash command only exists
- * inside a session and is rejected, as is empty / near-empty input. `/model`
- * or `/agent` with no argument is rejected with a command-specific usage
- * hint rather than falling through to the generic too-short message.
+ * override for the first prompt; a leading skill or plugin-command name
+ * (resolved against `activatable`, the same maps the main chat's own
+ * dispatcher uses) stages a skill/plugin activation instead — see
+ * `DispatchActivation`. Any other leading slash command only exists inside a
+ * session and is rejected, as is empty / near-empty input. `/model` or
+ * `/agent` with no argument is rejected with a command-specific usage hint
+ * rather than falling through to the generic too-short message. Skill/
+ * plugin-command args carry no minimum length (matching the main chat, which
+ * applies none either — many skills take no arguments at all).
  */
-export function parseDispatchInput(raw: string): DispatchParseResult {
+export function parseDispatchInput(
+  raw: string,
+  activatable: DispatchActivatableCommands,
+): DispatchParseResult {
   const trimmed = raw.trim();
   let text = trimmed;
   let model: string | undefined;
@@ -57,6 +122,8 @@ export function parseDispatchInput(raw: string): DispatchParseResult {
     const command = spaceIndex === -1 ? trimmed : trimmed.slice(0, spaceIndex);
     const rest = spaceIndex === -1 ? '' : trimmed.slice(spaceIndex).trim();
     if (command !== '/model' && command !== '/agent') {
+      const activation = resolveDispatchActivation(command.slice(1), rest, activatable);
+      if (activation !== undefined) return { text: '', activation };
       return { error: `"${command}" is only available inside a session` };
     }
     const argSpaceIndex = rest.search(/\s/);
@@ -127,6 +194,10 @@ export class AgentsViewDispatch {
   constructor(
     ui: TUI,
     private readonly workDir: string,
+    /** Live skill/plugin-command lookup source for dispatch-mode parsing —
+     *  a getter (not a snapshot) so a submission always resolves against
+     *  whatever the host has cached as of submit time. */
+    private readonly getActivatableCommands: () => DispatchActivatableCommands,
   ) {
     // disablePasteBurst: the burst guard turns Enter-after-rapid-input into a
     // newline — right for the main editor's chat box, wrong here: the
@@ -169,7 +240,9 @@ export class AgentsViewDispatch {
       this.onExit?.();
       return;
     }
-    const parsed = this.replying ? parseReplyInput(raw) : parseDispatchInput(raw);
+    const parsed = this.replying
+      ? parseReplyInput(raw)
+      : parseDispatchInput(raw, this.getActivatableCommands());
     if ('error' in parsed) {
       this.onError?.(parsed.error);
       return;

@@ -23,6 +23,7 @@ import {
   AgentsViewDispatch,
   parseDispatchInput,
   parseReplyInput,
+  type DispatchActivatableCommands,
 } from '@/tui/controllers/agents-view-dispatch';
 import { currentTheme } from '@/tui/theme';
 import { EXIT_CONFIRM_WINDOW_MS } from '#/tui/constant/kimi-tui';
@@ -118,7 +119,12 @@ interface FakeHarness {
   renameSession: ReturnType<typeof vi.fn>;
   createSession: ReturnType<typeof vi.fn>;
   session: { getContext: ReturnType<typeof vi.fn>; steer: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> };
-  createdSession: { id: string; prompt: ReturnType<typeof vi.fn> };
+  createdSession: {
+    id: string;
+    prompt: ReturnType<typeof vi.fn>;
+    activateSkill: ReturnType<typeof vi.fn>;
+    activatePluginCommand: ReturnType<typeof vi.fn>;
+  };
   wirePrompt: ReturnType<typeof vi.fn> | undefined;
   wireTrust: ReturnType<typeof vi.fn> | undefined;
   wireRows: ReturnType<typeof vi.fn> | undefined;
@@ -142,7 +148,12 @@ function makeHarness(
     steer: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
   };
-  const createdSession = { id: 'new-session', prompt: vi.fn(async () => {}) };
+  const createdSession = {
+    id: 'new-session',
+    prompt: vi.fn(async () => {}),
+    activateSkill: vi.fn(async () => {}),
+    activatePluginCommand: vi.fn(async () => {}),
+  };
   const wirePrompt = opts.wire === true ? vi.fn(async () => {}) : undefined;
   const wireTrust = opts.wire === true ? vi.fn(opts.trust ?? (async () => true)) : undefined;
   const wireRows =
@@ -240,6 +251,8 @@ async function boot(
     registered?: readonly string[];
     /** Stubbed `/model` argument-completion candidates; defaults to a small fixed pair. */
     modelCompletions?: readonly ArgCompletionSpec[];
+    /** Stubbed skill/plugin-command menu entries + activation maps; defaults to empty (cold-start). */
+    activatableCommands?: DispatchActivatableCommands;
   } = {},
 ): Promise<Boot> {
   const homeDir = await mkdtemp(join(tmpdir(), 'agents-view-controller-'));
@@ -285,6 +298,7 @@ async function boot(
         { value: 'kimi-latest', description: 'Kimi Latest' },
         { value: 'kimi-thinking', description: 'Kimi Thinking' },
       ],
+    agentsViewActivatableCommands: () => opts.activatableCommands ?? EMPTY_ACTIVATABLE,
     setAttachBadge,
     getCurrentSessionId: () => opts.currentSessionId ?? '',
     onOpenSession: opts.onOpenSession,
@@ -1017,72 +1031,158 @@ describe('AgentsViewController — quick-open (alt+1-9)', () => {
 
 // ── Dispatch editor + whitelist autocomplete + submission parsing ──
 
+/** No skills/plugin commands cached — the common case for tests that don't
+ *  exercise staged activation. */
+const EMPTY_ACTIVATABLE: DispatchActivatableCommands = {
+  commands: [],
+  skillCommandMap: new Map(),
+  pluginCommandMap: new Map(),
+};
+
 describe('parseDispatchInput', () => {
   it('plain text passes through as-is (trimmed)', () => {
-    expect(parseDispatchInput('fix the flaky test')).toEqual({ text: 'fix the flaky test' });
-    expect(parseDispatchInput('  fix the flaky test  ')).toEqual({ text: 'fix the flaky test' });
+    expect(parseDispatchInput('fix the flaky test', EMPTY_ACTIVATABLE)).toEqual({
+      text: 'fix the flaky test',
+    });
+    expect(parseDispatchInput('  fix the flaky test  ', EMPTY_ACTIVATABLE)).toEqual({
+      text: 'fix the flaky test',
+    });
   });
 
   it('a /model prefix stages the model and keeps the rest as text', () => {
-    expect(parseDispatchInput('/model kimi-k2 fix the flaky test')).toEqual({
+    expect(parseDispatchInput('/model kimi-k2 fix the flaky test', EMPTY_ACTIVATABLE)).toEqual({
       text: 'fix the flaky test',
       model: 'kimi-k2',
     });
   });
 
   it('a /agent prefix stages the profile and keeps the rest as text', () => {
-    expect(parseDispatchInput('/agent reviewer fix the flaky test')).toEqual({
+    expect(parseDispatchInput('/agent reviewer fix the flaky test', EMPTY_ACTIVATABLE)).toEqual({
       text: 'fix the flaky test',
       profile: 'reviewer',
     });
   });
 
   it('collapses extra whitespace around the staged argument', () => {
-    expect(parseDispatchInput('/model   kimi-k2   fix the flaky test')).toEqual({
+    expect(parseDispatchInput('/model   kimi-k2   fix the flaky test', EMPTY_ACTIVATABLE)).toEqual({
       text: 'fix the flaky test',
       model: 'kimi-k2',
     });
   });
 
-  it('any other slash command is rejected as session-only', () => {
-    expect(parseDispatchInput('/yolo fix the flaky test')).toEqual({
+  it('any other slash command that is not a known skill/plugin command is rejected as session-only', () => {
+    expect(parseDispatchInput('/yolo fix the flaky test', EMPTY_ACTIVATABLE)).toEqual({
       error: '"/yolo" is only available inside a session',
     });
-    expect(parseDispatchInput('/help')).toEqual({
+    expect(parseDispatchInput('/help', EMPTY_ACTIVATABLE)).toEqual({
       error: '"/help" is only available inside a session',
     });
-    expect(parseDispatchInput('/modelx fix the flaky test')).toEqual({
+    expect(parseDispatchInput('/modelx fix the flaky test', EMPTY_ACTIVATABLE)).toEqual({
       error: '"/modelx" is only available inside a session',
     });
   });
 
   it('a slash token mid-text is plain text, not a command', () => {
-    expect(parseDispatchInput('fix /model handling')).toEqual({ text: 'fix /model handling' });
+    expect(parseDispatchInput('fix /model handling', EMPTY_ACTIVATABLE)).toEqual({
+      text: 'fix /model handling',
+    });
   });
 
   it('rejects empty and too-short input', () => {
-    expect(parseDispatchInput('')).toEqual({ error: 'Too short — describe the task' });
-    expect(parseDispatchInput('   ')).toEqual({ error: 'Too short — describe the task' });
-    expect(parseDispatchInput('ab')).toEqual({ error: 'Too short — describe the task' });
-    expect(parseDispatchInput('a b')).toEqual({ error: 'Too short — describe the task' });
+    expect(parseDispatchInput('', EMPTY_ACTIVATABLE)).toEqual({ error: 'Too short — describe the task' });
+    expect(parseDispatchInput('   ', EMPTY_ACTIVATABLE)).toEqual({
+      error: 'Too short — describe the task',
+    });
+    expect(parseDispatchInput('ab', EMPTY_ACTIVATABLE)).toEqual({
+      error: 'Too short — describe the task',
+    });
+    expect(parseDispatchInput('a b', EMPTY_ACTIVATABLE)).toEqual({
+      error: 'Too short — describe the task',
+    });
   });
 
   it('counts non-space characters for the minimum length', () => {
-    expect(parseDispatchInput('a b c')).toEqual({ text: 'a b c' });
+    expect(parseDispatchInput('a b c', EMPTY_ACTIVATABLE)).toEqual({ text: 'a b c' });
   });
 
   it('/model or /agent alone (no argument) gets a command-specific usage hint, not the generic too-short message', () => {
-    expect(parseDispatchInput('/model')).toEqual({
+    expect(parseDispatchInput('/model', EMPTY_ACTIVATABLE)).toEqual({
       error: '/model needs a model alias and a task — /model <alias> <task>',
     });
-    expect(parseDispatchInput('/agent')).toEqual({
+    expect(parseDispatchInput('/agent', EMPTY_ACTIVATABLE)).toEqual({
       error: '/agent needs a profile name and a task — /agent <profile> <task>',
     });
   });
 
   it('a staged /model or /agent WITH an argument but no task text still falls to the generic too-short message', () => {
-    expect(parseDispatchInput('/model kimi-k2')).toEqual({ error: 'Too short — describe the task' });
-    expect(parseDispatchInput('/agent reviewer')).toEqual({ error: 'Too short — describe the task' });
+    expect(parseDispatchInput('/model kimi-k2', EMPTY_ACTIVATABLE)).toEqual({
+      error: 'Too short — describe the task',
+    });
+    expect(parseDispatchInput('/agent reviewer', EMPTY_ACTIVATABLE)).toEqual({
+      error: 'Too short — describe the task',
+    });
+  });
+
+  describe('staged skill/plugin-command activation', () => {
+    const activatable: DispatchActivatableCommands = {
+      commands: [],
+      skillCommandMap: new Map([
+        ['reviewcode', 'reviewcode'], // builtin/sub-skill: bare name is canonical
+        ['skill:standup-notes', 'standup-notes'], // project/user/extra: skill:-prefixed
+      ]),
+      pluginCommandMap: new Map([['myplugin:mycommand', 'plugin command body']]),
+    };
+
+    it('a bare-name skill command (builtin/sub-skill) stages a skill activation', () => {
+      expect(parseDispatchInput('/reviewcode', activatable)).toEqual({
+        text: '',
+        activation: { kind: 'skill', skillName: 'reviewcode', args: '' },
+      });
+    });
+
+    it('a skill:-prefixed skill command stages a skill activation with that exact prefix, matching main-chat naming', () => {
+      expect(parseDispatchInput('/skill:standup-notes yesterday and today', activatable)).toEqual({
+        text: '',
+        activation: { kind: 'skill', skillName: 'standup-notes', args: 'yesterday and today' },
+      });
+    });
+
+    it('a skill registered under its skill:-prefixed name still resolves when typed bare, same as the main chat', () => {
+      expect(parseDispatchInput('/standup-notes something', activatable)).toEqual({
+        text: '',
+        activation: { kind: 'skill', skillName: 'standup-notes', args: 'something' },
+      });
+    });
+
+    it('a plugin command stages a plugin-command activation, splitting pluginId:commandName', () => {
+      expect(parseDispatchInput('/myplugin:mycommand do the thing', activatable)).toEqual({
+        text: '',
+        activation: {
+          kind: 'plugin-command',
+          pluginId: 'myplugin',
+          commandName: 'mycommand',
+          args: 'do the thing',
+        },
+      });
+    });
+
+    it('skill/plugin activation args carry no minimum length — a bare activation with no args is valid', () => {
+      expect(parseDispatchInput('/myplugin:mycommand', activatable)).toEqual({
+        text: '',
+        activation: {
+          kind: 'plugin-command',
+          pluginId: 'myplugin',
+          commandName: 'mycommand',
+          args: '',
+        },
+      });
+    });
+
+    it('an unknown command name still falls through to the session-only rejection, even with a non-empty activatable set', () => {
+      expect(parseDispatchInput('/not-a-real-command fix it', activatable)).toEqual({
+        error: '"/not-a-real-command" is only available inside a session',
+      });
+    });
   });
 });
 
@@ -1108,13 +1208,13 @@ describe('parseReplyInput', () => {
 });
 
 describe('AgentsViewDispatch — editor wiring', () => {
-  function makeDispatch(): AgentsViewDispatch {
+  function makeDispatch(activatable: DispatchActivatableCommands = EMPTY_ACTIVATABLE): AgentsViewDispatch {
     const tui = {
       requestRender: vi.fn(),
       render: vi.fn(() => []),
       terminal: { rows: 40, cols: 120 },
     } as unknown as TUI;
-    return new AgentsViewDispatch(tui, '/home/user/project');
+    return new AgentsViewDispatch(tui, '/home/user/project', () => activatable);
   }
 
   it('an editor submission parses and forwards the DispatchSubmission to onSubmit', () => {
@@ -1183,7 +1283,7 @@ describe('AgentsViewDispatch — editor wiring', () => {
 
   it('installAutocomplete suggests only the installed commands — no /help', async () => {
     const dispatch = makeDispatch();
-    dispatch.installAutocomplete(dispatchSlashCommands(() => []));
+    dispatch.installAutocomplete(dispatchSlashCommands(() => [], () => EMPTY_ACTIVATABLE));
     const provider = (
       dispatch.editor as unknown as {
         autocompleteProvider: {
@@ -1203,7 +1303,7 @@ describe('AgentsViewDispatch — editor wiring', () => {
   });
 
   it('the dispatch whitelist is /model from the builtins plus a local /agent — no /help', () => {
-    const commands = dispatchSlashCommands(() => []);
+    const commands = dispatchSlashCommands(() => [], () => EMPTY_ACTIVATABLE);
     expect(commands.map((command) => command.name).toSorted()).toEqual(['agent', 'model']);
     const agent = commands.find((command) => command.name === 'agent');
     expect(agent?.description).toBeTruthy();
@@ -1212,10 +1312,13 @@ describe('AgentsViewDispatch — editor wiring', () => {
   it('/model argument completion surfaces the supplied model candidates', async () => {
     const dispatch = makeDispatch();
     dispatch.installAutocomplete(
-      dispatchSlashCommands(() => [
-        { value: 'kimi-latest', description: 'Kimi Latest' },
-        { value: 'kimi-thinking', description: 'Kimi Thinking' },
-      ]),
+      dispatchSlashCommands(
+        () => [
+          { value: 'kimi-latest', description: 'Kimi Latest' },
+          { value: 'kimi-thinking', description: 'Kimi Thinking' },
+        ],
+        () => EMPTY_ACTIVATABLE,
+      ),
     );
     const provider = (
       dispatch.editor as unknown as {
@@ -1239,9 +1342,142 @@ describe('AgentsViewDispatch — editor wiring', () => {
   });
 
   it('/agent has no argument completer — the whitelist item ships with completeArgs unset', () => {
-    const commands = dispatchSlashCommands(() => []);
+    const commands = dispatchSlashCommands(() => [], () => EMPTY_ACTIVATABLE);
     const agent = commands.find((command) => command.name === 'agent');
     expect(agent?.completeArgs).toBeUndefined();
+  });
+
+  it('an editor submission for a known skill command forwards a skill activation to onSubmit, not a literal-text prompt', () => {
+    const activatable: DispatchActivatableCommands = {
+      commands: [],
+      skillCommandMap: new Map([['skill:reviewcode', 'reviewcode']]),
+      pluginCommandMap: new Map(),
+    };
+    const dispatch = makeDispatch(activatable);
+    const onSubmit = vi.fn();
+    dispatch.onSubmit = onSubmit;
+    dispatch.editor.onSubmit?.('/skill:reviewcode check the auth module');
+    expect(onSubmit).toHaveBeenCalledWith({
+      text: '',
+      activation: { kind: 'skill', skillName: 'reviewcode', args: 'check the auth module' },
+    });
+  });
+
+  it('an editor submission for a known plugin command forwards a plugin-command activation to onSubmit', () => {
+    const activatable: DispatchActivatableCommands = {
+      commands: [],
+      skillCommandMap: new Map(),
+      pluginCommandMap: new Map([['myplugin:mycommand', 'body']]),
+    };
+    const dispatch = makeDispatch(activatable);
+    const onSubmit = vi.fn();
+    dispatch.onSubmit = onSubmit;
+    dispatch.editor.onSubmit?.('/myplugin:mycommand do the thing');
+    expect(onSubmit).toHaveBeenCalledWith({
+      text: '',
+      activation: {
+        kind: 'plugin-command',
+        pluginId: 'myplugin',
+        commandName: 'mycommand',
+        args: 'do the thing',
+      },
+    });
+  });
+
+  it('menu sourcing includes every skill and plugin command supplied, using the exact entries given — no relabeling', () => {
+    const dispatch = makeDispatch();
+    const skillEntry = { name: 'skill:reviewcode', aliases: [], description: 'Review code changes' };
+    const pluginEntry = { name: 'myplugin:mycommand', aliases: [], description: 'Run my command' };
+    dispatch.installAutocomplete(
+      dispatchSlashCommands(
+        () => [],
+        () => ({
+          commands: [skillEntry, pluginEntry],
+          skillCommandMap: new Map(),
+          pluginCommandMap: new Map(),
+        }),
+      ),
+    );
+    const provider = (
+      dispatch.editor as unknown as {
+        autocompleteProvider: {
+          getSuggestions(
+            lines: string[],
+            cursorLine: number,
+            cursorCol: number,
+            options: { signal: AbortSignal },
+          ): Promise<{ items: { value: string; description?: string }[] } | null>;
+        };
+      }
+    ).autocompleteProvider;
+    return provider.getSuggestions(['/'], 0, 1, { signal: new AbortController().signal }).then((suggestions) => {
+      expect(suggestions?.items.map((item) => item.value).toSorted()).toEqual([
+        'agent',
+        'model',
+        'myplugin:mycommand',
+        'skill:reviewcode',
+      ]);
+    });
+  });
+
+  it('the menu never offers exit, quit, or q — those stay on the separate literal-text EXIT_COMMANDS path', async () => {
+    const dispatch = makeDispatch();
+    // A skill/plugin command deliberately named like the exit aliases would
+    // be a pathological fixture, not a realistic one — this test instead
+    // asserts against the REAL whitelist builder, which only ever draws from
+    // BUILTIN_SLASH_COMMANDS (filtered to just `model`) plus the dispatch-
+    // local `/agent` item plus whatever skill/plugin commands are supplied;
+    // `exit` (and its aliases `quit`/`q`) are never in that builtin filter.
+    dispatch.installAutocomplete(
+      dispatchSlashCommands(
+        () => [],
+        () => ({
+          commands: [{ name: 'skill:reviewcode', aliases: [], description: 'Review code' }],
+          skillCommandMap: new Map(),
+          pluginCommandMap: new Map(),
+        }),
+      ),
+    );
+    const provider = (
+      dispatch.editor as unknown as {
+        autocompleteProvider: {
+          getSuggestions(
+            lines: string[],
+            cursorLine: number,
+            cursorCol: number,
+            options: { signal: AbortSignal },
+          ): Promise<{ items: { value: string }[] } | null>;
+        };
+      }
+    ).autocompleteProvider;
+    const suggestions = await provider.getSuggestions(['/'], 0, 1, {
+      signal: new AbortController().signal,
+    });
+    const names = suggestions?.items.map((item) => item.value) ?? [];
+    expect(names).not.toContain('exit');
+    expect(names).not.toContain('quit');
+    expect(names).not.toContain('q');
+  });
+
+  it('empty skill/plugin caches (cold-start gap) leave the menu at exactly model + agent, no crash', async () => {
+    const dispatch = makeDispatch();
+    dispatch.installAutocomplete(dispatchSlashCommands(() => [], () => EMPTY_ACTIVATABLE));
+    const provider = (
+      dispatch.editor as unknown as {
+        autocompleteProvider: {
+          getSuggestions(
+            lines: string[],
+            cursorLine: number,
+            cursorCol: number,
+            options: { signal: AbortSignal },
+          ): Promise<{ items: { value: string }[] } | null>;
+        };
+      }
+    ).autocompleteProvider;
+    const suggestions = await provider.getSuggestions(['/'], 0, 1, {
+      signal: new AbortController().signal,
+    });
+    expect(suggestions?.items.map((item) => item.value).toSorted()).toEqual(['agent', 'model']);
   });
 });
 
@@ -1277,8 +1513,8 @@ describe('AgentsViewDispatch — @ mention autocomplete (functional verification
       render: vi.fn(() => []),
       terminal: { rows: 40, cols: 120 },
     } as unknown as TUI;
-    const dispatch = new AgentsViewDispatch(tui, workDir);
-    dispatch.installAutocomplete(dispatchSlashCommands(() => []));
+    const dispatch = new AgentsViewDispatch(tui, workDir, () => EMPTY_ACTIVATABLE);
+    dispatch.installAutocomplete(dispatchSlashCommands(() => [], () => EMPTY_ACTIVATABLE));
 
     dispatch.editor.handleInput('@');
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -1369,6 +1605,45 @@ describe('AgentsViewController — dispatch', () => {
     await flush();
     expect(b.fake.createdSession.prompt).toHaveBeenCalledWith('fix the flaky test');
     expect(b.fake.wirePrompt).not.toHaveBeenCalled();
+  });
+
+  it('a skill command stages an activateSkill call — never a literal-text Session.prompt', async () => {
+    const b = await boot([summary('s1')], {
+      activatableCommands: {
+        commands: [],
+        skillCommandMap: new Map([['skill:reviewcode', 'reviewcode']]),
+        pluginCommandMap: new Map(),
+      },
+    });
+    dir = b.homeDir;
+    b.view().dispatch.editor.onSubmit?.('/skill:reviewcode check the auth module');
+    await flush();
+    expect(b.fake.createSession).toHaveBeenCalledWith({ workDir: '/home/user/project' });
+    expect(b.fake.createdSession.activateSkill).toHaveBeenCalledWith(
+      'reviewcode',
+      'check the auth module',
+    );
+    expect(b.fake.createdSession.prompt).not.toHaveBeenCalled();
+  });
+
+  it('a plugin command stages an activatePluginCommand call — never a literal-text Session.prompt', async () => {
+    const b = await boot([summary('s1')], {
+      activatableCommands: {
+        commands: [],
+        skillCommandMap: new Map(),
+        pluginCommandMap: new Map([['myplugin:mycommand', 'body']]),
+      },
+    });
+    dir = b.homeDir;
+    b.view().dispatch.editor.onSubmit?.('/myplugin:mycommand do the thing');
+    await flush();
+    expect(b.fake.createSession).toHaveBeenCalledWith({ workDir: '/home/user/project' });
+    expect(b.fake.createdSession.activatePluginCommand).toHaveBeenCalledWith(
+      'myplugin',
+      'mycommand',
+      'do the thing',
+    );
+    expect(b.fake.createdSession.prompt).not.toHaveBeenCalled();
   });
 
   it('overrides without the wire transport fail before createSession (no orphan session)', async () => {

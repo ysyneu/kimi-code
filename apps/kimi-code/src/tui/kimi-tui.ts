@@ -105,6 +105,7 @@ import {
 import { CHROME_GUTTER } from './constant/rendering';
 import { MAX_TERMINAL_TITLE_LENGTH } from './constant/terminal';
 import { AgentsViewController } from './controllers/agents-view';
+import type { DispatchActivatableCommands } from './controllers/agents-view-dispatch';
 import { AuthFlowController } from './controllers/auth-flow';
 import { BtwPanelController } from './controllers/btw-panel';
 import { ClipboardImageHintController } from './controllers/clipboard-image-hint';
@@ -1643,6 +1644,33 @@ export class KimiTUI {
     return Object.entries(this.state.appState.availableModels)
       .filter(([alias]) => alias !== SECONDARY_DERIVED_MODEL_ALIAS)
       .map(([alias, model]) => ({ value: alias, description: modelDisplayName(alias, model) }));
+  }
+
+  /**
+   * Skill + plugin-command entries and activation-lookup maps for the
+   * dispatch composer's staged-activation category — the exact same cached
+   * fields (`skillCommands`/`pluginCommands`/`skillCommandMap`/
+   * `pluginCommandMap`) the main chat's own `/` menu and dispatcher already
+   * use (`getSlashCommands`, `resolveSlashCommandInput`), reused unchanged.
+   *
+   * Cold-start gap: both caches start empty and only populate once a
+   * session has been attached this run (`refreshSkillCommands`/
+   * `refreshPluginCommands` short-circuit to `[]` with no session). There is
+   * no session-independent enumeration anywhere in the SDK to warm them
+   * earlier — checked `session.listSkills`/`listPluginCommands` (both
+   * `sessionId`-scoped, including the v2 RPC client's internal catalog
+   * path) and the one genuinely session-independent call, `harness.
+   * listPlugins()`, which returns plugin metadata/counts, not command
+   * bodies. So on a fresh `kimi agents` launch with no prior attach, this
+   * returns empty lists — the dispatch menu simply omits the skill/plugin
+   * section until the first attach, same as an empty search result.
+   */
+  agentsViewActivatableCommands(): DispatchActivatableCommands {
+    return {
+      commands: [...this.skillCommands, ...this.pluginCommands],
+      skillCommandMap: this.skillCommandMap,
+      pluginCommandMap: this.pluginCommandMap,
+    };
   }
 
   /**
