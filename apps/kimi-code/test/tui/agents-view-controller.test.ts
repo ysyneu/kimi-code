@@ -698,6 +698,30 @@ describe('AgentsViewController — delete', () => {
     // Both rows leave the persisted view registry too.
     await waitForViewState(b.homeDir, { pins: new Set(), sessions: new Set() });
   });
+
+  it('deleting a row clears its pendingReplyIds/replyFailures/replyAttempts entries, including group-delete', async () => {
+    const b = await boot([summary('s1'), summary('s2')]);
+    dir = b.homeDir;
+    // Leftover bookkeeping a stuck/failed reply would have left behind.
+    b.view().pendingReplyIds.add('s1');
+    b.view().replyFailures.set('s1', { text: 'never sent' });
+    b.view().replyAttempts.set('s1', new Promise<void>(() => {}));
+    b.view().pendingReplyIds.add('s2');
+    b.view().replyFailures.set('s2', { text: 'also never sent' });
+    b.view().replyAttempts.set('s2', new Promise<void>(() => {}));
+
+    // selection starts on the Completed group header — archives both rows.
+    b.component().handleInput(CTRL_X);
+    b.component().handleInput(CTRL_X);
+    await flush();
+
+    expect(b.view().pendingReplyIds.has('s1')).toBe(false);
+    expect(b.view().replyFailures.has('s1')).toBe(false);
+    expect(b.view().replyAttempts.has('s1')).toBe(false);
+    expect(b.view().pendingReplyIds.has('s2')).toBe(false);
+    expect(b.view().replyFailures.has('s2')).toBe(false);
+    expect(b.view().replyAttempts.has('s2')).toBe(false);
+  });
 });
 
 describe('AgentsViewController — pin', () => {

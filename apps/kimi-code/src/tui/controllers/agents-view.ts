@@ -1143,6 +1143,9 @@ export class AgentsViewController {
         await this.host.harness.deleteSession(sessionId);
         view.roster.remove(sessionId);
         view.viewSessions.delete(sessionId);
+        view.pendingReplyIds.delete(sessionId);
+        view.replyFailures.delete(sessionId);
+        view.replyAttempts.delete(sessionId);
         removed += 1;
         if (view.selectedId === sessionId) view.selectedId = undefined;
       } catch {
