@@ -1056,6 +1056,40 @@ describe('WorkspaceHandlerService', () => {
     expect(settled).toBe(true);
   });
 
+  it('a stuck (never-settling) MCP ready fails create with a clear timeout error within the bound, instead of hanging forever', async () => {
+    const previousTimeoutEnv = process.env['KIMI_SNAPSHOT_TIMEOUT_MS'];
+    process.env['KIMI_SNAPSHOT_TIMEOUT_MS'] = '4000';
+    const svc = await build([
+      stubPair(IWorkspaceMcpService, workspaceMcpServiceStub(new Promise<void>(() => {}))),
+    ]);
+
+    vi.useFakeTimers();
+    try {
+      let settled = false;
+      const create = svc.create({ sessionId: 's1', workDir: '/tmp/proj' });
+      void create.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+
+      await vi.advanceTimersByTimeAsync(3999);
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(create).rejects.toBeInstanceOf(Error2);
+      await expect(create).rejects.toMatchObject({ code: ErrorCodes.SESSION_RESUME_TIMEOUT });
+      expect(settled).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      if (previousTimeoutEnv === undefined) delete process.env['KIMI_SNAPSHOT_TIMEOUT_MS'];
+      else process.env['KIMI_SNAPSHOT_TIMEOUT_MS'] = previousTimeoutEnv;
+    }
+  });
+
   it('hides a session from get/list until its resume finishes', async () => {
     let resolveMcpReady: (() => void) | undefined;
     const mcpReady = new Promise<void>((resolve) => {
