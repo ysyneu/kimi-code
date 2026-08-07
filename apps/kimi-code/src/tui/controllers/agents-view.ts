@@ -1,3 +1,4 @@
+import { parseIntegerEnv } from '@moonshot-ai/agent-core-v2';
 import type { Event, KimiHarness, Unsubscribe, WireSession } from '@moonshot-ai/kimi-code-sdk';
 import type { Component, Container, ProcessTerminal, TUI } from '@moonshot-ai/pi-tui';
 
@@ -127,18 +128,36 @@ export interface AgentsViewState {
   replyTargetId: string | undefined;
   /**
    * Row ids whose `space`-reply RPC is currently outstanding — renders a
-   * distinct "sending" glyph (never the busy spinner) until the RPC settles.
-   * See {@link handleReply}.
+   * distinct "sending" glyph (never the busy spinner) until the RPC settles
+   * OR the bounded client-side wait is exceeded, whichever comes first. See
+   * {@link handleReply}.
    */
   pendingReplyIds: Set<string>;
   /**
-   * One entry per row whose last reply attempt failed — rejected, or
-   * exceeded the bounded client-side wait ({@link raceTimeout}). Carries the
-   * lost text back so re-entering reply mode on that row restores it
-   * instead of dropping it (see `onReplyRequest`). Cleared on the next send
-   * attempt for that row (success or failure) and on a fresh re-entry.
+   * One entry per row whose last reply attempt is currently showing as
+   * failed — rejected, or exceeded the bounded client-side wait
+   * ({@link replyRpcTimeoutMs}) while the underlying RPC was still running.
+   * Carries the lost text back so re-entering reply mode on that row
+   * restores it instead of dropping it (see `onReplyRequest`). Cleared on
+   * the next send attempt for that row (success or failure), on a fresh
+   * re-entry, and — the late-ack case — if the underlying RPC the bounded
+   * wait gave up on turns out to have succeeded after all (see
+   * {@link settleReplyAttempt}).
    */
   replyFailures: Map<string, { text: string }>;
+  /**
+   * The reply RPC promise currently "owned" by each row's most recent
+   * {@link handleReply} call. The bounded wait in `handleReply` can give up
+   * on a row while the real RPC keeps running in the background; this map
+   * is how {@link settleReplyAttempt} tells whether a given attempt is
+   * still the one that matters for that row (its own promise still matches
+   * the map entry) before touching `pendingReplyIds`/`replyFailures` — a
+   * retry overwrites the entry, which is what lets a stale late arrival
+   * from the SUPERSEDED attempt no-op instead of clobbering the newer
+   * one's state. Not rendered; pure bookkeeping, same footing as
+   * `flashTimer`/`busyTicker` below.
+   */
+  replyAttempts: Map<string, Promise<void>>;
   selectedId: string | undefined;
   /**
    * The session id this SAME roster-attach lifecycle was last backed out of
@@ -177,24 +196,57 @@ export interface AgentsViewState {
 }
 
 /**
- * Bounds how long the view waits for a reply RPC before treating it as
- * failed, independent of whatever the server's own resume-chain timeout
- * does (or doesn't) do. Same order of magnitude as the server-side bound
- * applied to the resume/materialize chain this RPC funnels through
- * (`KIMI_SNAPSHOT_TIMEOUT_MS`'s default, `packages/kap-server/src/services/
- * snapshot/snapshotConfig.ts`) — this is a client-only, per-request backstop
- * on top of that, not a substitute for it, so it stays a plain local
- * constant rather than importing server config into the TUI process (the
- * connected kap-server may be a remote host, not this build).
+ * Per-attempt server-side bound this client assumes for headroom purposes
+ * when `KIMI_SNAPSHOT_TIMEOUT_MS` is unset — same default the resume chain's
+ * own bounds use (`agent-core-v2`'s `DEFAULT_ROOT_STAT_TIMEOUT_MS` /
+ * `DEFAULT_MCP_READY_TIMEOUT_MS`, both 4000).
  */
-export const REPLY_RPC_TIMEOUT_MS = 4000;
+const DEFAULT_SERVER_TIMEOUT_MS = 4000;
+
+/**
+ * Fixed slack added on top of the doubled server bound in
+ * {@link replyRpcTimeoutMs} — network RTT to reach the server at all, plus
+ * the several resume-chain awaits that stay unbounded after this fix round
+ * (`workspaceDirs.ready`, `hostEnv.ready`, `sessionMetadata.ready`,
+ * `sessionToolPolicy.ready`, the agent-profile loaders). Same order of
+ * magnitude as this codebase's other client-side RPC-wait constant,
+ * `MODEL_PICKER_REFRESH_TIMEOUT_MS` (`commands/config.ts`).
+ */
+const REPLY_RPC_TIMEOUT_MARGIN_MS = 2_000;
+
+/**
+ * Bounds how long the view waits for a reply RPC before treating it as
+ * failed. The server chain this RPC funnels through can legitimately stack
+ * TWO instances of the same server bound in series on a cold resume
+ * (`WorkspaceService.createOrTouch`'s root-stat wait, then
+ * `WorkspaceHandlerService.materializeSession`'s MCP-ready wait) before the
+ * client's own clock — started earlier, at RPC issue, not at either
+ * server-side timer's start — even gets to see either one resolve. Matching
+ * the server bound 1:1 is therefore guaranteed to fire first on any
+ * legitimately-slow-but-not-stuck resume, so this derives real headroom:
+ * twice the assumed per-attempt server bound plus a fixed margin. Reads
+ * `KIMI_SNAPSHOT_TIMEOUT_MS` fresh on every call (not cached at import) so
+ * raising that knob to tolerate a slower legitimate resume widens the
+ * client's patience too, instead of widening the gap between the two —
+ * deliberately the SAME env var the server-side bounds use, not a new
+ * client-only one (the connected kap-server shares this process's env —
+ * same-machine is today's only deployment; a remote-host kap-server would
+ * need its own signal, out of scope here).
+ */
+export function replyRpcTimeoutMs(): number {
+  const serverBound = parseIntegerEnv(process.env['KIMI_SNAPSHOT_TIMEOUT_MS'], DEFAULT_SERVER_TIMEOUT_MS, 100);
+  return 2 * serverBound + REPLY_RPC_TIMEOUT_MARGIN_MS;
+}
 
 /**
  * Bounds `promise` to `ms`: rejects with a timeout error if it hasn't
- * settled in time. Losing race leaves `promise` to settle in the
- * background, unobserved — same `Promise.race` + timer shape already used
- * for client-side RPC waits elsewhere in this codebase (`commands/config.
- * ts`'s `withTimeout`, `cli/run-prompt.ts`'s `raceWithTimeout`).
+ * settled in time. Losing race leaves `promise` itself still running in the
+ * background — this function doesn't observe it further, though a caller
+ * may (see {@link handleReply}, which attaches its own `.then` to the same
+ * promise for exactly that reason). Same `Promise.race` + timer shape
+ * already used for client-side RPC waits elsewhere in this codebase
+ * (`commands/config.ts`'s `withTimeout`, `cli/run-prompt.ts`'s
+ * `raceWithTimeout`).
  */
 function raceTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -420,6 +472,7 @@ export class AgentsViewController {
       replyTargetId: undefined,
       pendingReplyIds: new Set(),
       replyFailures: new Map(),
+      replyAttempts: new Map(),
       selectedId: undefined,
       originSessionId: undefined,
       confirmDeleteId: undefined,
@@ -717,8 +770,9 @@ export class AgentsViewController {
    * whether the send landed: `pendingReplyIds` while outstanding, then
    * either nothing (success — the roster's own `work_changed` fan-out picks
    * up the change) or `replyFailures` (rejection, or the bounded wait in
-   * {@link raceTimeout} was exceeded), which persists until the user
-   * re-enters reply mode on that row.
+   * {@link replyRpcTimeoutMs} was exceeded), which persists until the user
+   * re-enters reply mode on that row OR {@link settleReplyAttempt} clears it
+   * because the RPC the bound gave up on turns out to have succeeded.
    */
   private async handleReply(view: AgentsViewState, targetId: string, text: string): Promise<void> {
     const rpc = this.host.harness.wireRpc();
@@ -729,21 +783,66 @@ export class AgentsViewController {
     view.replyFailures.delete(targetId);
     view.pendingReplyIds.add(targetId);
     this.pushProps();
+
+    const attempt = rpc.prompt({ sessionId: targetId, input: [{ type: 'text', text }] });
+    view.replyAttempts.set(targetId, attempt);
+    // Keeps observing the RPC for as long as it actually takes, independent
+    // of the bounded wait below — a legitimately slow server that succeeds
+    // or fails AFTER the client gives up must still correct the row instead
+    // of freezing on whatever the bounded wait last wrote.
+    attempt.then(
+      () => this.settleReplyAttempt(view, targetId, attempt, text, false),
+      () => this.settleReplyAttempt(view, targetId, attempt, text, true),
+    );
+
     try {
-      await raceTimeout(
-        rpc.prompt({ sessionId: targetId, input: [{ type: 'text', text }] }),
-        REPLY_RPC_TIMEOUT_MS,
-      );
+      await raceTimeout(attempt, replyRpcTimeoutMs());
     } catch (error) {
+      // Either `attempt` itself rejected within the bound (the `.then`
+      // above already reconciled the maps for that, or is about to on the
+      // next microtask — this write is then redundant but harmless), or
+      // the bound was exceeded while `attempt` is still running — in that
+      // case this IS the only thing that marks the row failed right now;
+      // `settleReplyAttempt` fires later, whenever `attempt` really settles.
       if (this.host.state.agentsView !== view) return;
+      view.replyFailures.set(targetId, { text });
+      view.pendingReplyIds.delete(targetId);
       const row = view.roster.get(targetId);
       const name = row === undefined ? targetId : rosterRowName(row);
-      view.replyFailures.set(targetId, { text });
       this.flash(`Reply to "${name}" failed: ${error instanceof Error ? error.message : String(error)}`);
-    } finally {
-      if (this.host.state.agentsView === view) view.pendingReplyIds.delete(targetId);
       this.pushProps();
     }
+  }
+
+  /**
+   * The single place that applies a reply attempt's REAL outcome to
+   * `pendingReplyIds`/`replyFailures` — called once `attempt` actually
+   * settles, whether that happens inside {@link handleReply}'s bounded wait
+   * or well after it already gave up (a legitimately slow, not stuck,
+   * server). On success this is what corrects a false "reply failed" row
+   * left by an exceeded bound; on failure it (re)affirms the failure the
+   * bounded wait may already have shown. No-ops once a retry has replaced
+   * this attempt for the row — `view.replyAttempts.get(targetId)` no
+   * longer points at THIS promise, because a fresh `handleReply` call
+   * always overwrites the entry — or the view has been torn down, so a
+   * late arrival from a superseded attempt never clobbers a newer one's
+   * state (the accepted duplicate-prompt case: the user already saw the
+   * failure and chose to retry).
+   */
+  private settleReplyAttempt(
+    view: AgentsViewState,
+    targetId: string,
+    attempt: Promise<void>,
+    text: string,
+    failed: boolean,
+  ): void {
+    if (this.host.state.agentsView !== view) return;
+    if (view.replyAttempts.get(targetId) !== attempt) return;
+    view.replyAttempts.delete(targetId);
+    view.pendingReplyIds.delete(targetId);
+    if (failed) view.replyFailures.set(targetId, { text });
+    else view.replyFailures.delete(targetId);
+    this.pushProps();
   }
 
   /**

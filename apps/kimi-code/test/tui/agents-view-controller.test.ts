@@ -16,7 +16,7 @@ import {
   AgentsViewController,
   dispatchSlashCommands,
   hintDeferredPermissionOnce,
-  REPLY_RPC_TIMEOUT_MS,
+  replyRpcTimeoutMs,
   type AgentsViewHost,
   type AgentsViewState,
 } from '@/tui/controllers/agents-view';
@@ -1849,13 +1849,153 @@ describe('AgentsViewController — reply mode (space)', () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(b.view().pendingReplyIds.has('s1')).toBe(true);
 
-      await vi.advanceTimersByTimeAsync(REPLY_RPC_TIMEOUT_MS - 1);
+      const bound = replyRpcTimeoutMs();
+      await vi.advanceTimersByTimeAsync(bound - 1);
       expect(b.view().pendingReplyIds.has('s1')).toBe(true);
       expect(b.view().replyFailures.has('s1')).toBe(false);
 
       await vi.advanceTimersByTimeAsync(1);
       expect(b.view().pendingReplyIds.has('s1')).toBe(false);
       expect(b.view().replyFailures.get('s1')).toEqual({ text: 'here is more context' });
+    } finally {
+      vi.useRealTimers();
+      b.controller.close(); // clear the pending flash timer
+    }
+  });
+
+  it('replyRpcTimeoutMs derives from KIMI_SNAPSHOT_TIMEOUT_MS as 2× the server bound plus a fixed margin', () => {
+    const previousEnv = process.env['KIMI_SNAPSHOT_TIMEOUT_MS'];
+    try {
+      delete process.env['KIMI_SNAPSHOT_TIMEOUT_MS'];
+      const defaultBound = replyRpcTimeoutMs();
+      const margin = defaultBound - 2 * 4000; // 4000 = the server-side default this mirrors
+      expect(margin).toBeGreaterThan(0);
+
+      process.env['KIMI_SNAPSHOT_TIMEOUT_MS'] = '6000';
+      expect(replyRpcTimeoutMs()).toBe(2 * 6000 + margin);
+
+      // Same fallback discipline as the server-side bounds: unparsable or
+      // below-floor values fall back to the default, not to zero/NaN.
+      process.env['KIMI_SNAPSHOT_TIMEOUT_MS'] = 'not-a-number';
+      expect(replyRpcTimeoutMs()).toBe(defaultBound);
+    } finally {
+      if (previousEnv === undefined) delete process.env['KIMI_SNAPSHOT_TIMEOUT_MS'];
+      else process.env['KIMI_SNAPSHOT_TIMEOUT_MS'] = previousEnv;
+    }
+  });
+
+  it('a reply that succeeds AFTER the client-side bound was exceeded clears the false failure and stops showing it as failed', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    let resolvePrompt: (() => void) | undefined;
+    b.fake.wirePrompt!.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolvePrompt = resolve;
+        }),
+    );
+    vi.useFakeTimers();
+    try {
+      b.component().handleInput(DOWN);
+      b.component().handleInput(SPACE);
+      b.view().dispatch.editor.onSubmit?.('here is more context');
+      await vi.advanceTimersByTimeAsync(replyRpcTimeoutMs());
+
+      // The bound already fired: the row shows a false failure while the
+      // real RPC is still outstanding.
+      expect(b.view().pendingReplyIds.has('s1')).toBe(false);
+      expect(b.view().replyFailures.get('s1')).toEqual({ text: 'here is more context' });
+
+      // The legitimately-slow server now succeeds, well after the client
+      // gave up.
+      resolvePrompt?.();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(b.view().replyFailures.has('s1')).toBe(false);
+      expect(b.view().pendingReplyIds.has('s1')).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      b.controller.close(); // clear the pending flash timer
+    }
+  });
+
+  it('a reply that rejects AFTER the client-side bound was exceeded keeps the row failed with the same recoverable text', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    let rejectPrompt: ((error: Error) => void) | undefined;
+    b.fake.wirePrompt!.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectPrompt = reject;
+        }),
+    );
+    vi.useFakeTimers();
+    try {
+      b.component().handleInput(DOWN);
+      b.component().handleInput(SPACE);
+      b.view().dispatch.editor.onSubmit?.('here is more context');
+      await vi.advanceTimersByTimeAsync(replyRpcTimeoutMs());
+      expect(b.view().replyFailures.get('s1')).toEqual({ text: 'here is more context' });
+
+      rejectPrompt?.(new Error('network down'));
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Still failed, same recoverable text — nothing regressed by the
+      // late arrival, and re-entering reply mode still recovers the text.
+      expect(b.view().replyFailures.get('s1')).toEqual({ text: 'here is more context' });
+      expect(b.view().pendingReplyIds.has('s1')).toBe(false);
+      b.component().handleInput(SPACE);
+      expect(b.view().dispatch.editor.getText()).toBe('here is more context');
+    } finally {
+      vi.useRealTimers();
+      b.controller.close(); // clear the pending flash timer
+    }
+  });
+
+  it('a late settle from a SUPERSEDED attempt does not clobber a retry already in flight for the same row', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    let resolveFirst: (() => void) | undefined;
+    b.fake.wirePrompt!.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveFirst = resolve;
+        }),
+    );
+    vi.useFakeTimers();
+    try {
+      b.component().handleInput(DOWN);
+      b.component().handleInput(SPACE);
+      b.view().dispatch.editor.onSubmit?.('first attempt');
+      await vi.advanceTimersByTimeAsync(replyRpcTimeoutMs());
+      expect(b.view().replyFailures.get('s1')).toEqual({ text: 'first attempt' });
+
+      // User retries — a NEW attempt for the same row, still pending.
+      b.component().handleInput(SPACE);
+      expect(b.view().dispatch.editor.getText()).toBe('first attempt');
+      let resolveSecond: (() => void) | undefined;
+      b.fake.wirePrompt!.mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            resolveSecond = resolve;
+          }),
+      );
+      b.view().dispatch.editor.onSubmit?.('second attempt');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(b.view().pendingReplyIds.has('s1')).toBe(true);
+
+      // The ORIGINAL (superseded) attempt now settles late — must be a
+      // no-op against the retry's own in-flight state.
+      resolveFirst?.();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(b.view().pendingReplyIds.has('s1')).toBe(true);
+      expect(b.view().replyFailures.has('s1')).toBe(false);
+
+      // The retry itself then settles normally.
+      resolveSecond?.();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(b.view().pendingReplyIds.has('s1')).toBe(false);
+      expect(b.view().replyFailures.has('s1')).toBe(false);
     } finally {
       vi.useRealTimers();
       b.controller.close(); // clear the pending flash timer
