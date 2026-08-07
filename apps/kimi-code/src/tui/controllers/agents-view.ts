@@ -3,6 +3,7 @@ import type { Component, Container, ProcessTerminal, TUI } from '@moonshot-ai/pi
 
 import { AgentsRoster, type AgentsGroup, type AgentsGroupId } from '../agents/roster';
 import { loadAgentsViewState, saveAgentsViewState } from '../agents/roster-persistence';
+import { completeLeadingArg, type ArgCompletionSpec } from '../commands/complete-args';
 import { BUILTIN_SLASH_COMMANDS } from '../commands/registry';
 import type { KimiSlashCommand } from '../commands/types';
 import { AgentsViewApp, type AgentsViewProps } from '../components/agents-view/app';
@@ -32,6 +33,12 @@ export interface AgentsViewHost {
   agentsViewWorkDir(): string;
   /** Header label for the model new sessions dispatch with by default. */
   agentsViewModelLabel(): string;
+  /**
+   * `/model` argument completion candidates for the dispatch composer: every
+   * configured alias with its display label, same source and
+   * secondary-derived-alias exclusion as the chat's model picker.
+   */
+  agentsViewModelCompletions(): readonly ArgCompletionSpec[];
   /**
    * Attach-mode footer badge feed: live roster counts while
    * detached; `undefined` clears the badge (return / close).
@@ -143,7 +150,11 @@ const GLOBAL_EVENT_TYPES: ReadonlySet<string> = new Set([
  * Dispatch-local `/agent` item: the builtin registry has no profile command
  * (profiles are a `--agent` CLI concept, not an in-session slash command), so
  * the whitelist entry is defined here. Its parse branch lives in
- * `parseDispatchInput`.
+ * `parseDispatchInput`. No `completeArgs`: profile names come from
+ * filesystem discovery that's DI-service-only today (`agent-core-v2`'s
+ * `workspaceAgentProfileLoader`), not a plain list the TUI can call, so the
+ * argument position shows no suggestions — `argumentHint` below still labels
+ * it in the top-level `/` menu.
  */
 const DISPATCH_AGENT_COMMAND: KimiSlashCommand = {
   name: 'agent',
@@ -155,16 +166,29 @@ const DISPATCH_AGENT_COMMAND: KimiSlashCommand = {
 };
 
 /** Builtin commands that make sense outside a session. */
-const DISPATCH_BUILTIN_WHITELIST: ReadonlySet<string> = new Set(['model', 'help']);
+const DISPATCH_BUILTIN_WHITELIST: ReadonlySet<string> = new Set(['model']);
 
 /**
- * The dispatch autocomplete whitelist: `/model` + `/help` filtered out of
- * `BUILTIN_SLASH_COMMANDS` (their copy is not reinvented here) plus the
- * dispatch-local `/agent` item.
+ * The dispatch autocomplete whitelist: `/model` filtered out of
+ * `BUILTIN_SLASH_COMMANDS` (its copy is not reinvented here, only its
+ * argument completion is added) plus the dispatch-local `/agent` item.
+ * `getModelCompletions` sources live configured-model candidates for
+ * `/model`'s argument position — passed in rather than read from a captured
+ * host so the closure always sees the model list as of completion time, not
+ * as of this call.
  */
-export function dispatchSlashCommands(): readonly KimiSlashCommand[] {
+export function dispatchSlashCommands(
+  getModelCompletions: () => readonly ArgCompletionSpec[],
+): readonly KimiSlashCommand[] {
   const builtins = BUILTIN_SLASH_COMMANDS.filter((command) =>
     DISPATCH_BUILTIN_WHITELIST.has(command.name),
+  ).map((command) =>
+    command.name === 'model'
+      ? {
+          ...command,
+          completeArgs: (prefix: string) => completeLeadingArg(getModelCompletions(), prefix),
+        }
+      : command,
   );
   return [...builtins, DISPATCH_AGENT_COMMAND];
 }
@@ -239,7 +263,7 @@ export class AgentsViewController {
     // The dispatch editor is built before the component: it renders into the
     // component's bottom box, so the initial props already reference it.
     const dispatch = new AgentsViewDispatch(state.ui, this.host.agentsViewWorkDir());
-    dispatch.installAutocomplete(dispatchSlashCommands());
+    dispatch.installAutocomplete(dispatchSlashCommands(() => this.host.agentsViewModelCompletions()));
 
     const component = new AgentsViewApp(
       this.buildProps({

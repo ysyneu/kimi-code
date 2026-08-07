@@ -42,7 +42,9 @@ export const DISPATCH_PLACEHOLDER = 'describe a task for a new session';
  * Parses raw dispatch input. Plain text becomes the first prompt of a new
  * session; a leading `/model <name>` or `/agent <profile>` stages that
  * override for the first prompt. Any other leading slash command only exists
- * inside a session and is rejected, as is empty / near-empty input.
+ * inside a session and is rejected, as is empty / near-empty input. `/model`
+ * or `/agent` with no argument is rejected with a command-specific usage
+ * hint rather than falling through to the generic too-short message.
  */
 export function parseDispatchInput(raw: string): DispatchParseResult {
   const trimmed = raw.trim();
@@ -60,8 +62,13 @@ export function parseDispatchInput(raw: string): DispatchParseResult {
     const argSpaceIndex = rest.search(/\s/);
     const argument = argSpaceIndex === -1 ? rest : rest.slice(0, argSpaceIndex);
     text = argSpaceIndex === -1 ? '' : rest.slice(argSpaceIndex).trim();
-    if (command === '/model') model = argument === '' ? undefined : argument;
-    else profile = argument === '' ? undefined : argument;
+    if (argument === '') {
+      const placeholder = command === '/model' ? '<alias>' : '<profile>';
+      const noun = command === '/model' ? 'model alias' : 'profile name';
+      return { error: `${command} needs a ${noun} and a task — ${command} ${placeholder} <task>` };
+    }
+    if (command === '/model') model = argument;
+    else profile = argument;
   }
 
   if (text.replaceAll(/\s/g, '').length < MIN_NON_SPACE_CHARS) {

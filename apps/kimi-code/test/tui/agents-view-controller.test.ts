@@ -9,6 +9,7 @@ import chalk from 'chalk';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { loadAgentsViewState, saveAgentsViewState } from '@/tui/agents/roster-persistence';
+import type { ArgCompletionSpec } from '@/tui/commands/complete-args';
 import type { AgentsViewApp } from '@/tui/components/agents-view/app';
 import type { CustomEditor } from '@/tui/components/editor/custom-editor';
 import {
@@ -237,6 +238,8 @@ async function boot(
      * empty view.
      */
     registered?: readonly string[];
+    /** Stubbed `/model` argument-completion candidates; defaults to a small fixed pair. */
+    modelCompletions?: readonly ArgCompletionSpec[];
   } = {},
 ): Promise<Boot> {
   const homeDir = await mkdtemp(join(tmpdir(), 'agents-view-controller-'));
@@ -277,6 +280,11 @@ async function boot(
     agentsViewServerLabel: () => 'test-server',
     agentsViewWorkDir: () => '/home/user/project',
     agentsViewModelLabel: () => 'test-model',
+    agentsViewModelCompletions: () =>
+      opts.modelCompletions ?? [
+        { value: 'kimi-latest', description: 'Kimi Latest' },
+        { value: 'kimi-thinking', description: 'Kimi Thinking' },
+      ],
     setAttachBadge,
     getCurrentSessionId: () => opts.currentSessionId ?? '',
     onOpenSession: opts.onOpenSession,
@@ -1063,10 +1071,18 @@ describe('parseDispatchInput', () => {
     expect(parseDispatchInput('a b c')).toEqual({ text: 'a b c' });
   });
 
-  it('a staged /model or /agent without enough task text is too short', () => {
-    expect(parseDispatchInput('/model')).toEqual({ error: 'Too short — describe the task' });
+  it('/model or /agent alone (no argument) gets a command-specific usage hint, not the generic too-short message', () => {
+    expect(parseDispatchInput('/model')).toEqual({
+      error: '/model needs a model alias and a task — /model <alias> <task>',
+    });
+    expect(parseDispatchInput('/agent')).toEqual({
+      error: '/agent needs a profile name and a task — /agent <profile> <task>',
+    });
+  });
+
+  it('a staged /model or /agent WITH an argument but no task text still falls to the generic too-short message', () => {
     expect(parseDispatchInput('/model kimi-k2')).toEqual({ error: 'Too short — describe the task' });
-    expect(parseDispatchInput('/agent')).toEqual({ error: 'Too short — describe the task' });
+    expect(parseDispatchInput('/agent reviewer')).toEqual({ error: 'Too short — describe the task' });
   });
 });
 
@@ -1165,9 +1181,9 @@ describe('AgentsViewDispatch — editor wiring', () => {
     expect(onSubmit).toHaveBeenCalledWith({ text: '/exit' });
   });
 
-  it('installAutocomplete suggests only the installed commands', async () => {
+  it('installAutocomplete suggests only the installed commands — no /help', async () => {
     const dispatch = makeDispatch();
-    dispatch.installAutocomplete(dispatchSlashCommands());
+    dispatch.installAutocomplete(dispatchSlashCommands(() => []));
     const provider = (
       dispatch.editor as unknown as {
         autocompleteProvider: {
@@ -1183,18 +1199,49 @@ describe('AgentsViewDispatch — editor wiring', () => {
     const suggestions = await provider.getSuggestions(['/'], 0, 1, {
       signal: new AbortController().signal,
     });
+    expect(suggestions?.items.map((item) => item.value).toSorted()).toEqual(['agent', 'model']);
+  });
+
+  it('the dispatch whitelist is /model from the builtins plus a local /agent — no /help', () => {
+    const commands = dispatchSlashCommands(() => []);
+    expect(commands.map((command) => command.name).toSorted()).toEqual(['agent', 'model']);
+    const agent = commands.find((command) => command.name === 'agent');
+    expect(agent?.description).toBeTruthy();
+  });
+
+  it('/model argument completion surfaces the supplied model candidates', async () => {
+    const dispatch = makeDispatch();
+    dispatch.installAutocomplete(
+      dispatchSlashCommands(() => [
+        { value: 'kimi-latest', description: 'Kimi Latest' },
+        { value: 'kimi-thinking', description: 'Kimi Thinking' },
+      ]),
+    );
+    const provider = (
+      dispatch.editor as unknown as {
+        autocompleteProvider: {
+          getSuggestions(
+            lines: string[],
+            cursorLine: number,
+            cursorCol: number,
+            options: { signal: AbortSignal },
+          ): Promise<{ items: { value: string }[] } | null>;
+        };
+      }
+    ).autocompleteProvider;
+    const suggestions = await provider.getSuggestions(['/model kimi'], 0, 11, {
+      signal: new AbortController().signal,
+    });
     expect(suggestions?.items.map((item) => item.value).toSorted()).toEqual([
-      'agent',
-      'help',
-      'model',
+      'kimi-latest',
+      'kimi-thinking',
     ]);
   });
 
-  it('the dispatch whitelist is /model + /help from the builtins plus a local /agent', () => {
-    const commands = dispatchSlashCommands();
-    expect(commands.map((command) => command.name).toSorted()).toEqual(['agent', 'help', 'model']);
+  it('/agent has no argument completer — the whitelist item ships with completeArgs unset', () => {
+    const commands = dispatchSlashCommands(() => []);
     const agent = commands.find((command) => command.name === 'agent');
-    expect(agent?.description).toBeTruthy();
+    expect(agent?.completeArgs).toBeUndefined();
   });
 });
 
@@ -1215,7 +1262,7 @@ describe('AgentsViewDispatch — @ mention autocomplete (functional verification
   // Gap 11's open question: does `@` already trigger file-mention
   // completion in this exact composer, or does it need new wiring? This
   // constructs the dispatch composer exactly as `AgentsViewController.show`
-  // does (`installAutocomplete(dispatchSlashCommands())` against a real
+  // does (`installAutocomplete(dispatchSlashCommands(...))` against a real
   // workDir) and types `@` into it — functional proof, not a code-reading
   // assumption. It already works: `CustomEditor` auto-triggers on `@`/`#`
   // (pi-tui's `DEFAULT_AUTOCOMPLETE_TRIGGER_CHARACTERS`) and
@@ -1231,7 +1278,7 @@ describe('AgentsViewDispatch — @ mention autocomplete (functional verification
       terminal: { rows: 40, cols: 120 },
     } as unknown as TUI;
     const dispatch = new AgentsViewDispatch(tui, workDir);
-    dispatch.installAutocomplete(dispatchSlashCommands());
+    dispatch.installAutocomplete(dispatchSlashCommands(() => []));
 
     dispatch.editor.handleInput('@');
     await new Promise((resolve) => setTimeout(resolve, 20));

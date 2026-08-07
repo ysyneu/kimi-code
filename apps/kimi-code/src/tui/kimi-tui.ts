@@ -2,7 +2,7 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { DeviceAuthorization } from '@moonshot-ai/kimi-code-oauth';
-import { effectiveModelAlias, log } from '@moonshot-ai/kimi-code-sdk';
+import { effectiveModelAlias, log, SECONDARY_DERIVED_MODEL_ALIAS } from '@moonshot-ai/kimi-code-sdk';
 import type {
   ApprovalRequest,
   ApprovalResponse,
@@ -45,6 +45,7 @@ import {
   type KimiSlashCommand,
   type SkillListSession,
 } from './commands';
+import type { ArgCompletionSpec } from './commands/complete-args';
 import * as slashCommands from './commands/dispatch';
 import { AgentsExitConfirmComponent } from './components/agents-view/exit-confirm';
 import { BannerComponent } from './components/chrome/banner';
@@ -63,6 +64,7 @@ import {
 } from './components/dialogs/approval-preview';
 import { CompactionComponent } from './components/dialogs/compaction';
 import { HelpPanelComponent } from './components/dialogs/help-panel';
+import { modelDisplayName } from './components/dialogs/model-selector';
 import { QuestionDialogComponent } from './components/dialogs/question-dialog';
 import { SessionPickerComponent, type SessionRow } from './components/dialogs/session-picker';
 import {
@@ -1629,6 +1631,18 @@ export class KimiTUI {
     const alias = availableModels[model];
     const effective = alias === undefined ? undefined : effectiveModelAlias(alias);
     return effective?.displayName ?? effective?.model ?? model;
+  }
+
+  /**
+   * `/model` argument completion candidates for the dispatch composer: every
+   * configured alias, minus the synthesized `__secondary__` derived entry
+   * (same exclusion the chat's model picker applies) — never selectable
+   * directly.
+   */
+  agentsViewModelCompletions(): readonly ArgCompletionSpec[] {
+    return Object.entries(this.state.appState.availableModels)
+      .filter(([alias]) => alias !== SECONDARY_DERIVED_MODEL_ALIAS)
+      .map(([alias, model]) => ({ value: alias, description: modelDisplayName(alias, model) }));
   }
 
   /**
