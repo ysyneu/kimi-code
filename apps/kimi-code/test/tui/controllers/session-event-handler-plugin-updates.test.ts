@@ -13,6 +13,7 @@ function makeHost() {
     resetToolUi: vi.fn(),
     setStep: vi.fn(),
     finalizeTurn: vi.fn(),
+    finalizeLiveTextBuffers: vi.fn(),
     getTurnContext: vi.fn(() => ({ turnId: 1, step: 0 })),
     registerToolCall: vi.fn(),
     completeToolResult: vi.fn(),

@@ -2475,6 +2475,109 @@ describe('KimiTUI agents-view attach', () => {
     expect(driver.state.appState.streamingPhase).toBe('idle');
   });
 
+  it('a second turn.started with no intervening turn.ended finalizes the previous turn instead of concatenating its text into the new one (adjacent fix)', async () => {
+    const session = makeAttachSession('ses-attached');
+    session.getStatus.mockResolvedValue({
+      model: 'k2',
+      thinkingEffort: 'off',
+      permission: 'manual',
+      planMode: false,
+      contextTokens: 10,
+      maxContextTokens: 100,
+      contextUsage: 0.1,
+      busy: true,
+    });
+    let sessionEventListener: ((event: Event) => void) | undefined;
+    session.onEvent.mockImplementation((listener) => {
+      sessionEventListener = listener;
+      return () => {
+        sessionEventListener = undefined;
+      };
+    });
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+
+    driver.onOpenSession('ses-attached');
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(sessionEventListener).toBeDefined();
+
+    const streamingUI = (
+      driver as unknown as {
+        streamingUI: { flushNow(): void; hasActiveThinkingComponent(): boolean };
+      }
+    ).streamingUI;
+
+    // Turn A starts and produces real thinking content — mounts a live
+    // spinner — but never receives its own turn.ended.
+    sessionEventListener?.({
+      type: 'turn.started',
+      agentId: 'main',
+      sessionId: 'ses-attached',
+      turnId: 100,
+    } as Event);
+    sessionEventListener?.({
+      type: 'thinking.delta',
+      agentId: 'main',
+      sessionId: 'ses-attached',
+      turnId: 100,
+      delta: 'turn A reasoning',
+    } as Event);
+    streamingUI.flushNow();
+
+    // Turn B starts — a different turnId, no turn.ended(100) in between.
+    sessionEventListener?.({
+      type: 'turn.started',
+      agentId: 'main',
+      sessionId: 'ses-attached',
+      turnId: 101,
+    } as Event);
+
+    // Without the fix, turn A's thinking component is still live here and
+    // turn B's own delta would concatenate onto it instead of starting fresh.
+    const finalizedAfterTurnB = driver.state.transcriptContainer.children.filter(
+      (c) => c.constructor.name === 'ThinkingComponent' && (c as unknown as { mode: string }).mode === 'finalized',
+    );
+    expect(finalizedAfterTurnB).toHaveLength(1);
+    expect((finalizedAfterTurnB[0] as unknown as { text: string }).text).toBe('turn A reasoning');
+
+    sessionEventListener?.({
+      type: 'thinking.delta',
+      agentId: 'main',
+      sessionId: 'ses-attached',
+      turnId: 101,
+      delta: 'turn B reasoning',
+    } as Event);
+    streamingUI.flushNow();
+    sessionEventListener?.({
+      type: 'assistant.delta',
+      agentId: 'main',
+      sessionId: 'ses-attached',
+      turnId: 101,
+      delta: 'ok',
+    } as Event);
+    streamingUI.flushNow();
+    sessionEventListener?.({
+      type: 'turn.ended',
+      agentId: 'main',
+      sessionId: 'ses-attached',
+      turnId: 101,
+      reason: 'completed',
+    } as Event);
+
+    const allThinkingComponents = driver.state.transcriptContainer.children.filter(
+      (c) => c.constructor.name === 'ThinkingComponent',
+    );
+    expect(allThinkingComponents).toHaveLength(2);
+    expect(allThinkingComponents.map((c) => (c as unknown as { text: string }).text)).toEqual([
+      'turn A reasoning',
+      'turn B reasoning',
+    ]);
+    expect(streamingUI.hasActiveThinkingComponent()).toBe(false);
+  });
+
   it('attach with a pending roster reply to the same row awaits its settlement before resuming, then renders the reply bubble (R9 Q1a)', async () => {
     const session = makeAttachSession('ses-attached');
     session.getResumeState.mockReturnValue(

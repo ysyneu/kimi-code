@@ -317,8 +317,18 @@ export class SessionEventHandler {
       this.pluginCommandTurns.set(String(event.turnId), event.origin.pluginId);
     }
     this.clearAgentSwarmProgress();
+    this.host.streamingUI.flushNow();
     this.host.streamingUI.resetToolUi();
     this.host.streamingUI.setStep(0);
+    // A new turn.started with no intervening turn.ended for whatever the
+    // previous turn was (its own turn.ended can be lost the same way a
+    // fresh attach can miss events — see reconcileStreamingPhaseAfterAttach)
+    // must not leave that turn's thinking/assistant draft dangling into this
+    // one: it would otherwise keep accumulating into the same shared
+    // _activeThinkingComponent/_thinkingDraft, concatenating unrelated
+    // turns' text together. Same close-out handleStepBegin already does at
+    // step boundaries, applied here at the coarser turn boundary too.
+    this.host.streamingUI.finalizeLiveTextBuffers('waiting');
     this.host.patchLivePane({
       mode: 'waiting',
       pendingApproval: null,
