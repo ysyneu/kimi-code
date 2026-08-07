@@ -1996,7 +1996,15 @@ export class KimiTUI {
     this.state.footer.setBackgroundCounts({ bashTasks: 0, agentTasks: 0 });
     this.streamingUI.setTodoList([]);
     this.streamingUI.setTurnId(undefined);
-    this.setAppState({ mcpServersSummary: null });
+    // R9 Q1b: every session switch/attach starts from a settled 'idle'
+    // baseline, closing the agents-view guard exemption's actual gap (the
+    // exemption is about not blocking the switch, not about skipping this
+    // reset). Without it, a `turn.ended` missed by the no-backlog live
+    // subscription (attach subscribes only after this reset + hydrate +
+    // replay complete) can leave the phase permanently wedged non-idle —
+    // finalizeTurn's own idle-guard then silently no-ops forever for that
+    // session, since no later `turn.ended` for the SAME turn ever arrives.
+    this.setAppState({ mcpServersSummary: null, streamingPhase: 'idle' });
     this.streamingUI.setStep(0);
     this.streamingUI.resetLiveText();
     this.updateQueueDisplay();
@@ -2064,6 +2072,11 @@ export class KimiTUI {
       this.agentsViewController.detachForAttach(targetSessionId);
       return;
     }
+    // R9 Q1a: a reply just fired at this row from the roster is
+    // fire-and-forget — wait for it to settle (success or the bounded
+    // give-up) before taking the attach snapshot, so the snapshot can never
+    // be taken before the reply is durably applied server-side.
+    await this.agentsViewController.awaitPendingReply(targetSessionId);
     let session: Session;
     try {
       session = await this.harness.resumeSession({

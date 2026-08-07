@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 import {
   log,
+  SDKRpcClientWire,
   type ApprovalHandler,
   type ApprovalRequest,
   type Event,
@@ -166,7 +167,9 @@ function goalSnapshot(overrides: Partial<GoalSnapshot> = {}): GoalSnapshot {
   };
 }
 
-function createResumeState(overrides: { permissionMode?: string; planMode?: boolean } = {}) {
+function createResumeState(
+  overrides: { permissionMode?: string; planMode?: boolean; replay?: readonly unknown[] } = {},
+) {
   return {
     id: 'ses-latest',
     workDir: '/tmp/proj-a',
@@ -184,7 +187,7 @@ function createResumeState(overrides: { permissionMode?: string; planMode?: bool
           systemPrompt: '',
         },
         context: { history: [], tokenCount: 10 },
-        replay: [],
+        replay: overrides.replay ?? [],
         permission: { mode: overrides.permissionMode ?? 'manual', rules: [] },
         plan: overrides.planMode ? { id: 'plan-1', content: '', path: '/tmp/plan.md' } : null,
         swarmMode: false,
@@ -1927,7 +1930,10 @@ describe('KimiTUI agents-view attach', () => {
     updatedAt: 1_000,
   };
 
-  function makeAgentsHarness(session: ReturnType<typeof makeAttachSession>) {
+  function makeAgentsHarness(
+    session: ReturnType<typeof makeAttachSession>,
+    opts: { withWireReply?: boolean } = {},
+  ) {
     const listeners = new Set<(event: Event) => void>();
     const homeDir = mkdtempSync(join(tmpdir(), 'kimi-agents-attach-'));
     dirs.push(homeDir);
@@ -1938,6 +1944,44 @@ describe('KimiTUI agents-view attach', () => {
       join(homeDir, 'agents-view.json'),
       JSON.stringify({ pins: [], sessions: [ATTACH_SUMMARY.id, 'ses-other'] }),
     );
+    // Reply-from-roster (R9 Q1a) needs a real wire rpc — the plain
+    // listSessions()-seeded roster every other attach test uses has no
+    // prompt() route (handleReply requires the wire transport).
+    const wirePrompt = opts.withWireReply === true ? vi.fn(async () => {}) : undefined;
+    const wireRpc =
+      wirePrompt === undefined
+        ? undefined
+        : Object.assign(Object.create(SDKRpcClientWire.prototype) as SDKRpcClientWire, {
+            prompt: wirePrompt,
+            listSessionRows: vi.fn(async () => [
+              {
+                id: ATTACH_SUMMARY.id,
+                workspace_id: 'ws_1',
+                title: ATTACH_SUMMARY.title,
+                created_at: new Date(ATTACH_SUMMARY.createdAt).toISOString(),
+                updated_at: new Date(ATTACH_SUMMARY.updatedAt).toISOString(),
+                busy: false,
+                pending_interaction: 'none',
+                metadata: { cwd: ATTACH_SUMMARY.workDir },
+                agent_config: { model: 'k2' },
+                usage: {
+                  input_tokens: 0,
+                  output_tokens: 0,
+                  cache_read_tokens: 0,
+                  cache_creation_tokens: 0,
+                  total_cost_usd: 0,
+                  context_tokens: 0,
+                  context_limit: 0,
+                  turn_count: 0,
+                },
+                permission_rules: [],
+                message_count: 0,
+                last_seq: 0,
+              },
+            ]),
+            getWorkspaceTrustForSession: vi.fn(async () => true),
+            onConnectionState: () => () => {},
+          });
     const harness = makeHarness(session, {
       homeDir,
       listSessions: vi.fn(async () => [ATTACH_SUMMARY]),
@@ -1947,9 +1991,11 @@ describe('KimiTUI agents-view attach', () => {
           listeners.delete(listener);
         };
       },
+      ...(wireRpc === undefined ? {} : { wireRpc: vi.fn(() => wireRpc) }),
     });
     return {
       harness,
+      wirePrompt,
       emit: (event: Event) => {
         for (const listener of listeners) listener(event);
       },
@@ -2220,6 +2266,88 @@ describe('KimiTUI agents-view attach', () => {
     driver.state.appState.streamingPhase = 'waiting';
     await expect(driver.resumeSession('ses-other')).resolves.toBe(true);
     expect(driver.state.appState.sessionId).toBe('ses-other');
+  });
+
+  it('attach resets a stuck streamingPhase back to idle (R9 Q1b) — a missed turn.ended can no longer wedge the status permanently', async () => {
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+    // Simulate the R9 repro: a `turn.ended` for a previous session's short
+    // turn never reached this client (no event backlog on the live
+    // subscription), leaving the phase wedged non-idle.
+    driver.state.appState.streamingPhase = 'thinking';
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(driver.state.appState.streamingPhase).toBe('idle');
+  });
+
+  it('attach with a pending roster reply to the same row awaits its settlement before resuming, then renders the reply bubble (R9 Q1a)', async () => {
+    const session = makeAttachSession('ses-attached');
+    session.getResumeState.mockReturnValue(
+      createResumeState({
+        replay: [
+          {
+            time: Date.now(),
+            type: 'message',
+            message: {
+              role: 'user',
+              content: [{ type: 'text', text: 'reply from roster' }],
+              toolCalls: [],
+            },
+          },
+        ],
+      }),
+    );
+    const { harness, wirePrompt } = makeAgentsHarness(session, { withWireReply: true });
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+
+    let resolvePrompt: (() => void) | undefined;
+    wirePrompt!.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolvePrompt = resolve;
+        }),
+    );
+
+    vi.useFakeTimers();
+    try {
+      const component = driver.state.agentsView!.component;
+      component.handleInput('[B'); // down: select the only row
+      component.handleInput(' '); // space: enter reply mode
+      driver.state.agentsView!.dispatch.editor.onSubmit?.('reply from roster');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(driver.state.agentsView?.pendingReplyIds.has('ses-attached')).toBe(true);
+
+      // Enter attaches immediately, before the reply RPC has settled — this
+      // must not race ahead of the reply's own durability.
+      driver.onOpenSession('ses-attached');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.resumeSession).not.toHaveBeenCalled();
+
+      resolvePrompt?.();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(harness.resumeSession).toHaveBeenCalledWith({
+        id: 'ses-attached',
+        replayTurnLimit: REPLAY_TURN_LIMIT,
+      });
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+      // The reply's own bubble is present on the FIRST hydrate pass — no
+      // second attach needed to see it.
+      expect(
+        driver.state.transcriptEntries.some(
+          (entry) => entry.kind === 'user' && entry.content === 'reply from roster',
+        ),
+      ).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('normal mode keeps the streaming switch guard', async () => {

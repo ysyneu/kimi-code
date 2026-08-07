@@ -699,16 +699,18 @@ describe('AgentsViewController — delete', () => {
     await waitForViewState(b.homeDir, { pins: new Set(), sessions: new Set() });
   });
 
-  it('deleting a row clears its pendingReplyIds/replyFailures/replyAttempts entries, including group-delete', async () => {
+  it('deleting a row clears its pendingReplyIds/replyFailures/replyAttempts/replyBarriers entries, including group-delete', async () => {
     const b = await boot([summary('s1'), summary('s2')]);
     dir = b.homeDir;
     // Leftover bookkeeping a stuck/failed reply would have left behind.
     b.view().pendingReplyIds.add('s1');
     b.view().replyFailures.set('s1', { text: 'never sent' });
     b.view().replyAttempts.set('s1', new Promise<void>(() => {}));
+    b.view().replyBarriers.set('s1', new Promise<void>(() => {}));
     b.view().pendingReplyIds.add('s2');
     b.view().replyFailures.set('s2', { text: 'also never sent' });
     b.view().replyAttempts.set('s2', new Promise<void>(() => {}));
+    b.view().replyBarriers.set('s2', new Promise<void>(() => {}));
 
     // selection starts on the Completed group header — archives both rows.
     b.component().handleInput(CTRL_X);
@@ -718,9 +720,11 @@ describe('AgentsViewController — delete', () => {
     expect(b.view().pendingReplyIds.has('s1')).toBe(false);
     expect(b.view().replyFailures.has('s1')).toBe(false);
     expect(b.view().replyAttempts.has('s1')).toBe(false);
+    expect(b.view().replyBarriers.has('s1')).toBe(false);
     expect(b.view().pendingReplyIds.has('s2')).toBe(false);
     expect(b.view().replyFailures.has('s2')).toBe(false);
     expect(b.view().replyAttempts.has('s2')).toBe(false);
+    expect(b.view().replyBarriers.has('s2')).toBe(false);
   });
 });
 
@@ -2020,6 +2024,79 @@ describe('AgentsViewController — reply mode (space)', () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(b.view().pendingReplyIds.has('s1')).toBe(false);
       expect(b.view().replyFailures.has('s1')).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      b.controller.close(); // clear the pending flash timer
+    }
+  });
+
+  // ── attach barrier: awaitPendingReply (R9 Q1a) ──
+
+  it('awaitPendingReply resolves immediately when nothing is pending for the row', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    let settled = false;
+    void b.controller.awaitPendingReply('s1').then(() => {
+      settled = true;
+    });
+    await flush();
+    expect(settled).toBe(true);
+  });
+
+  it('awaitPendingReply resolves once a pending reply succeeds — not before', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    let resolvePrompt: (() => void) | undefined;
+    b.fake.wirePrompt!.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolvePrompt = resolve;
+        }),
+    );
+    b.component().handleInput(DOWN);
+    b.component().handleInput(SPACE);
+    b.view().dispatch.editor.onSubmit?.('here is more context');
+    await flush();
+    expect(b.view().replyBarriers.has('s1')).toBe(true);
+
+    let settled = false;
+    void b.controller.awaitPendingReply('s1').then(() => {
+      settled = true;
+    });
+    await flush();
+    expect(settled).toBe(false);
+
+    resolvePrompt?.();
+    await flush();
+    expect(settled).toBe(true);
+    // The barrier entry is cleaned up once it settles.
+    expect(b.view().replyBarriers.has('s1')).toBe(false);
+  });
+
+  it('awaitPendingReply resolves once the bounded wait gives up, even if the underlying RPC never settles', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    // Never resolves — the same permanently-hung RPC replyRpcTimeoutMs
+    // guards against; awaitPendingReply must not inherit that hang.
+    b.fake.wirePrompt!.mockImplementationOnce(() => new Promise<void>(() => {}));
+    vi.useFakeTimers();
+    try {
+      b.component().handleInput(DOWN);
+      b.component().handleInput(SPACE);
+      b.view().dispatch.editor.onSubmit?.('here is more context');
+      await vi.advanceTimersByTimeAsync(0);
+
+      let settled = false;
+      void b.controller.awaitPendingReply('s1').then(() => {
+        settled = true;
+      });
+
+      const bound = replyRpcTimeoutMs();
+      await vi.advanceTimersByTimeAsync(bound - 1);
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true);
     } finally {
       vi.useRealTimers();
       b.controller.close(); // clear the pending flash timer

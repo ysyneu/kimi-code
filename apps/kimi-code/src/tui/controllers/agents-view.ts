@@ -158,6 +158,19 @@ export interface AgentsViewState {
    * `flashTimer`/`busyTicker` below.
    */
   replyAttempts: Map<string, Promise<void>>;
+  /**
+   * The {@link handleReply} call's own promise for each row's most recent
+   * attempt — distinct from {@link replyAttempts}' raw RPC promise, which
+   * can run long after the client gives up: THIS promise always settles
+   * within {@link replyRpcTimeoutMs}, because `handleReply`'s own control
+   * flow bounds itself on that same wait (success or the bounded give-up,
+   * whichever comes first). The attach barrier
+   * ({@link AgentsViewController.awaitPendingReply}, R9 Q1a) awaits this
+   * map, never `replyAttempts`, so a stuck underlying RPC can never block an
+   * attach — only the bounded wait can. Entries are removed once the
+   * promise they hold settles.
+   */
+  replyBarriers: Map<string, Promise<void>>;
   selectedId: string | undefined;
   /**
    * The session id this SAME roster-attach lifecycle was last backed out of
@@ -431,7 +444,15 @@ export class AgentsViewController {
       if (view !== undefined) this.exitReplyMode(view);
       this.unfocusDispatch();
       if (view !== undefined && replyTarget !== undefined) {
-        void this.handleReply(view, replyTarget, submission.text);
+        // Bounded (replyRpcTimeoutMs) regardless of how long the underlying
+        // RPC actually takes — see replyBarriers' own doc. The attach
+        // barrier (awaitPendingReply) reads this map entry, never the raw
+        // RPC promise in replyAttempts.
+        const barrier = this.handleReply(view, replyTarget, submission.text);
+        view.replyBarriers.set(replyTarget, barrier);
+        void barrier.finally(() => {
+          if (view.replyBarriers.get(replyTarget) === barrier) view.replyBarriers.delete(replyTarget);
+        });
         return;
       }
       void this.handleDispatch(submission);
@@ -473,6 +494,7 @@ export class AgentsViewController {
       pendingReplyIds: new Set(),
       replyFailures: new Map(),
       replyAttempts: new Map(),
+      replyBarriers: new Map(),
       selectedId: undefined,
       originSessionId: undefined,
       confirmDeleteId: undefined,
@@ -530,6 +552,23 @@ export class AgentsViewController {
     // Panels deferred while the takeover was up mount now — the user is back
     // in the chat that owns the pending interaction.
     this.host.flushDeferredPanels?.();
+  }
+
+  /**
+   * Attach barrier (R9 Q1a): if `targetId` has a roster reply RPC in flight
+   * from this same lifecycle, waits for it to settle — success or the
+   * bounded {@link replyRpcTimeoutMs} give-up, see {@link
+   * AgentsViewState.replyBarriers} — before the caller takes an attach
+   * snapshot, so the snapshot can never race ahead of the reply's own
+   * durability. No-op (resolves immediately) when nothing is pending for
+   * this row. Reuses R8's own per-row bookkeeping instead of a new
+   * synchronization primitive; no separate timeout is added here since the
+   * awaited promise is already bounded.
+   */
+  async awaitPendingReply(targetId: string): Promise<void> {
+    const barrier = this.host.state.agentsView?.replyBarriers.get(targetId);
+    if (barrier === undefined) return;
+    await barrier;
   }
 
   /**
@@ -1146,6 +1185,7 @@ export class AgentsViewController {
         view.pendingReplyIds.delete(sessionId);
         view.replyFailures.delete(sessionId);
         view.replyAttempts.delete(sessionId);
+        view.replyBarriers.delete(sessionId);
         removed += 1;
         if (view.selectedId === sessionId) view.selectedId = undefined;
       } catch {
