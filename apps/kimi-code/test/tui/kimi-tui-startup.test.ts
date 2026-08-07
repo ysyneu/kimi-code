@@ -8,6 +8,7 @@ import {
   type ApprovalRequest,
   type Event,
   type GoalSnapshot,
+  type SkillSummary,
 } from '@moonshot-ai/kimi-code-sdk';
 import type { MigrationPlan } from '@moonshot-ai/migration-legacy';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -2365,6 +2366,105 @@ function uiContainsFooter(driver: StartupDriver): boolean {
   return visit(driver.state.ui);
 }
 
+// ── Agents-view dispatch skill-menu warm-up (R6 review fix) ──
+//
+// The dispatch composer's skill menu is normally sourced from
+// `skillCommands`, populated only once a session has attached this run
+// (`refreshSkillCommands(session)`). `warmAgentsViewSkillMenu` closes that
+// gap via `KimiHarness.listWorkspaceSkills` — the one session-independent
+// skill route the SDK has — so the menu offers skills on a completely cold
+// `kimi agents` launch too. These drive the real `KimiTUI`, not a fake
+// `AgentsViewHost`, to prove the actual wiring (not just the contract).
+
+describe('KimiTUI agents-view dispatch skill warm-up', () => {
+  interface WarmDriver extends StartupDriver {
+    agentsViewController: { show(): Promise<void> };
+    session: { id: string } | undefined;
+  }
+
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  function skillSummary(name: string): SkillSummary {
+    return {
+      name,
+      description: `${name} description`,
+      path: `/tmp/proj-a/.kimi/skills/${name}/SKILL.md`,
+      source: 'project',
+    };
+  }
+
+  async function bootColdAgentsView(listWorkspaceSkills: ReturnType<typeof vi.fn>): Promise<WarmDriver> {
+    const homeDir = mkdtempSync(join(tmpdir(), 'kimi-agents-warm-'));
+    dirs.push(homeDir);
+    // Empty view registry: a cold `kimi agents` launch has never dispatched
+    // or attached to anything yet.
+    writeFileSync(join(homeDir, 'agents-view.json'), JSON.stringify({ pins: [], sessions: [] }));
+    const harness = makeHarness(makeSession(), {
+      homeDir,
+      listSessions: vi.fn(async () => []),
+      listWorkspaceSkills,
+      onEvent: () => () => {},
+    });
+    const driver = makeDriver(harness, {
+      ...makeStartupInput(),
+      startupAgentsView: true,
+    }) as unknown as WarmDriver;
+    await driver.init();
+    expect(driver.state.startupState).toBe('agents-view');
+    await driver.agentsViewController.show();
+    expect(driver.state.agentsView).toBeDefined();
+    return driver;
+  }
+
+  async function slashMenuItems(driver: StartupDriver): Promise<string[]> {
+    const provider = (
+      driver.state.agentsView?.dispatch.editor as unknown as
+        | {
+            autocompleteProvider: {
+              getSuggestions(
+                lines: string[],
+                cursorLine: number,
+                cursorCol: number,
+                options: { signal: AbortSignal },
+              ): Promise<{ items: { value: string }[] } | null>;
+            };
+          }
+        | undefined
+    )?.autocompleteProvider;
+    if (provider === undefined) return [];
+    const suggestions = await provider.getSuggestions(['/'], 0, 1, { signal: new AbortController().signal });
+    return suggestions?.items.map((item) => item.value).toSorted() ?? [];
+  }
+
+  it('warms the dispatch composer skill menu via listWorkspaceSkills before any session attaches', async () => {
+    const listWorkspaceSkills = vi.fn(async () => [skillSummary('reviewcode')]);
+    const driver = await bootColdAgentsView(listWorkspaceSkills);
+
+    await vi.waitFor(async () => {
+      expect(await slashMenuItems(driver)).toContain('skill:reviewcode');
+    });
+
+    expect(listWorkspaceSkills).toHaveBeenCalledWith('/tmp/proj-a');
+    // The menu populated without ever creating or attaching a session —
+    // the whole point of a session-independent warm route.
+    expect(driver.session).toBeUndefined();
+  });
+
+  it('leaves the plugin section empty pre-attach — the skill warm never touches plugin state', async () => {
+    const listWorkspaceSkills = vi.fn(async () => [skillSummary('reviewcode')]);
+    const driver = await bootColdAgentsView(listWorkspaceSkills);
+
+    await vi.waitFor(async () => {
+      expect(await slashMenuItems(driver)).toContain('skill:reviewcode');
+    });
+
+    const names = await slashMenuItems(driver);
+    expect(names.some((name) => name.includes(':') && !name.startsWith('skill:'))).toBe(false);
+  });
+});
 
 // ── Agents-view exit confirmation (embedded server) ──
 

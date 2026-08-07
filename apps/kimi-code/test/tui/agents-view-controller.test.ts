@@ -253,6 +253,15 @@ async function boot(
     modelCompletions?: readonly ArgCompletionSpec[];
     /** Stubbed skill/plugin-command menu entries + activation maps; defaults to empty (cold-start). */
     activatableCommands?: DispatchActivatableCommands;
+    /**
+     * What `agentsViewActivatableCommands()` returns AFTER
+     * `warmAgentsViewSkillMenu()` resolves — simulates the real
+     * `KimiTUI`'s cache mutating in place once `listWorkspaceSkills`
+     * lands. `undefined` (the default) simulates a warm that finds
+     * nothing new: `activatableCommands` stays in effect, matching the
+     * real host's no-op-on-failure/no-op-if-already-warmed behavior.
+     */
+    warmedActivatableCommands?: DispatchActivatableCommands;
   } = {},
 ): Promise<Boot> {
   const homeDir = await mkdtemp(join(tmpdir(), 'agents-view-controller-'));
@@ -282,6 +291,7 @@ async function boot(
   const showError = vi.fn();
   const showStatus = vi.fn();
   const setAttachBadge = vi.fn();
+  let currentActivatable = opts.activatableCommands ?? EMPTY_ACTIVATABLE;
   const host: AgentsViewHost = {
     state,
     harness: fake.harness,
@@ -298,7 +308,10 @@ async function boot(
         { value: 'kimi-latest', description: 'Kimi Latest' },
         { value: 'kimi-thinking', description: 'Kimi Thinking' },
       ],
-    agentsViewActivatableCommands: () => opts.activatableCommands ?? EMPTY_ACTIVATABLE,
+    agentsViewActivatableCommands: () => currentActivatable,
+    warmAgentsViewSkillMenu: async () => {
+      if (opts.warmedActivatableCommands !== undefined) currentActivatable = opts.warmedActivatableCommands;
+    },
     setAttachBadge,
     getCurrentSessionId: () => opts.currentSessionId ?? '',
     onOpenSession: opts.onOpenSession,
@@ -1644,6 +1657,46 @@ describe('AgentsViewController — dispatch', () => {
       'do the thing',
     );
     expect(b.fake.createdSession.prompt).not.toHaveBeenCalled();
+  });
+
+  it('a cold view (no prior attach) offers skill commands once the host warms them — the plugin section stays empty, undisturbed by the warm', async () => {
+    const b = await boot([summary('s1')], {
+      // Cold-start: nothing warmed yet — matches a fresh `kimi agents`
+      // launch with no session attached this run.
+      activatableCommands: EMPTY_ACTIVATABLE,
+      // What `KimiTUI.warmAgentsViewSkillMenu()` leaves behind once
+      // `listWorkspaceSkills` lands: skills only — the plugin half of the
+      // cold-start gap has no session-independent route to close it, so a
+      // real warm never touches plugin fields either.
+      warmedActivatableCommands: {
+        commands: [{ name: 'skill:reviewcode', aliases: [], description: 'Review code changes' }],
+        skillCommandMap: new Map([['skill:reviewcode', 'reviewcode']]),
+        pluginCommandMap: new Map(),
+      },
+    });
+    dir = b.homeDir;
+    const editor = b.view().dispatch.editor;
+    const provider = (
+      editor as unknown as {
+        autocompleteProvider: {
+          getSuggestions(
+            lines: string[],
+            cursorLine: number,
+            cursorCol: number,
+            options: { signal: AbortSignal },
+          ): Promise<{ items: { value: string }[] } | null>;
+        };
+      }
+    ).autocompleteProvider;
+
+    await flush();
+
+    const suggestions = await provider.getSuggestions(['/'], 0, 1, { signal: new AbortController().signal });
+    const names = suggestions?.items.map((item) => item.value).toSorted() ?? [];
+    expect(names).toEqual(['agent', 'model', 'skill:reviewcode']);
+    // No plugin-command entry appeared — only the skill half of the gap
+    // closed.
+    expect(names.some((name) => name.includes(':') && !name.startsWith('skill:'))).toBe(false);
   });
 
   it('overrides without the wire transport fail before createSession (no orphan session)', async () => {

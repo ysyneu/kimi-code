@@ -52,6 +52,17 @@ export interface AgentsViewHost {
    */
   agentsViewActivatableCommands(): DispatchActivatableCommands;
   /**
+   * Fills the skill half of `agentsViewActivatableCommands`'s cold-start
+   * gap (no session attached this run yet) via whatever session-independent
+   * route the host has for it — the controller calls this once at view
+   * mount and re-reads `agentsViewActivatableCommands()` when it resolves;
+   * it never inspects this method's return value. No plugin-command
+   * equivalent exists to warm the same way (see `KimiTUI.
+   * warmAgentsViewSkillMenu`'s doc comment), so the plugin half of the gap
+   * is unaffected by this call.
+   */
+  warmAgentsViewSkillMenu(): Promise<void>;
+  /**
    * Attach-mode footer badge feed: live roster counts while
    * detached; `undefined` clears the badge (return / close).
    */
@@ -382,6 +393,9 @@ export class AgentsViewController {
     // Trust badges load after mount: the roster is already useful without
     // them, and the per-row reads must never block or break show().
     void this.loadTrust((wireRows ?? summaries ?? []).map((row) => row.id));
+    // Skill cold-start gap (R6 review): the composer is already usable
+    // without the warmed menu, so this must never block show() either.
+    void this.warmSkillMenu(dispatch);
     // A seeded busy row must start the spinner ticker without waiting for an event.
     this.syncBusyTicker();
   }
@@ -519,6 +533,29 @@ export class AgentsViewController {
       }),
     );
     if (changed && this.host.state.agentsView === view) this.pushProps();
+  }
+
+  /**
+   * Closes the dispatch composer's skill cold-start gap (R6 review):
+   * `agentsViewActivatableCommands()` only reflects skills once a session
+   * has attached this run, so the menu built at mount time can miss them.
+   * Same "load after mount, never block show()" shape as `loadTrust` —
+   * awaits the host's warming call, then re-installs the dispatch
+   * autocomplete so the on-screen `/` menu picks up whatever the host
+   * filled in, without the user needing to reopen the view. No-ops if the
+   * view closed or was replaced by a fresh `show()` while awaiting.
+   */
+  private async warmSkillMenu(dispatch: AgentsViewDispatch): Promise<void> {
+    const view = this.host.state.agentsView;
+    if (view === undefined) return;
+    await this.host.warmAgentsViewSkillMenu();
+    if (this.host.state.agentsView !== view) return;
+    dispatch.installAutocomplete(
+      dispatchSlashCommands(
+        () => this.host.agentsViewModelCompletions(),
+        () => this.host.agentsViewActivatableCommands(),
+      ),
+    );
   }
 
   /**

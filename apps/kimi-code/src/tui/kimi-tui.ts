@@ -324,6 +324,11 @@ export class KimiTUI {
   readonly skillCommandMap = new Map<string, string>();
   private pluginCommands: readonly KimiSlashCommand[] = [];
   readonly pluginCommandMap = new Map<string, string>();
+  /** Agents-view dispatch menu's skill cold-start fallback — see
+   *  `warmAgentsViewSkillMenu`. Empty until a warm succeeds; superseded the
+   *  moment `skillCommands` itself becomes non-empty (a session attached). */
+  private agentsViewWorkspaceSkillCommands: readonly KimiSlashCommand[] = [];
+  private agentsViewWorkspaceSkillCommandMap: ReadonlyMap<string, string> = new Map();
   private readonly imageStore = new ImageAttachmentStore();
   private fdPath: string | null = detectFdPath();
   private fdDownloadStarted = false;
@@ -1653,24 +1658,58 @@ export class KimiTUI {
    * `pluginCommandMap`) the main chat's own `/` menu and dispatcher already
    * use (`getSlashCommands`, `resolveSlashCommandInput`), reused unchanged.
    *
-   * Cold-start gap: both caches start empty and only populate once a
-   * session has been attached this run (`refreshSkillCommands`/
-   * `refreshPluginCommands` short-circuit to `[]` with no session). There is
-   * no session-independent enumeration anywhere in the SDK to warm them
-   * earlier — checked `session.listSkills`/`listPluginCommands` (both
-   * `sessionId`-scoped, including the v2 RPC client's internal catalog
-   * path) and the one genuinely session-independent call, `harness.
-   * listPlugins()`, which returns plugin metadata/counts, not command
-   * bodies. So on a fresh `kimi agents` launch with no prior attach, this
-   * returns empty lists — the dispatch menu simply omits the skill/plugin
-   * section until the first attach, same as an empty search result.
+   * Cold-start gap, skill half: closed by `warmAgentsViewSkillMenu` — while
+   * `skillCommands` itself is still empty (no session attached this run),
+   * this falls back to `agentsViewWorkspaceSkillCommands`, the workspace-
+   * level warm result.
+   *
+   * Cold-start gap, plugin half: remains. `pluginCommands` only populates
+   * once a session has attached (`refreshPluginCommands` short-circuits to
+   * `[]` with no session) and there is no session-independent
+   * plugin-command route to warm it with — `session.listPluginCommands()`
+   * is `sessionId`-scoped (including the v2 RPC client's internal catalog
+   * path), and `KimiHarness` has no `listPlugins`/equivalent method at all
+   * (only `Session.listPlugins()`, itself session-scoped). So on a fresh
+   * `kimi agents` launch with no prior attach, the plugin section of the
+   * dispatch menu stays empty until the first attach.
    */
   agentsViewActivatableCommands(): DispatchActivatableCommands {
+    const skillsWarmed = this.skillCommands.length > 0;
     return {
-      commands: [...this.skillCommands, ...this.pluginCommands],
-      skillCommandMap: this.skillCommandMap,
+      commands: [
+        ...(skillsWarmed ? this.skillCommands : this.agentsViewWorkspaceSkillCommands),
+        ...this.pluginCommands,
+      ],
+      skillCommandMap: skillsWarmed ? this.skillCommandMap : this.agentsViewWorkspaceSkillCommandMap,
       pluginCommandMap: this.pluginCommandMap,
     };
+  }
+
+  /**
+   * `AgentsViewHost` seam: fills `agentsViewActivatableCommands`'s skill
+   * cold-start gap via `KimiHarness.listWorkspaceSkills` — "skills visible
+   * to a new session in `workDir`, without creating that session" — which
+   * is exactly what the dispatch composer needs, since every session it
+   * creates opens in `agentsViewWorkDir()`. Fed through the same
+   * `buildSkillSlashCommands` helper `refreshSkillCommands` already uses,
+   * so a warmed entry is indistinguishable in shape from a session-sourced
+   * one. No-op once `skillCommands` is non-empty (a real session has
+   * attached this run — its own list always wins over the workspace guess)
+   * or if the call fails; either way `agentsViewActivatableCommands` simply
+   * keeps returning whatever it already had.
+   */
+  async warmAgentsViewSkillMenu(): Promise<void> {
+    if (this.skillCommands.length > 0) return;
+    let skills;
+    try {
+      skills = await this.harness.listWorkspaceSkills(this.agentsViewWorkDir());
+    } catch {
+      return;
+    }
+    if (this.skillCommands.length > 0) return;
+    const warmed = buildSkillSlashCommands(skills);
+    this.agentsViewWorkspaceSkillCommands = warmed.commands;
+    this.agentsViewWorkspaceSkillCommandMap = warmed.commandMap;
   }
 
   /**
