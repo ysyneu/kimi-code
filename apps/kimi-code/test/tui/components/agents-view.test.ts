@@ -1,11 +1,16 @@
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import type { Terminal, TUI } from '@moonshot-ai/pi-tui';
 import chalk from 'chalk';
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import type { AgentsGroup, AgentsGroupId, AgentsRosterRow } from '@/tui/agents/roster';
 import { AgentsViewApp, type AgentsViewProps } from '@/tui/components/agents-view/app';
 import { AgentsExitConfirmComponent } from '@/tui/components/agents-view/exit-confirm';
 import { CustomEditor } from '@/tui/components/editor/custom-editor';
+import { FileMentionProvider } from '@/tui/components/editor/file-mention-provider';
 import { darkColors } from '@/tui/theme/colors';
 
 const ANSI_SGR = /\[[0-9;]*m/g;
@@ -1202,6 +1207,103 @@ describe('AgentsViewApp — reply panel key routing (task A1)', () => {
     app.handleInput(ESC);
     expect(onEscape).toHaveBeenCalledTimes(1);
     expect(onReplyClose).not.toHaveBeenCalled();
+  });
+
+  // Regression: the shared editor's own @-mention autocomplete dropdown
+  // must win Up/Down over the panel's close-and-move-selection shortcut —
+  // otherwise navigating suggestions instead silently closes the panel,
+  // moves the roster selection, and (at the controller layer, via
+  // exitReplyMode's unconditional setText('')) discards the draft.
+  describe('↑/↓ vs. an open autocomplete dropdown', () => {
+    let dir: string | undefined;
+    afterEach(async () => {
+      if (dir !== undefined) {
+        await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+      }
+      dir = undefined;
+    });
+
+    async function editorWithOpenAutocomplete(): Promise<CustomEditor> {
+      const workDir = await mkdtemp(join(tmpdir(), 'agents-view-reply-panel-mention-'));
+      dir = workDir;
+      await writeFile(join(workDir, 'incident-notes.md'), '# notes');
+      const editor = makeDispatchEditor();
+      // fdPath null: same fallback-to-real-fs-scan configuration
+      // `AgentsViewDispatch.installAutocomplete` wires up in production.
+      editor.setAutocompleteProvider(new FileMentionProvider([], workDir, null));
+      editor.handleInput('@');
+      // The scan + suggestion pipeline is async (debounce timer + a real
+      // fs.readdir); give it a turn to land, mirroring the existing
+      // "AgentsViewDispatch — @ mention autocomplete" controller test.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(editor.isShowingAutocomplete()).toBe(true);
+      return editor;
+    }
+
+    it('↑ navigates the dropdown instead of closing the panel — fails without the isShowingAutocomplete() guard', async () => {
+      const editor = await editorWithOpenAutocomplete();
+      const handleInputSpy = vi.spyOn(editor, 'handleInput');
+      const onReplyClose = vi.fn();
+      const onSelect = vi.fn();
+      const app = makeApp(
+        replyProps({
+          onReplyClose,
+          onSelect,
+          dispatchEditor: editor,
+          groups: [group('completed', [row('a', { title: 'a title' }), row('s1', { title: 's1 title' })])],
+          selectedId: 's1',
+        }),
+      );
+
+      app.handleInput('\u001B[A'); // up-arrow
+
+      // The panel stayed open and the roster selection didn't move —
+      // the keystroke went to the editor's own dropdown navigation instead.
+      expect(onReplyClose).not.toHaveBeenCalled();
+      expect(onSelect).not.toHaveBeenCalled();
+      expect(handleInputSpy).toHaveBeenCalledWith('\u001B[A');
+      // The draft (the `@` that opened the dropdown) is still there — no
+      // silent loss.
+      expect(editor.getText()).toBe('@');
+      expect(editor.isShowingAutocomplete()).toBe(true);
+    });
+
+    it('↓ navigates the dropdown instead of closing the panel', async () => {
+      const editor = await editorWithOpenAutocomplete();
+      const handleInputSpy = vi.spyOn(editor, 'handleInput');
+      const onReplyClose = vi.fn();
+      const onSelect = vi.fn();
+      const app = makeApp(replyProps({ onReplyClose, onSelect, dispatchEditor: editor }));
+
+      app.handleInput('\u001B[B'); // down-arrow
+
+      expect(onReplyClose).not.toHaveBeenCalled();
+      expect(onSelect).not.toHaveBeenCalled();
+      expect(handleInputSpy).toHaveBeenCalledWith('\u001B[B');
+      expect(editor.getText()).toBe('@');
+      expect(editor.isShowingAutocomplete()).toBe(true);
+    });
+
+    it('↑/↓ still close the panel and move the selection once the dropdown is dismissed', () => {
+      // No autocomplete provider installed at all here — same as every
+      // other panel test in this file — confirms the guard doesn't disable
+      // the ordinary close-and-move behavior when nothing is open.
+      const onReplyClose = vi.fn();
+      const onSelect = vi.fn();
+      const app = makeApp(
+        replyProps({
+          onReplyClose,
+          onSelect,
+          groups: [group('completed', [row('a', { title: 'a title' }), row('s1', { title: 's1 title' })])],
+          selectedId: 's1',
+        }),
+      );
+      app.handleInput('\u001B[A');
+      expect(onReplyClose).toHaveBeenCalledTimes(1);
+      expect(onSelect).toHaveBeenCalledWith('a');
+    });
   });
 });
 
