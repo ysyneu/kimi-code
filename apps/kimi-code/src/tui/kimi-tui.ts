@@ -1703,7 +1703,8 @@ export class KimiTUI {
     let skills;
     try {
       skills = await this.harness.listWorkspaceSkills(this.agentsViewWorkDir());
-    } catch {
+    } catch (error) {
+      log.debug('agents-view skill menu warm-up failed', { error });
       return;
     }
     if (this.skillCommands.length > 0) return;

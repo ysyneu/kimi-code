@@ -84,6 +84,7 @@ import type {
   WireSession,
   WireSessionStatus,
   WireSessionUsage,
+  WireSkill,
   WireSnapshot,
   WsEventFrame,
 } from './protocol';
@@ -161,6 +162,18 @@ function wireSessionToSummary(session: WireSession): SessionSummary {
     updatedAt: Date.parse(session.updated_at),
     archived: session.archived,
     metadata: session.metadata as JsonObject,
+  };
+}
+
+/** `WireSkill` → the v1 `SkillSummary` the SDK surface serves. */
+function wireSkillToSummary(skill: WireSkill): SkillSummary {
+  return {
+    name: skill.name,
+    description: skill.description,
+    path: skill.path,
+    source: skill.source,
+    type: skill.type,
+    disableModelInvocation: skill.disable_model_invocation,
   };
 }
 
@@ -559,6 +572,24 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
       throw error;
     }
     return this.http.getWorkspaceTrust(session.workspace_id);
+  }
+
+  /**
+   * Skills visible to a new session in `workDir`, without creating one — the
+   * base surface had no wire override for this, so every call fell through
+   * to `getRpc()` and threw `not_implemented` unconditionally (the agents-
+   * view dispatch menu's skill warm-up has never actually worked live). The
+   * server route (`GET /workspaces/{workspace_id}/skills`) takes a
+   * REGISTERED workspace id, not a raw path, so `workDir` is registered
+   * (idempotently — same `createOrTouch` semantics `POST /sessions` already
+   * relies on for `metadata.cwd`) first, so a `kimi agents` launch in a
+   * directory with no prior session still resolves instead of 404-ing as
+   * `workspace.not_found`.
+   */
+  override async listWorkspaceSkills(workDir: string): Promise<readonly SkillSummary[]> {
+    const workspace = await this.http.createOrTouchWorkspace(workDir);
+    const skills = await this.http.listWorkspaceSkills(workspace.id);
+    return skills.map(wireSkillToSummary);
   }
 
   // -----------------------------------------------------------------------

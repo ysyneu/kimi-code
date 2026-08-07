@@ -208,4 +208,29 @@ describe('WireHttpClient against a real kap-server', () => {
     const created = await http.createSession({ metadata: { cwd } });
     await expect(http.getSessionGoal(created.id)).resolves.toBeNull();
   });
+
+  // R9 Q4b: `listWorkspaceSkills` takes a workspace_id, not a raw path —
+  // createOrTouchWorkspace is the client-side resolution step.
+  it('createOrTouchWorkspace registers a root idempotently, and listWorkspaceSkills reads back builtin skills for it', async () => {
+    const registered = await http.createOrTouchWorkspace(cwd);
+    expect(registered.root).toBe(cwd);
+    expect(registered.id).toBeTruthy();
+
+    // Idempotent on root: a second call for the same path resolves the SAME
+    // workspace, not a duplicate.
+    const touched = await http.createOrTouchWorkspace(cwd);
+    expect(touched.id).toBe(registered.id);
+
+    const skills = await http.listWorkspaceSkills(registered.id);
+    // Builtins are code-defined (not discovered from disk), so this is
+    // stable regardless of the test's tmp workspace contents.
+    expect(skills.some((s) => s.name === 'mcp-config' && s.source === 'builtin')).toBe(true);
+  });
+
+  it('listWorkspaceSkills 404s as workspace.not_found for an unregistered workspace id', async () => {
+    // Well-formed (wd_<slug>_<hash12>) but never registered.
+    await expect(
+      http.listWorkspaceSkills('wd_does-not-exist_000000000000'),
+    ).rejects.toMatchObject({ code: 40410 });
+  });
 });

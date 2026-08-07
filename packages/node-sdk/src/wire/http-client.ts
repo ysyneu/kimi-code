@@ -10,6 +10,7 @@ import {
   wireSessionSchema,
   wireSessionStatusSchema,
   wireSessionWarningSchema,
+  wireSkillSchema,
   wireSnapshotSchema,
   wireWorkspaceSchema,
   type WireApprovalResponse,
@@ -21,6 +22,7 @@ import {
   type WireSessionPage,
   type WireSessionStatus,
   type WireSessionWarning,
+  type WireSkill,
   type WireSnapshot,
   type WireWorkspace,
 } from './protocol';
@@ -240,5 +242,28 @@ export class WireHttpClient {
       z.object({ trusted: z.boolean() }),
     );
     return data.trusted;
+  }
+
+  /**
+   * Register a workspace by root path, or touch its existing registration —
+   * the route is idempotent on `root` (same semantics `POST /sessions`
+   * already relies on internally for `metadata.cwd`). Use this to resolve a
+   * raw filesystem path to a `workspace_id` before calling a route that
+   * needs one (e.g. {@link listWorkspaceSkills}) without a session already
+   * anchoring it.
+   */
+  createOrTouchWorkspace(root: string): Promise<WireWorkspace> {
+    return this.request('POST', '/workspaces', { root }, wireWorkspaceSchema);
+  }
+
+  /** Skills visible to a NEW session in this workspace, without creating one. */
+  async listWorkspaceSkills(workspaceId: string): Promise<WireSkill[]> {
+    const data = await this.request(
+      'GET',
+      `/workspaces/${workspaceId}/skills`,
+      undefined,
+      z.object({ skills: z.array(wireSkillSchema) }),
+    );
+    return data.skills;
   }
 }

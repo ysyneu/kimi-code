@@ -712,6 +712,19 @@ describe('SDKRpcClientWire lifecycle', () => {
     await rpc.close();
   });
 
+  // R9 Q4b: listWorkspaceSkills had no wire override — every call fell
+  // through to getRpc() and threw not_implemented unconditionally.
+  it('listWorkspaceSkills resolves a bare workDir with no prior session, registering its workspace on the fly', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const freshDir = join(home, 'workspace-skills-fresh');
+    await mkdir(freshDir);
+    const skills = await rpc.listWorkspaceSkills(freshDir);
+    // Builtins are code-defined (not discovered from disk) — stable
+    // regardless of the fresh directory's contents.
+    expect(skills.some((s) => s.name === 'mcp-config' && s.source === 'builtin')).toBe(true);
+    await rpc.close();
+  });
+
   it('listSessionRows returns the full wire rows that SessionSummary drops', async () => {
     const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
     await rpc.start();

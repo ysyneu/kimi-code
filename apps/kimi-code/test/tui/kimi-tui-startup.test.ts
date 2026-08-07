@@ -2581,6 +2581,94 @@ describe('KimiTUI agents-view dispatch skill warm-up', () => {
     expect(driver.session).toBeUndefined();
   });
 
+  // R9 Q4b: the R6 warm-up above always mocked `listWorkspaceSkills`
+  // itself — a mock of a method whose real wire-transport implementation
+  // didn't exist would always pass, which is exactly how the wire override
+  // stayed broken through R6. This drives the SAME warm path with a REAL
+  // `SDKRpcClientWire`/`WireHttpClient` pair: `listWorkspaceSkills` is not
+  // mocked, only `fetch` is (the HTTP/route layer), so the transport
+  // override added for R9 is genuinely exercised end-to-end.
+  it('warms the dispatch composer skill menu through the REAL wire transport — listWorkspaceSkills itself is not mocked, only fetch is', async () => {
+    const base = 'http://127.0.0.1:58627';
+    const wireHomeDir = mkdtempSync(join(tmpdir(), 'kimi-wire-skills-home-'));
+    dirs.push(wireHomeDir);
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token: 'test-token', homeDir: wireHomeDir });
+
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      const method = init?.method ?? 'GET';
+      if (url === `${base}/api/v1/workspaces` && method === 'POST') {
+        return new Response(
+          JSON.stringify({
+            code: 0,
+            msg: 'ok',
+            data: {
+              id: 'ws_warm_1',
+              root: '/tmp/proj-a',
+              name: 'proj-a',
+              created_at: new Date().toISOString(),
+              last_opened_at: new Date().toISOString(),
+              session_count: 0,
+            },
+            request_id: 'r1',
+          }),
+          { status: 200 },
+        );
+      }
+      if (url === `${base}/api/v1/workspaces/ws_warm_1/skills` && method === 'GET') {
+        return new Response(
+          JSON.stringify({
+            code: 0,
+            msg: 'ok',
+            data: {
+              skills: [
+                {
+                  name: 'reviewcode',
+                  description: 'review code',
+                  path: '/tmp/proj-a/.kimi/skills/reviewcode/SKILL.md',
+                  source: 'project',
+                },
+              ],
+            },
+            request_id: 'r2',
+          }),
+          { status: 200 },
+        );
+      }
+      throw new Error(`unexpected fetch: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    try {
+      // The exact one-line delegation `KimiHarness.listWorkspaceSkills` does
+      // in production (`return this.rpc.listWorkspaceSkills(workDir)`): the
+      // point of this test is that SDKRpcClientWire's own method — and
+      // WireHttpClient underneath it — run for real, unmocked.
+      const listWorkspaceSkills = vi.fn((workDir: string) => rpc.listWorkspaceSkills(workDir));
+      const driver = await bootColdAgentsView(listWorkspaceSkills);
+
+      await vi.waitFor(async () => {
+        expect(await slashMenuItems(driver)).toContain('skill:reviewcode');
+      });
+
+      // Both real HTTP calls fired, in order — the workspace registration
+      // (workDir → workspace_id) THEN the read — proving the resolution
+      // step actually happened rather than a direct pass-through that would
+      // 404 against the real server.
+      expect(fetchMock).toHaveBeenCalledWith(
+        `${base}/api/v1/workspaces`,
+        expect.objectContaining({ method: 'POST' }),
+      );
+      expect(fetchMock).toHaveBeenCalledWith(
+        `${base}/api/v1/workspaces/ws_warm_1/skills`,
+        expect.objectContaining({ method: 'GET' }),
+      );
+    } finally {
+      vi.stubGlobal('fetch', originalFetch);
+    }
+  });
+
   it('leaves the plugin section empty pre-attach — the skill warm never touches plugin state', async () => {
     const listWorkspaceSkills = vi.fn(async () => [skillSummary('reviewcode')]);
     const driver = await bootColdAgentsView(listWorkspaceSkills);

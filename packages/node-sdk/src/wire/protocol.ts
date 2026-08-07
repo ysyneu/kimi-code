@@ -115,6 +115,18 @@ export const wireWorkspaceSchema = z.object({
 });
 export type WireWorkspace = z.infer<typeof wireWorkspaceSchema>;
 
+export const wireSkillSourceSchema = z.enum(['project', 'user', 'extra', 'builtin']);
+
+export const wireSkillSchema = z.object({
+  name: z.string().min(1),
+  description: z.string(),
+  path: z.string(),
+  source: wireSkillSourceSchema,
+  type: z.string().optional(),
+  disable_model_invocation: z.boolean().optional(),
+});
+export type WireSkill = z.infer<typeof wireSkillSchema>;
+
 export const wireSessionStatusSchema = z.object({
   busy: z.boolean(),
   model: z.string().optional(),
