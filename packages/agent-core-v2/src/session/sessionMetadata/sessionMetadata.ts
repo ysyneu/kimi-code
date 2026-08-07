@@ -31,6 +31,7 @@ export interface SessionMeta {
   readonly title?: string;
   readonly isCustomTitle?: boolean;
   readonly lastPrompt?: string;
+  readonly lastAssistantText?: string;
   readonly createdAt: number;
   readonly updatedAt: number;
   readonly archived: boolean;

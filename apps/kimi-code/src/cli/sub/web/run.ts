@@ -79,7 +79,7 @@ export interface WebCommandDeps {
   /**
    * Best-effort read of the server's persistent bearer token. When it returns
    * a token, the ready banner prints it and the opened Web UI URL carries it in
-   * the `#token=` fragment (M5.5). Optional so callers/tests that don't supply
+   * the `#token=` fragment. Optional so callers/tests that don't supply
    * it simply print/open the plain origin.
    */
   resolveToken?: () => string | undefined;
@@ -172,7 +172,7 @@ export async function handleWebCommand(
       // server writes `server.token` on first boot, so reading it beforehand
       // would miss first-time starts and the browser would hit the auth gate.
       // It is printed in the ready banner and rides in the opened Web UI
-      // URL's `#token=` fragment (M5.5); falls back to the plain origin / no
+      // URL's `#token=` fragment; falls back to the plain origin / no
       // token line when unavailable. When auth is bypassed, the token is
       // meaningless and is intentionally NOT shown or carried in the URL.
       const token = parsed.dangerousBypassAuth ? undefined : deps.resolveToken?.();
@@ -428,8 +428,8 @@ const DEFAULT_WEB_COMMAND_DEPS: WebCommandDeps = {
   startServerForeground,
   openUrl: defaultOpenUrl,
   resolveToken: () => {
-    // Read the persistent `<homeDir>/server.token` written on first boot
-    // (M5.1). Best-effort: a missing/older server yields undefined and the
+    // Read the persistent `<homeDir>/server.token` written on first boot.
+    // Best-effort: a missing/older server yields undefined and the
     // caller opens the plain origin.
     return tryResolveServerToken(getDataDir());
   },

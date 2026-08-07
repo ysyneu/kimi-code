@@ -257,12 +257,19 @@ export interface SessionStatus {
   readonly maxContextTokens: number;
   readonly contextUsage: number;
   readonly usage?: SessionUsage;
+  /** Whether a turn is in progress right now. Optional: the legacy v1 client
+   *  (`SDKRpcClient`, still `createKimiHarness`'s default engine) inherits
+   *  `SDKRpcClientBase.getStatus` unmodified and has no equivalent primitive
+   *  plumbed in — out of scope for the v2/wire attach-phase-seeding fix this
+   *  field exists for (see `KimiTUI.syncRuntimeState`). */
+  readonly busy?: boolean;
 }
 
 export interface SessionSummary {
   readonly id: string;
   readonly title?: string | undefined;
   readonly lastPrompt?: string;
+  readonly lastAssistantText?: string;
   readonly workDir: string;
   readonly sessionDir: string;
   readonly createdAt: number;

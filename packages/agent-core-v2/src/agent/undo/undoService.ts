@@ -5,6 +5,13 @@
  * Coordinates `contextMemory`, undo participants, `fullCompaction`,
  * `loop`, `prompt`, Agent and Session identity, `sessionMetadata`, `event`,
  * `eventBus`, `telemetry`, and `wire`. Bound at Agent scope.
+ *
+ * Also mirrors the main agent's most recent assistant reply into
+ * `sessionMetadata.lastAssistantText` on every `turn.ended` (mirrors
+ * `reconcileLastPrompt`'s backscan, on the response side instead of the undo
+ * side) — the same L4-turn-facts-into-L6-sessionMetadata coordination this
+ * domain already does for `lastPrompt`, just driven by the turn lifecycle
+ * rather than by an undo.
  */
 
 import { Disposable, type IDisposable } from '#/_base/di/lifecycle';
@@ -70,6 +77,9 @@ export class AgentConversationUndoService
     @ILogService private readonly log: ILogService,
   ) {
     super();
+    this._register(
+      this.eventBus.subscribe('turn.ended', () => this.reconcileLastAssistantTextSafely()),
+    );
   }
 
   availability(): UndoAvailability {
@@ -234,6 +244,35 @@ export class AgentConversationUndoService
         agentId: MAIN_AGENT_ID,
         sessionId: this.session.sessionId,
         patch: { lastPrompt },
+      },
+    });
+  }
+
+  private async reconcileLastAssistantTextSafely(): Promise<void> {
+    try {
+      await this.reconcileLastAssistantText();
+    } catch (error) {
+      this.log.error('undo lastAssistantText reconciliation failed', { error });
+    }
+  }
+
+  private async reconcileLastAssistantText(): Promise<void> {
+    if (this.agentCtx.agentId !== MAIN_AGENT_ID) return;
+    const history = this.context.get();
+    let lastAssistantText: string | undefined;
+    for (let i = history.length - 1; i >= 0; i--) {
+      const message = history[i]!;
+      if (message.role !== 'assistant') continue;
+      lastAssistantText = promptMetadataTextFromContentParts(message.content);
+      if (lastAssistantText !== undefined) break;
+    }
+    await this.metadata.update({ lastAssistantText });
+    this.eventService.publish({
+      type: 'session.meta.updated',
+      payload: {
+        agentId: MAIN_AGENT_ID,
+        sessionId: this.session.sessionId,
+        patch: { lastAssistantText },
       },
     });
   }

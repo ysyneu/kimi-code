@@ -34,6 +34,7 @@ export interface SessionWireFields {
   readonly root: string;
   readonly title?: string;
   readonly lastPrompt?: string;
+  readonly lastAssistantText?: string;
   readonly createdAt: number;
   readonly updatedAt: number;
   readonly archived: boolean;

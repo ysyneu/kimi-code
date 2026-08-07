@@ -25,6 +25,7 @@ export interface SessionSummary {
   readonly cwd?: string;
   readonly title?: string;
   readonly lastPrompt?: string;
+  readonly lastAssistantText?: string;
   readonly createdAt: number;
   readonly updatedAt: number;
   readonly archived: boolean;

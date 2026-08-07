@@ -1370,11 +1370,13 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
    */
   override async getStatus(input: SessionIdRpcInput): Promise<SessionStatus> {
     const agent = await this.agentScope(input.sessionId);
-    const facade = this.klient.session(input.sessionId).agent(this.interactiveAgentId);
-    const [context, plan, usage] = await Promise.all([
+    const session = this.klient.session(input.sessionId);
+    const facade = session.agent(this.interactiveAgentId);
+    const [context, plan, usage, status] = await Promise.all([
       facade.getContext(),
       facade.getPlan(),
       facade.getUsage(),
+      session.status(),
     ]);
     const profile = agent.accessor.get(IAgentProfileService).data();
     const capability = profile.modelCapabilities;
@@ -1395,6 +1397,10 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
       maxContextTokens,
       contextUsage,
       usage: hasUsage ? usage : undefined,
+      // Any non-'idle' facade status (a running turn or a pending
+      // approval/question — both hold the session open, mid-interaction) —
+      // matches the wire surface's own busy semantics one-for-one.
+      busy: status !== 'idle',
     };
   }
 

@@ -207,6 +207,13 @@ export class FooterComponent implements Component {
    */
   private backgroundBashTaskCount = 0;
   private backgroundAgentCount = 0;
+  /**
+   * Agents-view attach badge: live roster counts of the OTHER sessions
+   * while the user is attached to one. Fed by the agents view controller
+   * (its roster subscription survives the attach); both zero hides it.
+   */
+  private attachAgentsCount = 0;
+  private attachAwaitingCount = 0;
 
   constructor(state: AppState, onRefresh: () => void = () => {}) {
     this.state = state;
@@ -266,6 +273,15 @@ export class FooterComponent implements Component {
   setBackgroundCounts(counts: { bashTasks: number; agentTasks: number }): void {
     this.backgroundBashTaskCount = Math.max(0, counts.bashTasks);
     this.backgroundAgentCount = Math.max(0, counts.agentTasks);
+  }
+
+  /**
+   * Sync the attach-mode badge with live roster counts. Each non-zero count
+   * adds its segment to `← N agents · M awaiting input`; both zero hides it.
+   */
+  setAttachCounts(counts: { agents: number; awaiting: number }): void {
+    this.attachAgentsCount = Math.max(0, counts.agents);
+    this.attachAwaitingCount = Math.max(0, counts.awaiting);
   }
 
   invalidate(): void {}
@@ -412,6 +428,19 @@ export class FooterComponent implements Component {
     // tasks (background subagents) stay separate so the user can tell them
     // apart at a glance.
     const taskBadges: string[] = [];
+    // Agents-view attach badge leads: it points back to the view (`←`) the
+    // other badges have no relation to.
+    const attachSegments: string[] = [];
+    if (this.attachAgentsCount > 0) {
+      const noun = this.attachAgentsCount === 1 ? 'agent' : 'agents';
+      attachSegments.push(`${String(this.attachAgentsCount)} ${noun}`);
+    }
+    if (this.attachAwaitingCount > 0) {
+      attachSegments.push(`${String(this.attachAwaitingCount)} awaiting input`);
+    }
+    if (attachSegments.length > 0) {
+      taskBadges.push(chalk.hex(colors.primary)(`[← ${attachSegments.join(' · ')}]`));
+    }
     if (this.backgroundBashTaskCount > 0) {
       const noun = this.backgroundBashTaskCount === 1 ? 'task' : 'tasks';
       taskBadges.push(

@@ -141,6 +141,7 @@ export class SessionMetadata extends Disposable implements ISessionMetadata {
         cwd: this.ctx.cwd,
         title: this.data.title,
         lastPrompt: this.data.lastPrompt,
+        lastAssistantText: this.data.lastAssistantText,
         createdAt: this.data.createdAt,
         updatedAt: this.data.updatedAt,
         // `data.archived` stays undefined for sessions whose state.json

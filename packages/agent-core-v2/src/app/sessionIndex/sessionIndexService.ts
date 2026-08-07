@@ -335,6 +335,8 @@ export class FileSessionIndex implements ISessionIndex {
       cwd: recoverCwd(meta),
       title: typeof meta['title'] === 'string' ? meta['title'] : undefined,
       lastPrompt: typeof meta['lastPrompt'] === 'string' ? meta['lastPrompt'] : undefined,
+      lastAssistantText:
+        typeof meta['lastAssistantText'] === 'string' ? meta['lastAssistantText'] : undefined,
       createdAt: parseTime(meta['createdAt']),
       updatedAt: parseTime(meta['updatedAt']),
       archived: meta['archived'] === true,

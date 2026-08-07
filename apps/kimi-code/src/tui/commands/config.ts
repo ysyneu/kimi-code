@@ -25,6 +25,7 @@ import { DEFAULT_TUI_CONFIG, saveTuiConfig, type TuiConfig } from '../config';
 import type { ThemeName } from '#/tui/theme';
 import { currentTheme, isBuiltInTheme, lightColors, loadCustomThemeMerged } from '#/tui/theme';
 import { NO_ACTIVE_SESSION_MESSAGE } from '../constant/kimi-tui';
+import { hintDeferredPermissionOnce } from '../controllers/agents-view';
 import { formatErrorMessage } from '../utils/event-payload';
 import { thinkingEffortToConfig } from '../utils/thinking-config';
 import { showUsage } from './info';
@@ -132,6 +133,7 @@ export async function handleYoloCommand(host: SlashCommandHost, args: string): P
     }
     await session.setPermission('yolo');
     host.setAppState({ permissionMode: 'yolo' });
+    hintDeferredPermissionOnce(host);
     host.showNotice('YOLO mode: ON', 'Tool actions auto-approved; the agent may still ask you questions.');
     return;
   }
@@ -143,6 +145,7 @@ export async function handleYoloCommand(host: SlashCommandHost, args: string): P
     }
     await session.setPermission('manual');
     host.setAppState({ permissionMode: 'manual' });
+    hintDeferredPermissionOnce(host);
     host.showNotice('YOLO mode: OFF');
     return;
   }
@@ -151,10 +154,12 @@ export async function handleYoloCommand(host: SlashCommandHost, args: string): P
   if (currentMode === 'yolo') {
     await session.setPermission('manual');
     host.setAppState({ permissionMode: 'manual' });
+    hintDeferredPermissionOnce(host);
     host.showNotice('YOLO mode: OFF');
   } else {
     await session.setPermission('yolo');
     host.setAppState({ permissionMode: 'yolo' });
+    hintDeferredPermissionOnce(host);
     host.showNotice('YOLO mode: ON', 'Tool actions auto-approved; the agent may still ask you questions.');
   }
 }
@@ -176,6 +181,7 @@ export async function handleAutoCommand(host: SlashCommandHost, args: string): P
     }
     await session.setPermission('auto');
     host.setAppState({ permissionMode: 'auto' });
+    hintDeferredPermissionOnce(host);
     host.showNotice('Auto mode: ON', 'All actions auto-approved; the agent will not ask you questions.');
     return;
   }
@@ -187,6 +193,7 @@ export async function handleAutoCommand(host: SlashCommandHost, args: string): P
     }
     await session.setPermission('manual');
     host.setAppState({ permissionMode: 'manual' });
+    hintDeferredPermissionOnce(host);
     host.showNotice('Auto mode: OFF');
     return;
   }
@@ -195,10 +202,12 @@ export async function handleAutoCommand(host: SlashCommandHost, args: string): P
   if (currentMode === 'auto') {
     await session.setPermission('manual');
     host.setAppState({ permissionMode: 'manual' });
+    hintDeferredPermissionOnce(host);
     host.showNotice('Auto mode: OFF');
   } else {
     await session.setPermission('auto');
     host.setAppState({ permissionMode: 'auto' });
+    hintDeferredPermissionOnce(host);
     host.showNotice('Auto mode: ON', 'All actions auto-approved; the agent will not ask you questions.');
   }
 }
@@ -883,6 +892,7 @@ async function applyPermissionChoice(host: SlashCommandHost, mode: PermissionMod
   }
 
   host.setAppState({ permissionMode: mode });
+  hintDeferredPermissionOnce(host);
   host.showNotice(`Permission mode: ${mode}`);
 }
 

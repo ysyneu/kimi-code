@@ -25,6 +25,7 @@ import {
   buildKimiFileUrl,
   parseKimiFileUrl,
   promptMetadataTextFromContentParts,
+  DEFAULT_AGENT_PROFILE_NAME,
   ProfileError,
   type ContentPart,
   type PromptHandle,
@@ -299,6 +300,24 @@ export function registerPromptsRoutes(app: PromptRouteHost, core: Scope): void {
           // onto 40001 like the profile-selection errors above.
           try {
             await resolved.toolPolicy.setSessionDisabledTools(req.body.disabled_tools);
+          } catch (error) {
+            if (error instanceof ProfileError) {
+              throw new Error2(ErrorCodes.REQUEST_INVALID, error.message);
+            }
+            throw error;
+          }
+        }
+        // A session created over REST carries no model selection, so its main
+        // agent reaches here unbound when the submission named neither
+        // `profile` nor `model`. Bind the default profile now — at prompt
+        // time, not at agent creation: bind is first-bind-only, so an eager
+        // bind would reject the legitimate "create model-less, bind a custom
+        // `profile` on the first prompt" flow. The engine falls back to the
+        // configured `default_model`, so the turn no longer dies with
+        // `model.not_configured`.
+        if (resolved.profile.data().profileName === undefined) {
+          try {
+            await resolved.profile.bind({ profile: DEFAULT_AGENT_PROFILE_NAME });
           } catch (error) {
             if (error instanceof ProfileError) {
               throw new Error2(ErrorCodes.REQUEST_INVALID, error.message);

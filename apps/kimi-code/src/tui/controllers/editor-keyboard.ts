@@ -41,6 +41,7 @@ export interface EditorKeyboardHost {
   }): boolean;
   recallLastQueued(): QueuedMessage | undefined;
   showError(msg: string): void;
+  showStatus(msg: string): void;
   track(event: string, props?: Record<string, unknown>): void;
   updateEditorBorderHighlight(text?: string): void;
   updateQueueDisplay(): void;
@@ -50,6 +51,12 @@ export interface EditorKeyboardHost {
   cancelRunningShellCommand(): void;
   hideSessionPicker(): void;
   openUndoSelector(): void;
+  /**
+   * Agents-view attach: ← on an empty editor asks the host to return to
+   * the agents view. Return `true` when the return happened (agents mode +
+   * view detached); `false` leaves the key to its normal cursor semantics.
+   */
+  returnToAgentsView(): boolean;
   stop(exitCode?: number): Promise<void>;
   handlePlanToggle(next: boolean): void;
   handleInputModeChange(mode: 'prompt' | 'bash'): void;
@@ -83,8 +90,12 @@ export class EditorKeyboardController {
     // recalls everything. The filter is locked to the mode captured when the
     // user first enters history browsing (see onHistoryDraftSave), so landing on
     // a shell entry mid-browse doesn't switch the filter to shell-only.
+    // Agents view: bash mode is gated off, so `!` shell entries are hidden
+    // from recall entirely — input history is global, and landing on one would
+    // resurrect the hidden bash input mode via onRecall below.
     let browseMode: 'prompt' | 'bash' | null = null;
     editor.setHistoryFilter((entry: string) => {
+      if (host.state.startupState === 'agents-view') return !entry.startsWith('!');
       const mode = browseMode ?? editor.inputMode;
       return mode === 'bash' ? entry.startsWith('!') : true;
     });
@@ -353,6 +364,17 @@ export class EditorKeyboardController {
     };
 
     editor.onDownArrowEmpty = () => host.btwPanelController.scroll('down');
+
+    editor.onLeftArrowEmpty = () => host.returnToAgentsView();
+
+    // Agents view: the wire surface has no one-shot shell route,
+    // so the `!` bash-input mode is unavailable — veto the switch and say
+    // why. Outside agents mode the gate passes through (zero change).
+    editor.onBashModeAttempt = () => {
+      if (host.state.startupState !== 'agents-view') return false;
+      host.showStatus('Shell commands (!) are not available in agents view.');
+      return true;
+    };
 
     editor.onPasteImage = async () => this.handleClipboardImagePaste();
   }

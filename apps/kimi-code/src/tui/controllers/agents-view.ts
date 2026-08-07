@@ -1,0 +1,1354 @@
+import { parseIntegerEnv } from '@moonshot-ai/agent-core-v2';
+import type { Event, KimiHarness, Unsubscribe, WireSession } from '@moonshot-ai/kimi-code-sdk';
+import type { Component, Container, ProcessTerminal, TUI } from '@moonshot-ai/pi-tui';
+
+import { AgentsRoster, type AgentsGroup, type AgentsGroupId } from '../agents/roster';
+import { loadAgentsViewState, saveAgentsViewState } from '../agents/roster-persistence';
+import { completeLeadingArg, type ArgCompletionSpec } from '../commands/complete-args';
+import { BUILTIN_SLASH_COMMANDS } from '../commands/registry';
+import type { KimiSlashCommand } from '../commands/types';
+import { AgentsViewApp, type AgentsViewProps } from '../components/agents-view/app';
+import { rosterRowName } from '../components/agents-view/rows';
+import type { CustomEditor } from '../components/editor/custom-editor';
+import { EXIT_CONFIRM_WINDOW_MS } from '#/tui/constant/kimi-tui';
+import type { Theme } from '#/tui/theme';
+
+import {
+  AgentsViewDispatch,
+  DISPATCH_PLACEHOLDER,
+  type DispatchActivatableCommands,
+  type DispatchSubmission,
+} from './agents-view-dispatch';
+
+export interface AgentsViewHost {
+  readonly state: {
+    readonly agentsView: AgentsViewState | undefined;
+    readonly theme: Theme;
+    readonly terminal: ProcessTerminal;
+    readonly ui: TUI;
+    readonly editor: CustomEditor;
+    readonly editorContainer: Container;
+  };
+  readonly harness: KimiHarness;
+  showError(msg: string): void;
+  showStatus(msg: string): void;
+  setAgentsView(value: AgentsViewState | undefined): void;
+  /** Header label for the connected kap-server: "embedded" or host:port. */
+  agentsViewServerLabel(): string;
+  /** Dispatch target: every session created from the view opens in this cwd. */
+  agentsViewWorkDir(): string;
+  /** Header label for the model new sessions dispatch with by default. */
+  agentsViewModelLabel(): string;
+  /**
+   * `/model` argument completion candidates for the dispatch composer: every
+   * configured alias with its display label, same source and
+   * secondary-derived-alias exclusion as the chat's model picker.
+   */
+  agentsViewModelCompletions(): readonly ArgCompletionSpec[];
+  /**
+   * Skill + plugin-command entries and their activation maps for the
+   * dispatch composer's staged-activation category — same source and shape
+   * the main chat's own `/` menu uses, reused as-is (see `KimiTUI.
+   * agentsViewActivatableCommands`).
+   */
+  agentsViewActivatableCommands(): DispatchActivatableCommands;
+  /**
+   * Fills the skill half of `agentsViewActivatableCommands`'s cold-start
+   * gap (no session attached this run yet) via whatever session-independent
+   * route the host has for it — the controller calls this once at view
+   * mount and re-reads `agentsViewActivatableCommands()` when it resolves;
+   * it never inspects this method's return value. No plugin-command
+   * equivalent exists to warm the same way (see `KimiTUI.
+   * warmAgentsViewSkillMenu`'s doc comment), so the plugin half of the gap
+   * is unaffected by this call.
+   */
+  warmAgentsViewSkillMenu(): Promise<void>;
+  /**
+   * Attach-mode footer badge feed: live roster counts while
+   * detached; `undefined` clears the badge (return / close).
+   */
+  setAttachBadge(counts: { agents: number; awaiting: number } | undefined): void;
+  /**
+   * The currently attached session id ('' when none). The attach badge
+   * excludes it — the session on screen is not "other agents" news.
+   */
+  getCurrentSessionId(): string;
+  /** Attach seam: the host implements it; without it Enter shows a status hint. */
+  onOpenSession?(id: string): void;
+  /**
+   * Mounts any reverse-RPC panels (approval/question) deferred while the
+   * view takeover was on screen. The controller calls it when the user
+   * leaves the view for the chat that owns the pending interaction —
+   * detachForAttach (only when the attached session IS the current one) and
+   * close(). Without it deferred panels never surface.
+   */
+  flushDeferredPanels?(): void;
+}
+
+export interface AgentsViewState {
+  component: AgentsViewApp;
+  savedChildren: readonly Component[];
+  roster: AgentsRoster;
+  /** The same Set the roster mutates in place; persisted after every setPinned. */
+  pins: Set<string>;
+  /**
+   * The view's roster scope: only sessions the view created (dispatch) or
+   * attached to (Enter on a row) are listed — the server-wide session list
+   * from other clients (kimi-web, other terminals) is filtered out at seed,
+   * refresh and `event.session.created`. Persisted with the pins after
+   * every mutation.
+   */
+  viewSessions: Set<string>;
+  /** The same Map the roster mutates in place via `markSeen`; persisted alongside pins. */
+  seenAt: Map<string, number>;
+  dispatch: AgentsViewDispatch;
+  /**
+   * True while the user is attached to a session: the component is unmounted
+   * but the roster and its event subscription stay alive — the attached-mode
+   * footer badge reads live counts, and show() remounts the same
+   * component without a reload.
+   */
+  detached: boolean;
+  /**
+   * One-time-per-attach flag for the deferred-permission hint: the
+   * wire transport carries a stashed setPermission on the NEXT prompt, so the
+   * first user-initiated mode change per attach earns a status hint. Reset by
+   * detachForAttach. Read via {@link hintDeferredPermissionOnce}.
+   */
+  permissionHintShown: boolean;
+  /** Focus split between the roster list and the dispatch editor. */
+  dispatchFocused: boolean;
+  /**
+   * Set while the composer targets an EXISTING session (space on a row)
+   * instead of a new one — this is also the reply PANEL's own open flag
+   * (`AgentsViewApp` renders the bordered preview panel instead of the
+   * plain composer whenever it's set; see `renderReplyPanel`). Always
+   * paired with `dispatchFocused === true` — entering and leaving the panel
+   * toggles both together (see `onReplyRequest` and `closeReplyPanel`) so
+   * the component never has to reconcile a composer that's "replying" but
+   * unfocused.
+   */
+  replyTargetId: string | undefined;
+  /**
+   * Row ids whose `space`-reply RPC is currently outstanding — renders a
+   * distinct "sending" glyph (never the busy spinner) until the RPC settles
+   * OR the bounded client-side wait is exceeded, whichever comes first. See
+   * {@link handleReply}.
+   */
+  pendingReplyIds: Set<string>;
+  /**
+   * One entry per row whose last reply attempt is currently showing as
+   * failed — rejected, or exceeded the bounded client-side wait
+   * ({@link replyRpcTimeoutMs}) while the underlying RPC was still running.
+   * Carries the lost text back so reopening the reply panel on that row
+   * restores it instead of dropping it (see `onReplyRequest`). Cleared on
+   * the next send attempt for that row (success or failure), on a fresh
+   * re-entry, and — the late-ack case — if the underlying RPC the bounded
+   * wait gave up on turns out to have succeeded after all (see
+   * {@link settleReplyAttempt}).
+   */
+  replyFailures: Map<string, { text: string }>;
+  /**
+   * The reply RPC promise currently "owned" by each row's most recent
+   * {@link handleReply} call. The bounded wait in `handleReply` can give up
+   * on a row while the real RPC keeps running in the background; this map
+   * is how {@link settleReplyAttempt} tells whether a given attempt is
+   * still the one that matters for that row (its own promise still matches
+   * the map entry) before touching `pendingReplyIds`/`replyFailures` — a
+   * retry overwrites the entry, which is what lets a stale late arrival
+   * from the SUPERSEDED attempt no-op instead of clobbering the newer
+   * one's state. Not rendered; pure bookkeeping, same footing as
+   * `flashTimer`/`busyTicker` below.
+   */
+  replyAttempts: Map<string, Promise<void>>;
+  /**
+   * The {@link handleReply} call's own promise for each row's most recent
+   * attempt — distinct from {@link replyAttempts}' raw RPC promise, which
+   * can run long after the client gives up: THIS promise always settles
+   * within {@link replyRpcTimeoutMs}, because `handleReply`'s own control
+   * flow bounds itself on that same wait (success or the bounded give-up,
+   * whichever comes first). The attach barrier
+   * ({@link AgentsViewController.awaitPendingReply}, R9 Q1a) awaits this
+   * map, never `replyAttempts`, so a stuck underlying RPC can never block an
+   * attach — only the bounded wait can. Entries are removed once the
+   * promise they hold settles.
+   */
+  replyBarriers: Map<string, Promise<void>>;
+  selectedId: string | undefined;
+  /**
+   * The session id this SAME roster-attach lifecycle was last backed out of
+   * via ← (`returnToAgentsView`) — `undefined` until the first such return.
+   * Scoped to this `AgentsViewState` object's lifetime (reset only by a
+   * fresh `close()` + re-`show()`), not persisted across process restarts.
+   * Attaching TO a session (`detachForAttach`) never touches this — it only
+   * changes on the way back. Drives the row-level `isOrigin` bold marker.
+   */
+  originSessionId: string | undefined;
+  confirmDeleteId: string | undefined;
+  renameDraft: { sessionId: string; text: string } | undefined;
+  flashMessage: string | undefined;
+  flashTimer: NodeJS.Timeout | undefined;
+  /**
+   * Render ticker while any row is busy: roster events are rare (busy on /
+   * busy off), so without a periodic re-render the working spinner freezes
+   * on one frame for the whole turn. Runs only while the component is
+   * mounted (stopped on detach / close / when nothing is busy).
+   */
+  busyTicker: NodeJS.Timeout | undefined;
+  /**
+   * Set while a first Ctrl+C is armed, waiting on a confirming second press
+   * within `EXIT_CONFIRM_WINDOW_MS` — owned here (not the component) because
+   * disarming on a silent timeout needs `host.state.ui.requestRender()` to
+   * repaint without a keypress, access only the controller has. Exposed to
+   * the component read-only as `AgentsViewProps.pendingExitArmed`.
+   */
+  pendingExitTimer: ReturnType<typeof setTimeout> | undefined;
+  collapsedGroups: Set<AgentsGroupId>;
+  completedExpanded: boolean;
+  eventUnsubscribe: Unsubscribe;
+  /** WS connection-state subscription (wire transport only) — drives the
+   *  post-reconnect roster reconciliation. Dies with the view on close(). */
+  connectionUnsubscribe: Unsubscribe | undefined;
+}
+
+/**
+ * Per-attempt server-side bound this client assumes for headroom purposes
+ * when `KIMI_SNAPSHOT_TIMEOUT_MS` is unset — same default the resume chain's
+ * own bounds use (`agent-core-v2`'s `DEFAULT_ROOT_STAT_TIMEOUT_MS` /
+ * `DEFAULT_MCP_READY_TIMEOUT_MS`, both 4000).
+ */
+const DEFAULT_SERVER_TIMEOUT_MS = 4000;
+
+/**
+ * Fixed slack added on top of the doubled server bound in
+ * {@link replyRpcTimeoutMs} — network RTT to reach the server at all, plus
+ * the several resume-chain awaits that stay unbounded after this fix round
+ * (`workspaceDirs.ready`, `hostEnv.ready`, `sessionMetadata.ready`,
+ * `sessionToolPolicy.ready`, the agent-profile loaders). Same order of
+ * magnitude as this codebase's other client-side RPC-wait constant,
+ * `MODEL_PICKER_REFRESH_TIMEOUT_MS` (`commands/config.ts`).
+ */
+const REPLY_RPC_TIMEOUT_MARGIN_MS = 2_000;
+
+/**
+ * Bounds how long the view waits for a reply RPC before treating it as
+ * failed. The server chain this RPC funnels through can legitimately stack
+ * TWO instances of the same server bound in series on a cold resume
+ * (`WorkspaceService.createOrTouch`'s root-stat wait, then
+ * `WorkspaceHandlerService.materializeSession`'s MCP-ready wait) before the
+ * client's own clock — started earlier, at RPC issue, not at either
+ * server-side timer's start — even gets to see either one resolve. Matching
+ * the server bound 1:1 is therefore guaranteed to fire first on any
+ * legitimately-slow-but-not-stuck resume, so this derives real headroom:
+ * twice the assumed per-attempt server bound plus a fixed margin. Reads
+ * `KIMI_SNAPSHOT_TIMEOUT_MS` fresh on every call (not cached at import) so
+ * raising that knob to tolerate a slower legitimate resume widens the
+ * client's patience too, instead of widening the gap between the two —
+ * deliberately the SAME env var the server-side bounds use, not a new
+ * client-only one (the connected kap-server shares this process's env —
+ * same-machine is today's only deployment; a remote-host kap-server would
+ * need its own signal, out of scope here).
+ */
+export function replyRpcTimeoutMs(): number {
+  const serverBound = parseIntegerEnv(process.env['KIMI_SNAPSHOT_TIMEOUT_MS'], DEFAULT_SERVER_TIMEOUT_MS, 100);
+  return 2 * serverBound + REPLY_RPC_TIMEOUT_MARGIN_MS;
+}
+
+/**
+ * Bounds `promise` to `ms`: rejects with a timeout error if it hasn't
+ * settled in time. Losing race leaves `promise` itself still running in the
+ * background — this function doesn't observe it further, though a caller
+ * may (see {@link handleReply}, which attaches its own `.then` to the same
+ * promise for exactly that reason). Same `Promise.race` + timer shape
+ * already used for client-side RPC waits elsewhere in this codebase
+ * (`commands/config.ts`'s `withTimeout`, `cli/run-prompt.ts`'s
+ * `raceWithTimeout`).
+ */
+function raceTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`timed out after ${String(ms)}ms`));
+    }, ms);
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
+/** The only event types the roster reduces; everything else is dropped here. */
+const GLOBAL_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'session.meta.updated',
+  'event.session.work_changed',
+  'event.session.created',
+]);
+
+/**
+ * Dispatch-local `/agent` item: the builtin registry has no profile command
+ * (profiles are a `--agent` CLI concept, not an in-session slash command), so
+ * the whitelist entry is defined here. Its parse branch lives in
+ * `parseDispatchInput`. No `completeArgs`: profile names come from
+ * filesystem discovery that's DI-service-only today (`agent-core-v2`'s
+ * `workspaceAgentProfileLoader`), not a plain list the TUI can call, so the
+ * argument position shows no suggestions — `argumentHint` below still labels
+ * it in the top-level `/` menu.
+ */
+const DISPATCH_AGENT_COMMAND: KimiSlashCommand = {
+  name: 'agent',
+  aliases: [],
+  description: 'Run the new session with an agent profile',
+  priority: 90,
+  argumentHint: '<profile>',
+  availability: 'always',
+};
+
+/** Builtin commands that make sense outside a session. */
+const DISPATCH_BUILTIN_WHITELIST: ReadonlySet<string> = new Set(['model']);
+
+/**
+ * The dispatch autocomplete whitelist: `/model` filtered out of
+ * `BUILTIN_SLASH_COMMANDS` (its copy is not reinvented here, only its
+ * argument completion is added), the dispatch-local `/agent` item, and every
+ * skill + plugin command the main chat's own `/` menu would show — same
+ * source, same entries, appended in the same order the main chat uses
+ * (`[...builtins, ...skillCommands, ...pluginCommands]`, see `KimiTUI.
+ * getSlashCommands`). `getModelCompletions`/`getActivatableCommands` are
+ * getters rather than captured snapshots so the closures they feed always
+ * see live data as of completion/menu-build time, not as of this call.
+ */
+export function dispatchSlashCommands(
+  getModelCompletions: () => readonly ArgCompletionSpec[],
+  getActivatableCommands: () => DispatchActivatableCommands,
+): readonly KimiSlashCommand[] {
+  const builtins = BUILTIN_SLASH_COMMANDS.filter((command) =>
+    DISPATCH_BUILTIN_WHITELIST.has(command.name),
+  ).map((command) =>
+    command.name === 'model'
+      ? {
+          ...command,
+          completeArgs: (prefix: string) => completeLeadingArg(getModelCompletions(), prefix),
+        }
+      : command,
+  );
+  return [...builtins, DISPATCH_AGENT_COMMAND, ...getActivatableCommands().commands];
+}
+
+/**
+ * Mounts the agents view as a full-screen takeover (same container-swap
+ * pattern as TasksBrowserController), owns the roster data flow
+ * (listSessions + global event subscription) and every action side effect —
+ * the component stays SDK-free.
+ *
+ * Component contract obligations (see AgentsViewApp's docstring):
+ * - While `confirmDeleteId` is set, ANY action callback — including `onQuit`
+ *   (Esc during confirm) — clears the confirm instead of acting as a quit.
+ * - Esc during rename submits the ORIGINAL title; an unchanged title is a
+ *   cancel and never reaches the SDK.
+ */
+export class AgentsViewController {
+  constructor(private readonly host: AgentsViewHost) {}
+
+  get isOpen(): boolean {
+    return this.host.state.agentsView !== undefined;
+  }
+
+  /**
+   * `originSessionId`: passed only by the ← "return to roster" seam
+   * (`returnToAgentsView`) — the session id the caller is backing out of.
+   * Every other caller (cold open, post-quit-confirm remount, failed-attach
+   * recovery) omits it, leaving whatever origin the lifecycle already had
+   * untouched.
+   */
+  async show(originSessionId?: string): Promise<void> {
+    const { state } = this.host;
+    const existing = state.agentsView;
+    if (existing !== undefined) {
+      // Return from attach: remount the same component over the live roster —
+      // the subscription kept it current, so there is nothing to reload.
+      if (existing.detached) {
+        if (originSessionId !== undefined) existing.originSessionId = originSessionId;
+        this.remount(existing);
+      }
+      return;
+    }
+
+    // The wire transport seeds from the full session rows — busy /
+    // pending_interaction survive the mapping (I1). Any other transport
+    // falls back to the plain SessionSummary list. Both are then narrowed to
+    // the view's own registry: sessions dispatched from or attached through
+    // this view, never the whole server-wide list.
+    const rpc = this.host.harness.wireRpc();
+    let persisted: Awaited<ReturnType<typeof loadAgentsViewState>>;
+    let summaries: Awaited<ReturnType<KimiHarness['listSessions']>> | undefined;
+    let wireRows: readonly WireSession[] | undefined;
+    try {
+      [persisted, summaries, wireRows] = await Promise.all([
+        loadAgentsViewState(this.host.harness.homeDir),
+        rpc === undefined ? this.host.harness.listSessions({}) : Promise.resolve(undefined),
+        rpc?.listSessionRows() ?? Promise.resolve(undefined),
+      ]);
+    } catch (error) {
+      this.host.showError(
+        `Failed to load sessions: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return;
+    }
+    if (state.agentsView !== undefined) return;
+    const { pins, sessions: viewSessions, seenAt } = persisted;
+
+    const roster = new AgentsRoster(pins, seenAt);
+    if (wireRows !== undefined) roster.setAllRows(wireRows.filter((row) => viewSessions.has(row.id)));
+    else if (summaries !== undefined) roster.setAll(summaries.filter((row) => viewSessions.has(row.id)));
+
+    // The dispatch editor is built before the component: it renders into the
+    // component's bottom box, so the initial props already reference it.
+    const dispatch = new AgentsViewDispatch(
+      state.ui,
+      this.host.agentsViewWorkDir(),
+      () => this.host.agentsViewActivatableCommands(),
+    );
+    dispatch.installAutocomplete(
+      dispatchSlashCommands(
+        () => this.host.agentsViewModelCompletions(),
+        () => this.host.agentsViewActivatableCommands(),
+      ),
+    );
+
+    const component = new AgentsViewApp(
+      this.buildProps({
+        roster,
+        dispatch,
+        dispatchFocused: false,
+        replyTargetId: undefined,
+        pendingReplyIds: new Set(),
+        replyFailures: new Map(),
+        selectedId: undefined,
+        originSessionId: undefined,
+        confirmDeleteId: undefined,
+        renameDraft: undefined,
+        flashMessage: undefined,
+        pendingExitTimer: undefined,
+        collapsedGroups: new Set(),
+        completedExpanded: false,
+      }),
+      state.terminal,
+    );
+
+    const savedChildren = [...state.ui.children];
+    state.ui.clear();
+    state.ui.addChild(component);
+    state.ui.setFocus(component);
+    state.ui.requestRender(true);
+
+    dispatch.onSubmit = (submission) => {
+      const view = this.host.state.agentsView;
+      const replyTarget = view?.replyTargetId;
+      if (view !== undefined) this.closeReplyPanel(view);
+      if (view !== undefined && replyTarget !== undefined) {
+        // Bounded (replyRpcTimeoutMs) regardless of how long the underlying
+        // RPC actually takes — see replyBarriers' own doc. The attach
+        // barrier (awaitPendingReply) reads this map entry, never the raw
+        // RPC promise in replyAttempts.
+        const barrier = this.handleReply(view, replyTarget, submission.text);
+        view.replyBarriers.set(replyTarget, barrier);
+        void barrier.finally(() => {
+          if (view.replyBarriers.get(replyTarget) === barrier) view.replyBarriers.delete(replyTarget);
+        });
+        return;
+      }
+      void this.handleDispatch(submission);
+    };
+    dispatch.onError = (message) => {
+      const view = this.host.state.agentsView;
+      if (view !== undefined) this.closeReplyPanel(view);
+      this.flash(message);
+    };
+    // `exit` / `/exit` submitted from the dispatch composer — dispatch mode
+    // only, `AgentsViewDispatch` never fires this while `replying`. Same
+    // close path as onQuit (Esc-Esc / `?` grid's `esc to quit`).
+    dispatch.onExit = () => {
+      this.close();
+    };
+    // Esc inside the focused editor returns focus to the list (the editor's
+    // own autocomplete-cancel wins over this when a dropdown is open).
+    // The reply panel is closed the same way as a submit: back to the "new
+    // session" composer, not a second escape stage — and (unlike a submit,
+    // which the editor already emptied on its own) this is the path that
+    // discards an unsent draft (see `exitReplyMode`).
+    dispatch.editor.onEscape = () => {
+      const view = this.host.state.agentsView;
+      if (view !== undefined) this.closeReplyPanel(view);
+    };
+
+    this.host.setAgentsView({
+      component,
+      savedChildren,
+      roster,
+      pins,
+      viewSessions,
+      seenAt,
+      dispatch,
+      detached: false,
+      permissionHintShown: false,
+      dispatchFocused: false,
+      replyTargetId: undefined,
+      pendingReplyIds: new Set(),
+      replyFailures: new Map(),
+      replyAttempts: new Map(),
+      replyBarriers: new Map(),
+      selectedId: undefined,
+      originSessionId: undefined,
+      confirmDeleteId: undefined,
+      renameDraft: undefined,
+      flashMessage: undefined,
+      flashTimer: undefined,
+      busyTicker: undefined,
+      pendingExitTimer: undefined,
+      collapsedGroups: new Set(),
+      completedExpanded: false,
+      eventUnsubscribe: this.host.harness.onEvent((event) => {
+        this.handleGlobalEvent(event);
+      }),
+      connectionUnsubscribe: rpc?.onConnectionState((connected) => {
+        // Global fan-out events have no journal: whatever changed during a
+        // drop is lost, so a reconnect re-seeds the whole roster (I2). The
+        // initial connect predates this handler — only reconnects fire it.
+        if (connected) void this.refreshRoster();
+      }),
+    });
+
+    // Trust badges load after mount: the roster is already useful without
+    // them, and the per-row reads must never block or break show().
+    void this.loadTrust((wireRows ?? summaries ?? []).map((row) => row.id));
+    // Skill cold-start gap (R6 review): the composer is already usable
+    // without the warmed menu, so this must never block show() either.
+    void this.warmSkillMenu(dispatch);
+    // A seeded busy row must start the spinner ticker without waiting for an event.
+    this.syncBusyTicker();
+  }
+
+  close(): void {
+    const { state } = this.host;
+    const view = state.agentsView;
+    if (view === undefined || view.detached) {
+      // Detached (attached to a session): the roster subscription deliberately
+      // survives — switchToSession's runtime reset calls close() on the
+      // attach path, and tearing down here would kill the badge's data feed.
+      return;
+    }
+    view.eventUnsubscribe();
+    view.connectionUnsubscribe?.();
+    if (view.flashTimer !== undefined) clearTimeout(view.flashTimer);
+    if (view.busyTicker !== undefined) clearInterval(view.busyTicker);
+    if (view.pendingExitTimer !== undefined) clearTimeout(view.pendingExitTimer);
+    this.host.setAttachBadge(undefined);
+
+    state.ui.clear();
+    for (const child of view.savedChildren) {
+      state.ui.addChild(child);
+    }
+    this.host.setAgentsView(undefined);
+    state.ui.setFocus(state.editorContainer.children[0] ?? state.editor);
+    state.ui.requestRender(true);
+    // Panels deferred while the takeover was up mount now — the user is back
+    // in the chat that owns the pending interaction.
+    this.host.flushDeferredPanels?.();
+  }
+
+  /**
+   * Attach barrier (R9 Q1a): if `targetId` has a roster reply RPC in flight
+   * from this same lifecycle, waits for it to settle — success or the
+   * bounded {@link replyRpcTimeoutMs} give-up, see {@link
+   * AgentsViewState.replyBarriers} — before the caller takes an attach
+   * snapshot, so the snapshot can never race ahead of the reply's own
+   * durability. No-op (resolves immediately) when nothing is pending for
+   * this row. Reuses R8's own per-row bookkeeping instead of a new
+   * synchronization primitive; no separate timeout is added here since the
+   * awaited promise is already bounded.
+   */
+  async awaitPendingReply(targetId: string): Promise<void> {
+    const barrier = this.host.state.agentsView?.replyBarriers.get(targetId);
+    if (barrier === undefined) return;
+    await barrier;
+  }
+
+  /**
+   * Attach detach: unmounts the component but keeps the roster and its global
+   * event subscription alive (see {@link AgentsViewState.detached}). The user
+   * returns via the Task-4 key, which re-runs show().
+   *
+   * `sessionId` is the session being attached — the seeded badge excludes it.
+   * It must be passed in: at this point `appState.sessionId` still holds the
+   * PREVIOUS session (switchToSession runs after the detach), so reading the
+   * current id here would seed the badge with the wrong exclusion.
+   */
+  detachForAttach(sessionId: string): void {
+    const { state } = this.host;
+    const view = state.agentsView;
+    if (view === undefined || view.detached) return;
+    view.detached = true;
+    // Each attach re-arms the one-time deferred-permission hint.
+    view.permissionHintShown = false;
+    if (view.flashTimer !== undefined) {
+      clearTimeout(view.flashTimer);
+      view.flashTimer = undefined;
+      view.flashMessage = undefined;
+    }
+    // The spinner only animates on screen — the attach badge shows counts,
+    // not frames, so the ticker stops until remount.
+    if (view.busyTicker !== undefined) {
+      clearInterval(view.busyTicker);
+      view.busyTicker = undefined;
+    }
+    // An armed Ctrl+C hint is screen-local: detaching mid-window must not
+    // leave a stale timer running against the now-invisible component, nor
+    // let its footer hint reappear armed on remount (remount reuses this
+    // same component instance) with the next Ctrl+C misread as a
+    // confirming second press instead of a fresh first one.
+    if (view.pendingExitTimer !== undefined) {
+      clearTimeout(view.pendingExitTimer);
+      view.pendingExitTimer = undefined;
+    }
+
+    state.ui.clear();
+    for (const child of view.savedChildren) {
+      state.ui.addChild(child);
+    }
+    // Focus whatever occupies the editor slot: when a reverse-RPC panel is
+    // mounted there the editor is off-tree, and focusing it would leave the
+    // restored panel visible but keyboard-dead.
+    state.ui.setFocus(state.editorContainer.children[0] ?? state.editor);
+    state.ui.requestRender(true);
+    // Seed the attach-mode footer badge with the current roster counts.
+    this.pushAttachBadge(view, sessionId);
+    // Pending approvals/questions belong to the CURRENT session (handlers
+    // are per-session), so only an attach into that session surfaces what
+    // the view deferred. Attaching into a DIFFERENT session must not pop
+    // this session's panel into the wrong chat — those entries stay
+    // deferred until the switch's unload cancels them (the same cancel
+    // semantics as any session switch with a pending approval).
+    if (sessionId === this.host.getCurrentSessionId()) this.host.flushDeferredPanels?.();
+  }
+
+  /** Return-from-attach remount: same component, same roster, no reload. */
+  private remount(view: AgentsViewState): void {
+    const { state } = this.host;
+    view.detached = false;
+    view.savedChildren = [...state.ui.children];
+    state.ui.clear();
+    state.ui.addChild(view.component);
+    state.ui.setFocus(view.component);
+    this.pushProps();
+    // Back on the view: its own rows show the counts — the badge goes away.
+    this.host.setAttachBadge(undefined);
+    // Busy rows kept working while attached — resume the spinner heartbeat.
+    this.syncBusyTicker();
+    state.ui.requestRender(true);
+  }
+
+  // ---------------------------------------------------------------------------
+
+  /**
+   * One-shot trust read at roster load (no live refresh): the
+   * wire transport resolves each row's workspace trust and the badge rides
+   * `roster.setTrusted`. A per-row failure leaves `trusted` undefined — no
+   * badge, no error surface; non-wire transports have no trust route and are
+   * skipped by the narrowing.
+   */
+  private async loadTrust(ids: readonly string[]): Promise<void> {
+    const view = this.host.state.agentsView;
+    if (view === undefined) return;
+    const rpc = this.host.harness.wireRpc();
+    if (rpc === undefined) return;
+    let changed = false;
+    await Promise.all(
+      ids.map(async (id) => {
+        // Archived sessions never entered the roster; setTrusted would no-op.
+        if (view.roster.get(id) === undefined) return;
+        let trusted: boolean | undefined;
+        try {
+          trusted = await rpc.getWorkspaceTrustForSession(id);
+        } catch {
+          return;
+        }
+        if (this.host.state.agentsView !== view) return;
+        view.roster.setTrusted(id, trusted);
+        changed = true;
+      }),
+    );
+    if (changed && this.host.state.agentsView === view) this.pushProps();
+  }
+
+  /**
+   * Closes the dispatch composer's skill cold-start gap (R6 review):
+   * `agentsViewActivatableCommands()` only reflects skills once a session
+   * has attached this run, so the menu built at mount time can miss them.
+   * Same "load after mount, never block show()" shape as `loadTrust` —
+   * awaits the host's warming call, then re-installs the dispatch
+   * autocomplete so the on-screen `/` menu picks up whatever the host
+   * filled in, without the user needing to reopen the view. No-ops if the
+   * view closed or was replaced by a fresh `show()` while awaiting.
+   */
+  private async warmSkillMenu(dispatch: AgentsViewDispatch): Promise<void> {
+    const view = this.host.state.agentsView;
+    if (view === undefined) return;
+    await this.host.warmAgentsViewSkillMenu();
+    if (this.host.state.agentsView !== view) return;
+    dispatch.installAutocomplete(
+      dispatchSlashCommands(
+        () => this.host.agentsViewModelCompletions(),
+        () => this.host.agentsViewActivatableCommands(),
+      ),
+    );
+  }
+
+  /**
+   * WS reconnect reconciliation (I2): global fan-out events have no journal,
+   * so whatever changed during the drop is re-seeded from a fresh session
+   * list. A failed re-list keeps the last known roster — the next reconnect
+   * retries.
+   */
+  private async refreshRoster(): Promise<void> {
+    const view = this.host.state.agentsView;
+    if (view === undefined) return;
+    const rpc = this.host.harness.wireRpc();
+    if (rpc === undefined) return;
+    let rows: readonly WireSession[];
+    try {
+      rows = await rpc.listSessionRows();
+    } catch {
+      return;
+    }
+    if (this.host.state.agentsView !== view) return;
+    view.roster.setAllRows(rows.filter((row) => view.viewSessions.has(row.id)));
+    // A session that vanished during the drop must not leave a dangling
+    // selection behind.
+    if (view.selectedId !== undefined && view.roster.get(view.selectedId) === undefined) {
+      view.selectedId = undefined;
+    }
+    this.syncBusyTicker();
+    this.pushProps();
+    // The attach badge reads the same roster while detached — keep it honest.
+    if (view.detached) this.pushAttachBadge(view, this.host.getCurrentSessionId());
+  }
+
+  /**
+   * Dispatch flow: create the session in the view's workDir, then apply the
+   * first RPC call. Staged model/profile overrides ride the first `prompt`
+   * call's submission body — the wire create route drops per-session agent
+   * config, so they never reach `createSession`. A staged skill/plugin
+   * activation instead calls `activateSkill`/`activatePluginCommand` in
+   * place of `prompt` — neither is literal text the model should see
+   * verbatim (see `DispatchActivation`'s doc comment). The new roster row
+   * arrives on its own via the `event.session.created` subscription.
+   */
+  private async handleDispatch(submission: DispatchSubmission): Promise<void> {
+    const view = this.host.state.agentsView;
+    if (view === undefined) return;
+    // Validate before mutate: `Session.prompt` carries no overrides — the
+    // extended rpc-level prompt (`WirePromptRpcInput`) does, reached
+    // through the harness's rpc with an instanceof narrowing (never `any`).
+    // A transport that can't carry the overrides is rejected HERE, before
+    // createSession, so the failure can't orphan a server-side session.
+    const hasOverrides = submission.model !== undefined || submission.profile !== undefined;
+    const rpc = hasOverrides ? this.host.harness.wireRpc() : undefined;
+    if (hasOverrides && rpc === undefined) {
+      this.flash('Dispatch failed: /model and /agent overrides require the wire transport');
+      return;
+    }
+    try {
+      const session = await this.host.harness.createSession({
+        workDir: this.host.agentsViewWorkDir(),
+      });
+      // Register BEFORE the first RPC call: the server's
+      // `event.session.created` echo only enters the roster when the id is
+      // already in the view's registry. The new row is pre-selected so the
+      // dispatch is visibly confirmed the moment it lands.
+      view.viewSessions.add(session.id);
+      void this.persistState(view);
+      view.selectedId = session.id;
+      this.pushProps();
+      const { activation } = submission;
+      if (activation !== undefined) {
+        if (activation.kind === 'skill') {
+          await session.activateSkill(activation.skillName, activation.args);
+        } else {
+          await session.activatePluginCommand(
+            activation.pluginId,
+            activation.commandName,
+            activation.args,
+          );
+        }
+      } else if (rpc !== undefined) {
+        await rpc.prompt({
+          sessionId: session.id,
+          input: [{ type: 'text', text: submission.text }],
+          model: submission.model,
+          profile: submission.profile,
+        });
+      } else {
+        await session.prompt(submission.text);
+      }
+    } catch (error) {
+      if (this.host.state.agentsView !== view) return;
+      this.flash(`Dispatch failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * Reply flow (space on a row): prompts an EXISTING session directly
+   * through the wire rpc — the same primitive `handleDispatch`'s override
+   * branch already uses for model/profile, minus the overrides and minus
+   * creating anything. Wire-only, same restriction as those overrides: a
+   * background reply from the roster has no client-side `Session` object
+   * to fall back to (the target row may never have been resumed in this
+   * process — it could be listed straight from a persisted summary).
+   *
+   * The call is fire-and-forget from `dispatch.onSubmit`'s point of view —
+   * the reply panel has already closed and focus has already returned to
+   * the list by the time this runs — so the row itself carries the truth of
+   * whether the send landed: `pendingReplyIds` while outstanding, then
+   * either nothing (success — the roster's own `work_changed` fan-out picks
+   * up the change) or `replyFailures` (rejection, or the bounded wait in
+   * {@link replyRpcTimeoutMs} was exceeded), which persists until the user
+   * reopens the reply panel on that row OR {@link settleReplyAttempt} clears
+   * it because the RPC the bound gave up on turns out to have succeeded.
+   */
+  private async handleReply(view: AgentsViewState, targetId: string, text: string): Promise<void> {
+    const rpc = this.host.harness.wireRpc();
+    if (rpc === undefined) {
+      this.flash('Reply failed: replying from the list requires the wire transport');
+      return;
+    }
+    view.replyFailures.delete(targetId);
+    view.pendingReplyIds.add(targetId);
+    this.pushProps();
+
+    const attempt = rpc.prompt({ sessionId: targetId, input: [{ type: 'text', text }] });
+    view.replyAttempts.set(targetId, attempt);
+    // Keeps observing the RPC for as long as it actually takes, independent
+    // of the bounded wait below — a legitimately slow server that succeeds
+    // or fails AFTER the client gives up must still correct the row instead
+    // of freezing on whatever the bounded wait last wrote.
+    attempt.then(
+      () => this.settleReplyAttempt(view, targetId, attempt, text, false),
+      () => this.settleReplyAttempt(view, targetId, attempt, text, true),
+    );
+
+    try {
+      await raceTimeout(attempt, replyRpcTimeoutMs());
+    } catch (error) {
+      // Either `attempt` itself rejected within the bound (the `.then`
+      // above already reconciled the maps for that, or is about to on the
+      // next microtask — this write is then redundant but harmless), or
+      // the bound was exceeded while `attempt` is still running — in that
+      // case this IS the only thing that marks the row failed right now;
+      // `settleReplyAttempt` fires later, whenever `attempt` really settles.
+      if (this.host.state.agentsView !== view) return;
+      view.replyFailures.set(targetId, { text });
+      view.pendingReplyIds.delete(targetId);
+      const row = view.roster.get(targetId);
+      const name = row === undefined ? targetId : rosterRowName(row);
+      this.flash(`Reply to "${name}" failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.pushProps();
+    }
+  }
+
+  /**
+   * The single place that applies a reply attempt's REAL outcome to
+   * `pendingReplyIds`/`replyFailures` — called once `attempt` actually
+   * settles, whether that happens inside {@link handleReply}'s bounded wait
+   * or well after it already gave up (a legitimately slow, not stuck,
+   * server). On success this is what corrects a false "reply failed" row
+   * left by an exceeded bound; on failure it (re)affirms the failure the
+   * bounded wait may already have shown. No-ops once a retry has replaced
+   * this attempt for the row — `view.replyAttempts.get(targetId)` no
+   * longer points at THIS promise, because a fresh `handleReply` call
+   * always overwrites the entry — or the view has been torn down, so a
+   * late arrival from a superseded attempt never clobbers a newer one's
+   * state (the accepted duplicate-prompt case: the user already saw the
+   * failure and chose to retry).
+   */
+  private settleReplyAttempt(
+    view: AgentsViewState,
+    targetId: string,
+    attempt: Promise<void>,
+    text: string,
+    failed: boolean,
+  ): void {
+    if (this.host.state.agentsView !== view) return;
+    if (view.replyAttempts.get(targetId) !== attempt) return;
+    view.replyAttempts.delete(targetId);
+    view.pendingReplyIds.delete(targetId);
+    if (failed) view.replyFailures.set(targetId, { text });
+    else view.replyFailures.delete(targetId);
+    this.pushProps();
+  }
+
+  /**
+   * Clears reply-panel state (placeholder + `replyTargetId` + the dispatch's
+   * `replying` parse-mode flag + any unsent draft text) — called on every
+   * editor submit round trip (success or parse-error) and on every panel
+   * close. Reply is the same composer as dispatch; only its momentary
+   * target, placeholder and input parsing differ, so "leaving the panel" is
+   * just resetting those back to the dispatch defaults. The `setText('')`
+   * is a no-op after a submit (pi-tui already emptied the editor before
+   * calling back) but is what makes a non-submit close (Esc, space-on-empty,
+   * Ctrl+X, ↑/↓ — see `closeReplyPanel`) discard an unsent draft instead of
+   * leaking it into the next "new session" dispatch.
+   */
+  private exitReplyMode(view: AgentsViewState): void {
+    if (view.replyTargetId === undefined) return;
+    view.replyTargetId = undefined;
+    view.dispatch.replying = false;
+    view.dispatch.editor.setPlaceholder(DISPATCH_PLACEHOLDER);
+    view.dispatch.editor.setText('');
+  }
+
+  /**
+   * The reply panel's single "close" primitive: clears the panel's state
+   * (via `exitReplyMode`) and returns focus from the (now-unmounted) panel
+   * composer to the roster list. Shared by every way of leaving the panel —
+   * a submit (`dispatch.onSubmit`), a parse error (`dispatch.onError`), Esc
+   * (the editor's own `onEscape`, wired above), and the component's
+   * `onReplyClose` prop callback (space on an empty input, Ctrl+X, ↑/↓ when
+   * the editor's autocomplete isn't open — see
+   * `AgentsViewApp.handleReplyPanelKey`).
+   */
+  private closeReplyPanel(view: AgentsViewState): void {
+    this.exitReplyMode(view);
+    this.unfocusDispatch();
+  }
+
+  private handleGlobalEvent(event: Event): void {
+    const view = this.host.state.agentsView;
+    if (view === undefined) return;
+    if (!GLOBAL_EVENT_TYPES.has(event.type)) return;
+    // A session the view never touched never enters the roster: server-wide
+    // `event.session.created` fan-outs from other clients (kimi-web, other
+    // terminals) are dropped at the registry gate.
+    if (event.type === 'event.session.created' && !view.viewSessions.has(event.session.id)) {
+      return;
+    }
+    view.roster.applyEvent(event);
+    this.syncBusyTicker();
+    this.pushProps();
+    // While attached the component is unmounted, but the footer badge still
+    // reads live roster counts (the subscription survived the detach).
+    if (view.detached) this.pushAttachBadge(view, this.host.getCurrentSessionId());
+  }
+
+  /** Pushes the live roster counts to the attach-mode footer badge. */
+  private pushAttachBadge(view: AgentsViewState, excludeId: string): void {
+    const counts = view.roster.counts(excludeId);
+    this.host.setAttachBadge({ agents: counts.working, awaiting: counts.awaiting });
+  }
+
+  private buildProps(view: {
+    roster: AgentsRoster;
+    dispatch: AgentsViewDispatch;
+    dispatchFocused: boolean;
+    replyTargetId: string | undefined;
+    pendingReplyIds: ReadonlySet<string>;
+    replyFailures: ReadonlyMap<string, { text: string }>;
+    selectedId: string | undefined;
+    originSessionId: string | undefined;
+    confirmDeleteId: string | undefined;
+    renameDraft: { sessionId: string; text: string } | undefined;
+    flashMessage: string | undefined;
+    pendingExitTimer: ReturnType<typeof setTimeout> | undefined;
+    collapsedGroups: ReadonlySet<AgentsGroupId>;
+    completedExpanded: boolean;
+  }): AgentsViewProps {
+    const groups = view.roster
+      .groups(view.completedExpanded ? Number.MAX_SAFE_INTEGER : undefined)
+      .map((group): AgentsGroup => {
+        if (!view.collapsedGroups.has(group.id)) return group;
+        return { id: group.id, label: group.label, rows: [], collapsedCount: group.rows.length };
+      });
+    return {
+      groups,
+      counts: view.roster.counts(),
+      selectedId: view.selectedId,
+      originId: view.originSessionId,
+      serverLabel: this.host.agentsViewServerLabel(),
+      modelLabel: this.host.agentsViewModelLabel(),
+      confirmDeleteId: view.confirmDeleteId,
+      renameDraft: view.renameDraft,
+      flashMessage: view.flashMessage,
+      dispatchFocused: view.dispatchFocused,
+      dispatchEditor: view.dispatch.editor,
+      replyTargetId: view.replyTargetId,
+      pendingReplyIds: view.pendingReplyIds,
+      replyFailureIds: new Set(view.replyFailures.keys()),
+      pendingExitArmed: view.pendingExitTimer !== undefined,
+      ...this.buildCallbacks(),
+    };
+  }
+
+  /** Returns focus from the dispatch editor to the roster list. */
+  private unfocusDispatch(): void {
+    const view = this.host.state.agentsView;
+    if (view === undefined || !view.dispatchFocused) return;
+    view.dispatchFocused = false;
+    view.dispatch.editor.focused = false;
+    this.pushProps();
+  }
+
+  private pushProps(): void {
+    const view = this.host.state.agentsView;
+    if (view === undefined || view.detached) return;
+    view.component.setProps(this.buildProps(view));
+    this.host.state.ui.requestRender();
+  }
+
+  /** Clears a pending delete confirm; returns true when one was pending. */
+  private clearConfirm(view: AgentsViewState): boolean {
+    if (view.confirmDeleteId === undefined) return false;
+    view.confirmDeleteId = undefined;
+    return true;
+  }
+
+  /**
+   * The shared "actually leave" path behind both `onQuit` and a confirming
+   * second Ctrl+C: a pending delete confirm still absorbs it as a cancel
+   * first (matches Ctrl+X's own confirm flow), otherwise closes the view.
+   */
+  private quitOrCancelConfirm(view: AgentsViewState): void {
+    if (this.clearConfirm(view)) {
+      this.pushProps();
+      return;
+    }
+    this.close();
+  }
+
+  private buildCallbacks(): Pick<
+    AgentsViewProps,
+    | 'onSelect'
+    | 'onOpen'
+    | 'onDeleteRequest'
+    | 'onDeleteConfirm'
+    | 'onRenameBegin'
+    | 'onRenameSubmit'
+    | 'onPinToggle'
+    | 'onReplyRequest'
+    | 'onReplyClose'
+    | 'onReorderPinned'
+    | 'onHelpToggle'
+    | 'onQuit'
+    | 'onCtrlC'
+    | 'onDispatchFocusChange'
+  > {
+    return {
+      onSelect: (id) => {
+        const view = this.host.state.agentsView;
+        if (view === undefined) return;
+        view.selectedId = id === '' ? undefined : id;
+        if (this.clearConfirm(view)) this.pushProps();
+      },
+      onOpen: (id) => {
+        const view = this.host.state.agentsView;
+        if (view === undefined) return;
+        this.clearConfirm(view);
+        if (id === 'more:completed') {
+          view.completedExpanded = true;
+          this.pushProps();
+          return;
+        }
+        if (id.startsWith('group:')) {
+          const groupId = id.slice('group:'.length) as AgentsGroupId;
+          if (view.collapsedGroups.has(groupId)) view.collapsedGroups.delete(groupId);
+          else view.collapsedGroups.add(groupId);
+          this.pushProps();
+          return;
+        }
+        if (this.host.onOpenSession !== undefined) {
+          // Attaching a row reaffirms its registry membership (in practice it
+          // is already registered — the roster only lists registry rows).
+          view.viewSessions.add(id);
+          // Opening a row is the only thing that clears its unseen bit.
+          view.roster.markSeen(id);
+          void this.persistState(view);
+          this.host.onOpenSession(id);
+        } else {
+          this.host.showStatus('Attach is not available from this host');
+        }
+      },
+      onDeleteRequest: (id) => {
+        const view = this.host.state.agentsView;
+        if (view === undefined) return;
+        view.confirmDeleteId = id;
+        this.pushProps();
+      },
+      onDeleteConfirm: (id) => {
+        const view = this.host.state.agentsView;
+        if (view === undefined) return;
+        view.confirmDeleteId = undefined;
+        this.pushProps();
+        void this.handleDelete(id);
+      },
+      onRenameBegin: (id) => {
+        const view = this.host.state.agentsView;
+        if (view === undefined) return;
+        this.clearConfirm(view);
+        const row = view.roster.get(id);
+        if (row === undefined) return;
+        view.renameDraft = { sessionId: id, text: row.title };
+        this.pushProps();
+      },
+      onRenameSubmit: (id, text) => {
+        const view = this.host.state.agentsView;
+        if (view === undefined) return;
+        this.clearConfirm(view);
+        view.renameDraft = undefined;
+        const row = view.roster.get(id);
+        // Esc-cancel resubmits the original title: unchanged = cancel.
+        if (row === undefined || text === row.title || text.trim() === '') {
+          this.pushProps();
+          return;
+        }
+        void this.handleRename(id, row.title, text);
+      },
+      onPinToggle: (id) => {
+        const view = this.host.state.agentsView;
+        if (view === undefined) return;
+        this.clearConfirm(view);
+        void this.handlePinToggle(id);
+      },
+      onReplyRequest: (id) => {
+        const view = this.host.state.agentsView;
+        if (view === undefined) return;
+        this.clearConfirm(view);
+        const row = view.roster.get(id);
+        if (row === undefined) return;
+        view.replyTargetId = id;
+        view.dispatch.replying = true;
+        view.dispatchFocused = true;
+        view.dispatch.editor.focused = true;
+        // Fixed literal, not `reply to <name>` — the panel itself already
+        // shows the row's preview/age content (see `renderReplyPanel`), so
+        // the composer placeholder doesn't need to repeat the name too.
+        view.dispatch.editor.setPlaceholder('reply');
+        // A row re-entered from its failed state recovers the text that
+        // never made it through instead of forcing the user to retype it.
+        const failure = view.replyFailures.get(id);
+        if (failure !== undefined) {
+          view.replyFailures.delete(id);
+          view.dispatch.editor.setText(failure.text);
+        }
+        this.pushProps();
+      },
+      onReplyClose: () => {
+        const view = this.host.state.agentsView;
+        if (view === undefined) return;
+        this.closeReplyPanel(view);
+      },
+      onReorderPinned: (id, delta) => {
+        const view = this.host.state.agentsView;
+        if (view === undefined) return;
+        this.clearConfirm(view);
+        view.roster.reorderPinned(id, delta);
+        this.pushProps();
+        void this.persistState(view);
+      },
+      onHelpToggle: () => {
+        const view = this.host.state.agentsView;
+        if (view === undefined) return;
+        if (this.clearConfirm(view)) this.pushProps();
+      },
+      onQuit: () => {
+        const view = this.host.state.agentsView;
+        if (view === undefined) return;
+        // Esc during delete-confirm cancels the confirm, not the view.
+        this.quitOrCancelConfirm(view);
+      },
+      // Every Ctrl+C press reports here unconditionally — arm vs. quit is
+      // decided by whether a timer is already running. The timer (not the
+      // component) owns the auto-disarm because only the controller has
+      // `state.ui.requestRender()` to repaint on a silent timeout.
+      onCtrlC: () => {
+        const view = this.host.state.agentsView;
+        if (view === undefined) return;
+        if (view.pendingExitTimer !== undefined) {
+          clearTimeout(view.pendingExitTimer);
+          view.pendingExitTimer = undefined;
+          this.quitOrCancelConfirm(view);
+          return;
+        }
+        view.pendingExitTimer = setTimeout(() => {
+          const current = this.host.state.agentsView;
+          if (current === undefined || current.pendingExitTimer === undefined) return;
+          current.pendingExitTimer = undefined;
+          this.pushProps();
+        }, EXIT_CONFIRM_WINDOW_MS);
+        this.pushProps();
+      },
+      onDispatchFocusChange: (focused) => {
+        const view = this.host.state.agentsView;
+        if (view === undefined || view.dispatchFocused === focused) return;
+        view.dispatchFocused = focused;
+        view.dispatch.editor.focused = focused;
+        this.pushProps();
+      },
+    };
+  }
+
+  private async handleDelete(id: string): Promise<void> {
+    const view = this.host.state.agentsView;
+    if (view === undefined) return;
+
+    const ids: readonly string[] = id.startsWith('group:')
+      ? (view.roster
+          .groups(Number.MAX_SAFE_INTEGER)
+          .find((group) => group.id === id.slice('group:'.length))
+          ?.rows.map((row) => row.id) ?? [])
+      : [id];
+    if (ids.length === 0) return;
+
+    let failed = 0;
+    let removed = 0;
+    for (const sessionId of ids) {
+      try {
+        await this.host.harness.deleteSession(sessionId);
+        view.roster.remove(sessionId);
+        view.viewSessions.delete(sessionId);
+        view.pendingReplyIds.delete(sessionId);
+        view.replyFailures.delete(sessionId);
+        view.replyAttempts.delete(sessionId);
+        view.replyBarriers.delete(sessionId);
+        removed += 1;
+        if (view.selectedId === sessionId) view.selectedId = undefined;
+      } catch {
+        failed += 1;
+      }
+      if (this.host.state.agentsView !== view) return;
+      this.pushProps();
+    }
+    if (removed > 0) void this.persistState(view);
+    if (failed > 0) {
+      this.flash(`Failed to archive ${String(failed)} of ${String(ids.length)} session(s)`);
+    } else if (ids.length > 1) {
+      this.flash(`Archived ${String(ids.length)} sessions`);
+    }
+  }
+
+  private async handleRename(id: string, previousTitle: string, title: string): Promise<void> {
+    const view = this.host.state.agentsView;
+    if (view === undefined) return;
+    view.roster.setTitle(id, title);
+    this.pushProps();
+    try {
+      await this.host.harness.renameSession({ id, title });
+    } catch (error) {
+      if (this.host.state.agentsView !== view) return;
+      view.roster.setTitle(id, previousTitle);
+      this.host.showError(
+        `Rename failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      this.pushProps();
+    }
+  }
+
+  private async handlePinToggle(id: string): Promise<void> {
+    const view = this.host.state.agentsView;
+    if (view === undefined) return;
+    const row = view.roster.get(id);
+    if (row === undefined) return;
+    view.roster.setPinned(id, !row.pinned);
+    this.pushProps();
+    // The roster mutates the pins Set in place; persist the whole view state.
+    await this.persistState(view);
+  }
+
+  /**
+   * Serializes state writes: tmp-write + rename must land in call order and
+   * never overlap — a slow earlier write renaming after a later one would
+   * persist stale pins/registry. The chain also coalesces bursts: each write
+   * snapshots the (mutated-in-place) sets when it runs, not when it was
+   * scheduled.
+   */
+  private persistChain: Promise<void> = Promise.resolve();
+
+  /** Persist pins + registry atomically; failures flash, never throw. */
+  private persistState(view: AgentsViewState): Promise<void> {
+    this.persistChain = this.persistChain.then(async () => {
+      try {
+        await saveAgentsViewState(this.host.harness.homeDir, {
+          pins: view.pins,
+          sessions: view.viewSessions,
+          seenAt: view.seenAt,
+        });
+      } catch (error) {
+        if (this.host.state.agentsView !== view) return;
+        this.flash(
+          `Failed to persist agents view state: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    });
+    return this.persistChain;
+  }
+
+  /**
+   * Spinner heartbeat: roster events are rare (busy on / busy off), so while
+   * any row is working a 400 ms re-render keeps the spinner animating. Runs
+   * only while the component is mounted; detach / close / an idle roster
+   * stops it.
+   */
+  private syncBusyTicker(): void {
+    const view = this.host.state.agentsView;
+    if (view === undefined) return;
+    const anyBusy = view.roster.counts().working > 0;
+    if (anyBusy && !view.detached && view.busyTicker === undefined) {
+      view.busyTicker = setInterval(() => {
+        const current = this.host.state.agentsView;
+        // close() cleared the interval alongside the state — nothing to do.
+        if (current !== view) return;
+        if (view.detached || view.roster.counts().working === 0) {
+          this.syncBusyTicker();
+          return;
+        }
+        this.pushProps();
+      }, 400);
+      // A render heartbeat must never hold the event loop open on its own.
+      view.busyTicker.unref();
+    } else if ((!anyBusy || view.detached) && view.busyTicker !== undefined) {
+      clearInterval(view.busyTicker);
+      view.busyTicker = undefined;
+    }
+  }
+
+  private flash(message: string, durationMs = 2500): void {
+    const view = this.host.state.agentsView;
+    if (view === undefined) return;
+    if (view.flashTimer !== undefined) clearTimeout(view.flashTimer);
+    view.flashMessage = message;
+    view.flashTimer = setTimeout(() => {
+      const current = this.host.state.agentsView;
+      if (current !== view) return;
+      current.flashMessage = undefined;
+      current.flashTimer = undefined;
+      this.pushProps();
+    }, durationMs);
+    this.pushProps();
+  }
+}
+
+/**
+ * Deferred-permission hint: on the wire transport setPermission is
+ * stashed and rides the NEXT prompt's submission body, so the first
+ * user-initiated permission-mode change per attach earns a one-time status
+ * hint. The per-attach flag lives on {@link AgentsViewState.permissionHintShown}
+ * (reset by detachForAttach). `detached` is the "attached to a session"
+ * marker — `isOpen` stays true while detached, so mount
+ * checks must look at `detached`, not at the state's presence.
+ */
+export function hintDeferredPermissionOnce(host: {
+  readonly state: { readonly agentsView: AgentsViewState | undefined };
+  showStatus(msg: string): void;
+}): void {
+  const view = host.state.agentsView;
+  if (view === undefined || !view.detached || view.permissionHintShown) return;
+  view.permissionHintShown = true;
+  host.showStatus('Permission mode applies to the next prompt.');
+}

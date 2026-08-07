@@ -1,5 +1,5 @@
 # Copied from packages/kimi-core at build time
-agents/
+/agents/
 
 # Generated at build time by scripts/build-vis-asset.mjs.
 # Only the ~150KB base64 VALUE file is ignored; the committed `.d.ts` stub

@@ -15,6 +15,8 @@ interface Harness {
   readonly cancelCompaction: ReturnType<typeof vi.fn>;
   readonly btwCancelRunning: ReturnType<typeof vi.fn>;
   readonly btwCloseOrCancel: ReturnType<typeof vi.fn>;
+  readonly returnToAgentsView: ReturnType<typeof vi.fn>;
+  readonly showStatus: ReturnType<typeof vi.fn>;
 }
 
 function createHarness(options: { streamingPhase?: string; isCompacting?: boolean } = {}): Harness {
@@ -29,6 +31,8 @@ function createHarness(options: { streamingPhase?: string; isCompacting?: boolea
   const cancelCompaction = vi.fn(async () => {});
   const btwCancelRunning = vi.fn(() => false);
   const btwCloseOrCancel = vi.fn(() => false);
+  const returnToAgentsView = vi.fn(() => false);
+  const showStatus = vi.fn();
   const session = { cancel: vi.fn(async () => {}), cancelCompaction };
 
   const host = {
@@ -46,6 +50,8 @@ function createHarness(options: { streamingPhase?: string; isCompacting?: boolea
     btwPanelController: { cancelRunning: btwCancelRunning, closeOrCancel: btwCloseOrCancel },
     openUndoSelector,
     cancelRunningShellCommand,
+    returnToAgentsView,
+    showStatus,
   } as unknown as EditorKeyboardHost;
 
   const controller = new EditorKeyboardController(
@@ -62,6 +68,8 @@ function createHarness(options: { streamingPhase?: string; isCompacting?: boolea
     cancelCompaction,
     btwCancelRunning,
     btwCloseOrCancel,
+    returnToAgentsView,
+    showStatus,
   };
 }
 
@@ -265,6 +273,19 @@ describe('EditorKeyboardController shell history recall', () => {
     expect(editor['setInputMode'] as unknown as Mock).toHaveBeenCalledWith('prompt');
   });
 
+  it('agents view: the recall filter hides `!` shell entries entirely', () => {
+    // Input history is global/persistent: without this gate, ↑ on an empty
+    // buffer in the agents view could land on a `!` entry and resurrect the
+    // hidden bash input mode (which then submits via runShellCommandFromInput).
+    const { host, editor } = createHarness();
+    (host.state as unknown as { startupState: string }).startupState = 'agents-view';
+    const setHistoryFilter = editor['setHistoryFilter'] as unknown as Mock;
+    const [filter] = setHistoryFilter.mock.calls[0] as [(entry: string) => boolean];
+
+    expect(filter('!cmd')).toBe(false);
+    expect(filter('hello')).toBe(true);
+  });
+
   it('saves the current input mode as the history draft host state', () => {
     const { editor } = createHarness();
     const save = editor['onHistoryDraftSave'] as unknown as () => unknown;
@@ -283,5 +304,54 @@ describe('EditorKeyboardController shell history recall', () => {
     restore('prompt');
 
     expect(editor['setInputMode'] as unknown as Mock).toHaveBeenCalledWith('prompt');
+  });
+});
+
+
+// ── ← on an empty editor returns to the agents view ──
+
+describe('EditorKeyboardController onLeftArrowEmpty', () => {
+  it('delegates to the host and consumes the key when the host returns true', () => {
+    const { editor, returnToAgentsView } = createHarness();
+    returnToAgentsView.mockReturnValue(true);
+    const handler = editor['onLeftArrowEmpty'] as unknown as () => boolean;
+    expect(handler).toBeDefined();
+
+    expect(handler()).toBe(true);
+    expect(returnToAgentsView).toHaveBeenCalledOnce();
+  });
+
+  it('falls through (returns false) when the host is not in agents-attach mode', () => {
+    const { editor, returnToAgentsView } = createHarness();
+    returnToAgentsView.mockReturnValue(false);
+    const handler = editor['onLeftArrowEmpty'] as unknown as () => boolean;
+
+    expect(handler()).toBe(false);
+    expect(returnToAgentsView).toHaveBeenCalledOnce();
+  });
+});
+
+
+// ── `!` bash-input mode is hidden in the agents view ──
+
+describe('EditorKeyboardController bash mode gate', () => {
+  it('vetoes bash mode with a status hint while the agents view is active', () => {
+    const { host, editor, showStatus } = createHarness();
+    (host.state as unknown as { startupState: string }).startupState = 'agents-view';
+    const gate = editor['onBashModeAttempt'] as unknown as () => boolean;
+    expect(gate).toBeDefined();
+
+    expect(gate()).toBe(true);
+    expect(showStatus).toHaveBeenCalledWith(
+      'Shell commands (!) are not available in agents view.',
+    );
+  });
+
+  it('passes through outside the agents view (zero behavior change, no hint)', () => {
+    const { editor, showStatus } = createHarness();
+    const gate = editor['onBashModeAttempt'] as unknown as () => boolean;
+
+    expect(gate()).toBe(false);
+    expect(showStatus).not.toHaveBeenCalled();
   });
 });

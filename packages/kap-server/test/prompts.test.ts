@@ -11,7 +11,7 @@ import {
   closeSessionById,
   getLiveSessionById,
 } from '@moonshot-ai/agent-core-v2';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { type RunningServer, startServer } from '../src/start';
 import { TEST_HOST_IDENTITY } from './helpers/hostIdentity';
@@ -611,6 +611,22 @@ describe('server-v2 /api/v1 prompts', () => {
     });
     const promptId = submitted.body.data.prompt_id;
 
+    // With the default-profile bind the turn genuinely starts against the stub
+    // provider instead of dying instantly — cancel it and wait for the settle
+    // so the abort below targets an already-settled prompt.
+    const cancelled = await call<{ aborted: boolean }>(
+      'POST',
+      `/api/v1/sessions/${id}/prompts/${promptId}:abort`,
+    );
+    expect(cancelled.body.code).toBe(0);
+    await vi.waitFor(async () => {
+      const list = await call<{ active: PromptItemWire | null; queued: PromptItemWire[] }>(
+        'GET',
+        `/api/v1/sessions/${id}/prompts`,
+      );
+      expect(list.body.data.active).toBeNull();
+    });
+
     const aborted = await call<{ aborted: boolean }>(
       'POST',
       `/api/v1/sessions/${id}/prompts/${promptId}:abort`,
@@ -627,6 +643,42 @@ describe('server-v2 /api/v1 prompts', () => {
       `/api/v1/sessions/${id}/prompts/prompt_does_not_exist:abort`,
     );
     expect(body.code).toBe(40402);
+  });
+
+  it('steers a queued prompt into the active turn via the single-colon prompts:steer route', async () => {
+    const id = await createSession(home as string);
+    await createMainAgent(id);
+
+    // Turn 1 binds the default profile and genuinely runs against the
+    // unreachable stub endpoint, so turn 2 queues behind it.
+    const first = await call<PromptItemWire>('POST', `/api/v1/sessions/${id}/prompts`, {
+      content: [{ type: 'text', text: 'first' }],
+    });
+    expect(first.body.code).toBe(0);
+    expect(first.body.data.status).toBe('running');
+
+    const second = await call<PromptItemWire>('POST', `/api/v1/sessions/${id}/prompts`, {
+      content: [{ type: 'text', text: 'second' }],
+    });
+    expect(second.body.code).toBe(0);
+    expect(second.body.data.status).toBe('queued');
+
+    // The documented wire path is single-colon `prompts:steer`
+    // (protocol/rest-prompt.ts); the declared route used to carry a literal
+    // double colon that no request URL ever matches.
+    const steered = await call<{ steered: boolean; prompt_ids: string[] }>(
+      'POST',
+      `/api/v1/sessions/${id}/prompts:steer`,
+      { prompt_ids: [second.body.data.prompt_id] },
+    );
+    expect(steered.body.code).toBe(0);
+    expect(steered.body.data).toEqual({
+      steered: true,
+      prompt_ids: [second.body.data.prompt_id],
+    });
+
+    // Settle the session so the test does not leave a retrying turn behind.
+    await call('POST', `/api/v1/sessions/${id}:abort`);
   });
 
   it('returns 40401 for an unknown session', async () => {
@@ -717,6 +769,28 @@ describe('server-v2 /api/v1 prompts', () => {
     });
     expect(body.code).toBe(40001);
     expect(body.msg).toContain('agent_does_not_exist');
+  });
+
+  it('binds the default profile for a model-less prompt on a REST-created session', async () => {
+    // REST session creation reads only `metadata.cwd`/`title`, so the main
+    // agent is created unbound; without a `profile`/`model` override the
+    // prompt route must bind the default profile (falling back to the
+    // configured default_model) instead of letting the turn die with
+    // `model.not_configured`. No createMainAgent here — the route's
+    // ensureMainAgent path is the one the bug hit.
+    const id = await createSession(home as string);
+
+    const submitted = await call<PromptItemWire>('POST', `/api/v1/sessions/${id}/prompts`, {
+      content: [{ type: 'text', text: 'hello' }],
+    });
+    expect(submitted.body.code).toBe(0);
+
+    const session = getLiveSessionById(server!.core.accessor, id);
+    if (session === undefined) throw new Error(`session ${id} not found`);
+    const profile = session.accessor.get(IAgentLifecycleService).get('main')?.accessor
+      .get(IAgentProfileService);
+    expect(profile?.data().profileName).toBe('agent');
+    expect(profile?.data().modelAlias).toBe('stub');
   });
 
   it('binds a discovered custom agent profile on the first prompt', async () => {

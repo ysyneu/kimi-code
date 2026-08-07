@@ -57,6 +57,8 @@ export const sessionSchema = z.object({
   current_prompt_id: z.string().min(1).optional(),
   /** Text of the most recent user prompt, for search/preview. Absent for empty sessions. */
   last_prompt: z.string().optional(),
+  /** Text of the main agent's most recent assistant reply, for list previews. Absent for sessions with no reply yet. */
+  last_assistant_text: z.string().optional(),
   metadata: sessionMetadataSchema,
   agent_config: sessionAgentConfigSchema,
   usage: sessionUsageSchema,

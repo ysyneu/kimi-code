@@ -8,6 +8,11 @@ export {
   SDKRpcClientV2,
   type SDKRpcClientV2Options,
 } from '#/sdk-rpc-client-v2';
+export { createKimiHarnessWire } from '#/kimi-harness';
+export { SDKRpcClientWire, type SDKRpcClientWireOptions } from '#/wire/sdk-rpc-client-wire';
+// The full wire session row (busy / pending_interaction / last_turn_reason) —
+// the fields `SessionSummary` drops, served by `SDKRpcClientWire.listSessionRows`.
+export type { WireSession } from '#/wire/protocol';
 export {
   createKimiConfigRpc,
   KimiConfigRpcClient,

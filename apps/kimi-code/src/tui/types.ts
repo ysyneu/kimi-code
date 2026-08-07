@@ -249,9 +249,11 @@ export interface TUIStartupOptions {
   /** Raw --agent-file paths, passed to session creation alongside `agentProfile`. */
   readonly agentFiles?: readonly string[];
   readonly startupNotice?: string;
+  /** `kimi agents`: boot straight into the agents view — no startup session. */
+  readonly agentsView?: boolean;
 }
 
-export type TUIStartupState = 'pending' | 'ready' | 'picker';
+export type TUIStartupState = 'pending' | 'ready' | 'picker' | 'agents-view';
 
 export interface KimiTUIOptions {
   initialAppState: AppState;

@@ -9,6 +9,7 @@ import {
 
 import { Session } from '#/session';
 import type { KimiAuthFacade } from '#/auth';
+import type { Event } from '#/events';
 import type { SDKRpcClientBase } from '#/rpc';
 import type {
   AuthenticateMcpServerOptions,
@@ -20,6 +21,7 @@ import type {
   GetConfigOptions,
   KimiConfig,
   KimiConfigPatch,
+  KimiHarnessOptions,
   KimiHostIdentity,
   ListSessionsOptions,
   McpServerConfig,
@@ -33,7 +35,9 @@ import type {
   TelemetryContextPatch,
   TelemetryProperties,
   TestMcpServerOptions,
+  Unsubscribe,
 } from '#/types';
+import { SDKRpcClientWire } from '#/wire/sdk-rpc-client-wire';
 
 export interface KimiHarnessRuntimeOptions {
   readonly identity?: KimiHostIdentity;
@@ -101,6 +105,19 @@ export class KimiHarness {
     return this.rpc.withInteractiveAgent(agentId, fn);
   }
 
+  /**
+   * Narrow onto the wire transport's rpc client: the agents view needs its
+   * extended prompt input (model/profile overrides), a feature only the wire
+   * transport exposes. Returns undefined for any other transport — callers
+   * must treat that as "wire-only feature unavailable", never fall back to
+   * `any`. A public accessor instead of reaching past `rpc`'s private
+   * modifier from outside the class, so a rename here stays a compile error
+   * at every call site instead of a silent runtime `undefined`.
+   */
+  wireRpc(): SDKRpcClientWire | undefined {
+    return this.rpc instanceof SDKRpcClientWire ? this.rpc : undefined;
+  }
+
   track(event: string, properties?: TelemetryProperties): void {
     this.telemetry.track(event, properties);
   }
@@ -138,10 +155,25 @@ export class KimiHarness {
     const active = this.activeSessions.get(id);
     const { kaos, persistenceKaos, sessionStartedProperties, ...resumeInput } = input;
     if (active !== undefined) {
+      // A cache hit only skips the real resume when `active` already
+      // carries resume state from one. A `Session` that has only ever
+      // been through `createSession()` (e.g. agents-view dispatch,
+      // attached moments later while its id is still hot in this map) has
+      // `resumeState` undefined — handing it back untouched would silently
+      // return a session with no history and no live subscription. Do the
+      // real resume and merge it into the SAME object so identity-sensitive
+      // callers (kaos rebind, profile checks) keep getting `active` back.
+      const needsResume = active.getResumeState() === undefined;
       if (kaos !== undefined || persistenceKaos !== undefined) {
-        await this.rpc.resumeSessionWithKaos({ ...resumeInput, id }, kaos ?? persistenceKaos as Kaos, persistenceKaos);
-      } else if (input.agentProfile !== undefined) {
-        await this.rpc.resumeSession({ ...resumeInput, id });
+        const summary = await this.rpc.resumeSessionWithKaos({ ...resumeInput, id }, kaos ?? persistenceKaos as Kaos, persistenceKaos);
+        if (needsResume) active.applyResumedState(summary);
+      } else if (input.agentProfile !== undefined || needsResume) {
+        const summary = await this.rpc.resumeSession({ ...resumeInput, id });
+        if (needsResume) active.applyResumedState(summary);
+      }
+      if (needsResume) {
+        this.trackSessionStarted(id, true, sessionStartedProperties);
+        this.trackSessionEvent(id, 'session_resume');
       }
       return active;
     }
@@ -248,6 +280,16 @@ export class KimiHarness {
 
   async listSessions(options: ListSessionsOptions = {}): Promise<readonly SessionSummary[]> {
     return this.rpc.listSessions(options);
+  }
+
+  /**
+   * Subscribes to the full translated event stream — every session's events
+   * plus the subscription-free global events (`event.session.work_changed`,
+   * `session.meta.updated`, `event.session.created`). Listeners interested in
+   * one session should use `Session.onEvent`, which filters by session id.
+   */
+  onEvent(listener: (event: Event) => void): Unsubscribe {
+    return this.rpc.onEvent(listener);
   }
 
   /** Skills visible to a new session in `workDir`, without creating that session. */
@@ -372,4 +414,29 @@ function normalizeSessionId(value: string): string {
     throw new KimiError(ErrorCodes.SESSION_ID_EMPTY, 'Session id cannot be empty.');
   }
   return normalized;
+}
+
+/**
+ * The wire-transport harness factory: the SDK drives a running kap-server over
+ * the `/api/v1` REST + WS surface instead of hosting an engine in-process.
+ * Async because the supervisor must connect (`rpc.start()`) before the harness
+ * is handed out; option plumbing mirrors `createKimiHarnessV2`.
+ */
+export async function createKimiHarnessWire(
+  options: KimiHarnessOptions & { readonly serverUrl: string; readonly token?: string },
+): Promise<KimiHarness> {
+  const rpc = new SDKRpcClientWire(options);
+  await rpc.start();
+  return new KimiHarness(rpc, {
+    identity: rpc.identity,
+    uiMode: options.uiMode,
+    homeDir: rpc.homeDir,
+    configPath: rpc.configPath,
+    auth: rpc.auth,
+    telemetry: rpc.telemetry,
+    ensureConfigFile: () => rpc.ensureConfigFile(),
+    onClose: () => rpc.close(),
+    imageLimits: undefined,
+    sessionStartedProperties: options.sessionStartedProperties,
+  });
 }

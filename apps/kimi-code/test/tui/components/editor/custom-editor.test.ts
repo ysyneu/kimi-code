@@ -116,6 +116,54 @@ describe('CustomEditor onNonEscapeInput', () => {
   });
 });
 
+describe('CustomEditor onLeftArrowEmpty', () => {
+  const LEFT = '\u001B[D';
+
+  it('consumes ← on an empty editor when the handler returns true', () => {
+    const editor = makeEditor();
+    const onLeftArrowEmpty = vi.fn(() => true);
+    editor.onLeftArrowEmpty = onLeftArrowEmpty;
+
+    editor.handleInput(LEFT);
+
+    expect(onLeftArrowEmpty).toHaveBeenCalledOnce();
+    expect(editor.getText()).toBe('');
+  });
+
+  it('falls through when the handler returns false', () => {
+    const editor = makeEditor();
+    const onLeftArrowEmpty = vi.fn(() => false);
+    editor.onLeftArrowEmpty = onLeftArrowEmpty;
+
+    // Must not throw or corrupt the buffer; the editor stays empty.
+    editor.handleInput(LEFT);
+
+    expect(onLeftArrowEmpty).toHaveBeenCalledOnce();
+    expect(editor.getText()).toBe('');
+  });
+
+  it('keeps cursor semantics on a non-empty editor (handler not called)', () => {
+    const editor = makeEditor();
+    const onLeftArrowEmpty = vi.fn(() => true);
+    editor.onLeftArrowEmpty = onLeftArrowEmpty;
+    editor.setText('ab');
+    expect(editor.getCursor()).toEqual({ line: 0, col: 2 });
+
+    editor.handleInput(LEFT);
+
+    expect(onLeftArrowEmpty).not.toHaveBeenCalled();
+    expect(editor.getCursor()).toEqual({ line: 0, col: 1 });
+  });
+
+  it('is a no-op on an empty editor without a handler', () => {
+    const editor = makeEditor();
+
+    editor.handleInput(LEFT);
+
+    expect(editor.getText()).toBe('');
+  });
+});
+
 describe('CustomEditor slash argument completion refresh', () => {
   it('reopens /add-dir directory completions after tab completion and entering slash', async () => {
     const editor = makeEditor();
@@ -724,6 +772,46 @@ describe('CustomEditor bash mode via paste', () => {
 
     expect(editor.inputMode).toBe('bash');
     expect(editor.getText()).toBe('');
+  });
+});
+
+
+// ── Bash (`!`) mode gate — the agents view has no shell route ──
+
+describe('CustomEditor bash mode gate', () => {
+  it('a veto swallows the typed ! keystroke: prompt mode kept, buffer untouched', () => {
+    const editor = makeEditor();
+    const onInputModeChange = vi.fn();
+    const onBashModeAttempt = vi.fn(() => true);
+    editor.onInputModeChange = onInputModeChange;
+    editor.onBashModeAttempt = onBashModeAttempt;
+
+    editor.handleInput('!');
+
+    expect(onBashModeAttempt).toHaveBeenCalledOnce();
+    expect(editor.inputMode).toBe('prompt');
+    expect(editor.getText()).toBe('');
+    expect(onInputModeChange).not.toHaveBeenCalled();
+  });
+
+  it('a pass-through gate (false) keeps the normal bash-mode switch', () => {
+    const editor = makeEditor();
+    editor.onBashModeAttempt = vi.fn(() => false);
+
+    editor.handleInput('!');
+
+    expect(editor.inputMode).toBe('bash');
+    expect(editor.getText()).toBe('');
+  });
+
+  it('a veto keeps a pasted !cmd literal instead of switching modes', () => {
+    const editor = makeEditor();
+    editor.onBashModeAttempt = vi.fn(() => true);
+
+    editor.handleInput('[200~!ls[201~');
+
+    expect(editor.inputMode).toBe('prompt');
+    expect(editor.getText()).toBe('!ls');
   });
 });
 
