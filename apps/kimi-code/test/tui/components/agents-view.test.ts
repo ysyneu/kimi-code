@@ -836,15 +836,15 @@ describe('AgentsViewApp — pin / help / quit', () => {
     expect(onQuit).toHaveBeenCalledTimes(1);
   });
 
-  // ── R4 parity: Esc is a dismiss-cascade, not a flat quit ──
+  // ── R9 Q3: Esc closes the innermost overlay, otherwise quits — no origin-return ──
 
-  it('Esc returns to the origin session instead of quitting when one is set', () => {
+  it('Esc quits even when an origin is set — no origin-return (R9 Q3)', () => {
     const onQuit = vi.fn();
     const onOpen = vi.fn();
     const app = makeApp({ onQuit, onOpen, originId: 'ses-origin' });
     app.handleInput(ESC);
-    expect(onOpen).toHaveBeenCalledWith('ses-origin');
-    expect(onQuit).not.toHaveBeenCalled();
+    expect(onQuit).toHaveBeenCalledTimes(1);
+    expect(onOpen).not.toHaveBeenCalled();
   });
 
   it('a delete confirm still absorbs Esc as a cancel first, even with an origin set', () => {

@@ -38,11 +38,12 @@
  * - Reorder: `shift+↑↓` fires `onReorderPinned` only for a PINNED row;
  *   the callback is a no-op signal for anything else, so the controller
  *   need not re-check `pinned` itself.
- * - Esc is a dismiss-cascade, not a flat quit: rename/dispatch-focused/help
- *   each already absorb it above the branch below. Past that, Esc returns to
- *   `props.originId` (via the normal `onOpen` path — attaching back onto the
- *   session you already left resolves as a re-enter, not a fresh resume) when
- *   an origin is set, and only calls `onQuit` when there is none.
+ * - Esc closes the innermost overlay (rename/dispatch-focused/help/delete
+ *   confirm each already absorb it above the branch below); past that it
+ *   calls `onQuit()`, full stop — same as the exit command path. It never
+ *   re-attaches to `props.originId`: that field only drives the row's bold
+ *   "came from" styling now (see its own doc comment), a cosmetic marker
+ *   independent of Esc/quit.
  * - Ctrl+C is a genuine two-stage confirm-to-exit, independent of Esc/origin:
  *   every press just reports `onCtrlC()` — the component makes no arm/quit
  *   decision itself and holds no timer. The controller owns the actual
@@ -203,7 +204,7 @@ const HELP_GRID: readonly (readonly (HelpCell | undefined)[])[] = [
     ['alt+1-9', 'to open'],
     ['space', 'to reply'],
     ['@', 'to mention'],
-    ['esc', 'to go back/quit'],
+    ['esc', 'to quit'],
   ],
   [
     ['ctrl+r', 'to rename'],
@@ -374,15 +375,9 @@ export class AgentsViewApp extends Container implements Focusable {
 
     if (matchesKey(data, Key.escape)) {
       // A pending delete confirm is itself the innermost thing to dismiss —
-      // it keeps consuming Esc as a cancel (via onQuit; the controller
-      // clears confirmDeleteId instead of closing) ahead of the
-      // origin-return check below.
-      if (this.props.confirmDeleteId === undefined && this.props.originId !== undefined) {
-        // Nothing left to dismiss: return to the session this lifecycle was
-        // last backed out of — same effect as Enter on that row.
-        this.props.onOpen(this.props.originId);
-        return;
-      }
+      // onQuit is how it cancels (the controller clears confirmDeleteId
+      // instead of closing); every other case just quits (R9 Q3: no
+      // origin-return — see the class docstring).
       this.props.onQuit();
       return;
     }
