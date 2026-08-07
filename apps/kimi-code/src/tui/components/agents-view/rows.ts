@@ -173,7 +173,7 @@ export function rosterRowName(row: AgentsRosterRow): string {
  *
  * `sendState` overrides the status glyph and, while `'failed'`,
  * replaces the summary line with a persistent recovery hint — the row must
- * stay visibly wrong until the user re-enters reply mode (which restores
+ * stay visibly wrong until the user reopens the reply panel (which restores
  * the lost text) or a later send for the same row succeeds.
  */
 export function renderRosterRow(

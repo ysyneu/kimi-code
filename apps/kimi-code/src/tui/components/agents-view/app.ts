@@ -37,9 +37,11 @@
  *   target and placeholder differ; `renderReplyPanel` wraps it with the
  *   row's preview/age content). While the panel is open, `handleInput`
  *   intercepts space-on-empty-input (toggle close), Ctrl+X (close + start
- *   the row's delete flow), ↑/↓ (close + move selection) and Enter-on-empty
- *   (close + attach, same path as Enter on the row) BEFORE forwarding to the
- *   editor — Esc and Enter-with-text still fall through to the editor's own
+ *   the row's delete flow), ↑/↓ (close + move selection, but only while
+ *   `dispatchEditor` isn't showing its own autocomplete dropdown — see
+ *   `handleReplyPanelKey`) and Enter-on-empty (close + attach, same path as
+ *   Enter on the row) BEFORE forwarding to the editor — Esc and
+ *   Enter-with-text still fall through to the editor's own
  *   `onEscape`/`onSubmit`, which the controller wires to close/submit.
  * - Reorder: `shift+↑↓` fires `onReorderPinned` only for a PINNED row;
  *   the callback is a no-op signal for anything else, so the controller
@@ -124,9 +126,9 @@ export interface AgentsViewProps {
   readonly pendingReplyIds: ReadonlySet<string>;
   /**
    * Rows whose last reply attempt failed — rejected, or exceeded the
-   * controller's bounded client-side wait. Persists until the user
-   * re-enters reply mode on that row (which restores the lost text) or a
-   * later send for the same row succeeds.
+   * controller's bounded client-side wait. Persists until the user reopens
+   * the reply panel on that row (which restores the lost text) or a later
+   * send for the same row succeeds.
    */
   readonly replyFailureIds: ReadonlySet<string>;
   /**
@@ -538,15 +540,25 @@ export class AgentsViewApp extends Container implements Focusable {
       this.props.onDeleteRequest(targetId);
       return true;
     }
-    if (matchesKey(data, Key.up)) {
-      this.props.onReplyClose();
-      this.moveSelection(-1);
-      return true;
-    }
-    if (matchesKey(data, Key.down)) {
-      this.props.onReplyClose();
-      this.moveSelection(1);
-      return true;
+    // Up/Down close the panel and move the roster selection — but ONLY when
+    // the shared editor isn't showing its own @-mention/slash autocomplete
+    // dropdown. `Editor.handleInput` (pi-tui) routes Up/Down to the
+    // dropdown's own navigation whenever one is open (same as plain
+    // dispatch already relies on); intercepting unconditionally here would
+    // steal that navigation and — since `exitReplyMode` clears the draft on
+    // every non-submit close — silently discard whatever the user had
+    // typed. Falling through leaves the keystroke for `dispatchEditor` below.
+    if (!this.props.dispatchEditor.isShowingAutocomplete()) {
+      if (matchesKey(data, Key.up)) {
+        this.props.onReplyClose();
+        this.moveSelection(-1);
+        return true;
+      }
+      if (matchesKey(data, Key.down)) {
+        this.props.onReplyClose();
+        this.moveSelection(1);
+        return true;
+      }
     }
     // Empty Enter closes the panel and attaches (same path as Enter on the
     // row); a non-empty Enter is the editor's own submit — falls through to

@@ -140,7 +140,7 @@ export interface AgentsViewState {
    * One entry per row whose last reply attempt is currently showing as
    * failed — rejected, or exceeded the bounded client-side wait
    * ({@link replyRpcTimeoutMs}) while the underlying RPC was still running.
-   * Carries the lost text back so re-entering reply mode on that row
+   * Carries the lost text back so reopening the reply panel on that row
    * restores it instead of dropping it (see `onReplyRequest`). Cleared on
    * the next send attempt for that row (success or failure), on a fresh
    * re-entry, and — the late-ack case — if the underlying RPC the bounded
@@ -806,14 +806,14 @@ export class AgentsViewController {
    * process — it could be listed straight from a persisted summary).
    *
    * The call is fire-and-forget from `dispatch.onSubmit`'s point of view —
-   * reply mode has already exited and focus has already returned to the
-   * list by the time this runs — so the row itself carries the truth of
+   * the reply panel has already closed and focus has already returned to
+   * the list by the time this runs — so the row itself carries the truth of
    * whether the send landed: `pendingReplyIds` while outstanding, then
    * either nothing (success — the roster's own `work_changed` fan-out picks
    * up the change) or `replyFailures` (rejection, or the bounded wait in
    * {@link replyRpcTimeoutMs} was exceeded), which persists until the user
-   * re-enters reply mode on that row OR {@link settleReplyAttempt} clears it
-   * because the RPC the bound gave up on turns out to have succeeded.
+   * reopens the reply panel on that row OR {@link settleReplyAttempt} clears
+   * it because the RPC the bound gave up on turns out to have succeeded.
    */
   private async handleReply(view: AgentsViewState, targetId: string, text: string): Promise<void> {
     const rpc = this.host.harness.wireRpc();
@@ -907,12 +907,14 @@ export class AgentsViewController {
   }
 
   /**
-   * The reply panel's single "close" primitive: exits reply mode and returns
-   * focus from the (now-unmounted) panel composer to the roster list. Shared
-   * by every way of leaving the panel — a submit (`dispatch.onSubmit`), a
-   * parse error (`dispatch.onError`), Esc (the editor's own `onEscape`,
-   * wired above), and the component's `onReplyClose` prop callback (space on
-   * an empty input, Ctrl+X, ↑/↓ — see `AgentsViewApp.handleReplyPanelKey`).
+   * The reply panel's single "close" primitive: clears the panel's state
+   * (via `exitReplyMode`) and returns focus from the (now-unmounted) panel
+   * composer to the roster list. Shared by every way of leaving the panel —
+   * a submit (`dispatch.onSubmit`), a parse error (`dispatch.onError`), Esc
+   * (the editor's own `onEscape`, wired above), and the component's
+   * `onReplyClose` prop callback (space on an empty input, Ctrl+X, ↑/↓ when
+   * the editor's autocomplete isn't open — see
+   * `AgentsViewApp.handleReplyPanelKey`).
    */
   private closeReplyPanel(view: AgentsViewState): void {
     this.exitReplyMode(view);
