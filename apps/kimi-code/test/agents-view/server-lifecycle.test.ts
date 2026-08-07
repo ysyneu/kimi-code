@@ -149,16 +149,61 @@ describe('resolveAgentsServer', () => {
     await first.shutdown();
   });
 
-  it('refuses an external server whose version differs', async () => {
+  it('embeds a fresh server when the only live instance is version-mismatched', async () => {
     const first = await resolveAgentsServer({
       homeDir: home,
       identity: IDENTITY,
       cliVersion: IDENTITY.version,
     });
-    await expect(
-      resolveAgentsServer({ homeDir: home, identity: IDENTITY, cliVersion: '9.9.9-different' }),
-    ).rejects.toThrow(/9\.9\.9-different/);
+    const second = await resolveAgentsServer({
+      homeDir: home,
+      identity: IDENTITY,
+      cliVersion: '9.9.9-different',
+    });
+    expect(second.mode).toBe('embedded');
+    expect(second.baseUrl).not.toBe(first.baseUrl);
+    const res = await fetch(`${second.baseUrl}/api/v1/healthz`);
+    expect(res.ok).toBe(true);
+    await second.shutdown();
     await first.shutdown();
+  });
+
+  it('skips an older mismatched instance and attaches to a newer matching one', async () => {
+    // A stale, differently versioned instance registered well before the
+    // version-correct one — proves selection filters by version rather than
+    // picking whichever live instance happens to sort first (oldest-first).
+    const instancesDir = join(home, 'server', 'instances');
+    await mkdir(instancesDir, { recursive: true });
+    await writeFile(
+      join(instancesDir, 'old-mismatch.json'),
+      JSON.stringify({
+        server_id: 'old-mismatch',
+        pid: process.pid, // alive, so it stays in the live set
+        host: '127.0.0.1',
+        port: 1,
+        started_at: 1000,
+        heartbeat_at: 1000,
+        host_version: 'some-other-version',
+      }),
+    );
+
+    const matching = await resolveAgentsServer({
+      homeDir: home,
+      identity: IDENTITY,
+      cliVersion: IDENTITY.version,
+    });
+    expect(matching.mode).toBe('embedded');
+
+    const second = await resolveAgentsServer({
+      homeDir: home,
+      identity: IDENTITY,
+      cliVersion: IDENTITY.version,
+    });
+    expect(second.mode).toBe('attached');
+    expect(second.baseUrl).toBe(matching.baseUrl);
+
+    await second.shutdown();
+    await matching.shutdown();
   });
 
   it('falls back to embedded when the registered pid is alive but the port is dead', async () => {
@@ -192,7 +237,7 @@ describe('resolveAgentsServer', () => {
     await server.shutdown();
   });
 
-  it('refuses a versionless (pre-version-gate) running server', async () => {
+  it('embeds a fresh server when the only live instance is versionless (pre-version-gate)', async () => {
     const instancesDir = join(home, 'server', 'instances');
     await mkdir(instancesDir, { recursive: true });
     await writeFile(
@@ -207,9 +252,16 @@ describe('resolveAgentsServer', () => {
         // no host_version — written by a server older than the version gate
       }),
     );
-    await expect(
-      resolveAgentsServer({ homeDir: home, identity: IDENTITY, cliVersion: IDENTITY.version }),
-    ).rejects.toThrow(/older than the version gate/);
+
+    const server = await resolveAgentsServer({
+      homeDir: home,
+      identity: IDENTITY,
+      cliVersion: IDENTITY.version,
+    });
+    expect(server.mode).toBe('embedded');
+    const res = await fetch(`${server.baseUrl}/api/v1/healthz`);
+    expect(res.ok).toBe(true);
+    await server.shutdown();
   });
 });
 

@@ -4,16 +4,17 @@
  *
  * Discovery reuses `@moonshot-ai/kap-server`'s instance registry read side:
  * instance files under `<home>/server/instances/*.json` are probed with
- * `kill(pid, 0)`, dead-pid files are swept, and the longest-running live
- * instance wins. `resolveAgentsServer` builds on it: attach to that live
- * instance (behind a same-version gate), or embed a kap-server in-process
- * when none is running.
+ * `kill(pid, 0)`, dead-pid files are swept, and the live set comes back
+ * sorted oldest-first. `resolveAgentsServer` builds on it: attach to the
+ * first live instance that is both version-matched and reachable, or embed a
+ * kap-server in-process when none qualifies.
  */
 
 import { readFileSync } from 'node:fs';
 
 import {
   getLiveServerInstance,
+  listLiveServerInstances,
   serverTokenPath,
   startServer,
   type RunningServer,
@@ -99,45 +100,48 @@ export interface ResolveAgentsServerOptions {
 }
 
 /**
- * Resolve the kap-server the agents view talks to: attach to the live instance
- * registered under `homeDir` when one exists, embed one in-process otherwise.
+ * Resolve the kap-server the agents view talks to: attach to a live,
+ * version-matched instance registered under `homeDir` when one exists, embed
+ * one in-process otherwise.
  *
- * Version gate: an attached server must run the same version as this CLI —
- * the wire protocol and home-dir state are version-coupled, so a mismatched
- * (or versionless, i.e. too-old) server is refused with a restart hint.
+ * Version filter: the wire protocol and home-dir state are version-coupled,
+ * so only an instance running this CLI's exact version is attach-worthy.
+ * The instance registry is multi-instance by design (concurrent differently
+ * versioned servers are the shipped norm, not an error) — every live
+ * instance is scanned oldest-first for a version match; a mismatched (or
+ * versionless, i.e. too-old) instance is simply skipped rather than failed
+ * on, exactly like the no-live-instance case below.
  *
  * Liveness gate: a registered pid is not proof of service — an orphaned
  * server can hold a live pid while its HTTP surface is already gone (e.g. a
  * half-shutdown TUI host). Attaching to that used to crash the CLI with a
- * raw ECONNREFUSED, so the instance must answer a probe request before we
- * attach; an unreachable one falls through to the embedded path.
+ * raw ECONNREFUSED, so each version-matched instance must answer a probe
+ * request before we attach; an unreachable one is skipped like a version
+ * mismatch.
  */
 export async function resolveAgentsServer(
   options: ResolveAgentsServerOptions,
 ): Promise<AgentsServer> {
   const { homeDir, identity, cliVersion } = options;
 
-  const live = await discoverRunningServer(homeDir);
-  if (live !== undefined) {
-    if (live.version !== cliVersion) {
-      throw new Error(
-        live.version === undefined
-          ? `a kap-server (pid ${live.pid}) older than the version gate is already running — restart it with this CLI (${cliVersion})`
-          : `kap-server version mismatch: running ${live.version} (pid ${live.pid}), this CLI is ${cliVersion} — restart the running server with \`kimi web\` before opening the agents view`,
-      );
-    }
+  const versionMatched = (await listLiveServerInstances(homeDir)).filter(
+    (instance) => instance.serverVersion === cliVersion,
+  );
+  if (versionMatched.length > 0) {
     // Same-machine premise: always talk to the server over loopback, whatever
     // host the instance file advertises.
-    const baseUrl = `http://127.0.0.1:${live.port}`;
     const token = readServerToken(homeDir);
-    if (await probeServer(baseUrl, token)) {
-      return {
-        mode: 'attached',
-        baseUrl,
-        token,
-        serverPid: live.pid,
-        shutdown: async () => {},
-      };
+    for (const instance of versionMatched) {
+      const baseUrl = `http://127.0.0.1:${instance.port}`;
+      if (await probeServer(baseUrl, token)) {
+        return {
+          mode: 'attached',
+          baseUrl,
+          token,
+          serverPid: instance.pid,
+          shutdown: async () => {},
+        };
+      }
     }
   }
 
