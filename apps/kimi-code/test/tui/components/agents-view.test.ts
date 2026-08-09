@@ -96,6 +96,7 @@ function makeProps(overrides: Partial<AgentsViewProps> = {}): AgentsViewProps {
     counts: { awaiting: 0, working: 0, completed: 0 },
     selectedId: undefined,
     originId: undefined,
+    attachedIds: new Set(),
     serverLabel: 'embedded',
     modelLabel: 'kimi-k2',
     confirmDeleteId: undefined,
@@ -543,6 +544,26 @@ describe('AgentsViewApp — footer hints follow the selection target', () => {
   it('more-row footer mentions expand', () => {
     const out = render(makeApp({ groups, counts, selectedId: 'more:completed' }));
     expect(out).toContain('expand');
+  });
+
+  it('a row never attached in this process shows "enter to open" (B2)', () => {
+    const out = render(makeApp({ groups, counts, selectedId: 'work-1', attachedIds: new Set() }));
+    expect(out).toContain('enter to open');
+    expect(out).not.toContain('enter to return');
+  });
+
+  it('a row this process HAS attached to shows "enter to return" (B2)', () => {
+    const out = render(makeApp({ groups, counts, selectedId: 'work-1', attachedIds: new Set(['work-1']) }));
+    expect(out).toContain('enter to return');
+    expect(out).not.toContain('enter to open');
+  });
+
+  it('the return verb is per-row — an attached id does not flip an unrelated row (B2)', () => {
+    const out = render(
+      makeApp({ groups, counts, selectedId: 'done-0', attachedIds: new Set(['work-1']) }),
+    );
+    expect(out).toContain('enter to open');
+    expect(out).not.toContain('enter to return');
   });
 });
 

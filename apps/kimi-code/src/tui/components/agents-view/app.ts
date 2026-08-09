@@ -116,6 +116,14 @@ export interface AgentsViewProps {
    * "came from" styling in `rows.ts`, not the cursor pointer.
    */
   readonly originId: string | undefined;
+  /**
+   * B2: session ids this TUI PROCESS has attached to at least once —
+   * controller-owned, in-memory only (see `AgentsViewController`'s own
+   * field doc), NOT `selectedId`/`originId`-scoped. Drives the roster
+   * footer's row hint: `enter to open` for an id not in this set, `enter to
+   * return` once it is. Checked by row id (`ViewItem.id`, same as `row.id`).
+   */
+  readonly attachedIds: ReadonlySet<string>;
   /** "embedded" or host:port of the connected kap-server. Not currently shown
    *  by the header chrome (Claude Code's header has no server-label slot),
    *  but kept on the props contract for the host wiring that supplies it. */
@@ -899,8 +907,11 @@ export class AgentsViewApp extends Container implements Focusable {
       } else if (item.kind === 'more') {
         left = compose(hint('enter', 'to expand'), hint('?', 'for shortcuts'));
       } else {
+        // B2: this process has never attached to the row vs. it has —
+        // "open" the first time, "return" every time after.
+        const openVerb = this.props.attachedIds.has(item.id) ? 'to return' : 'to open';
         left = compose(
-          hint('enter', 'to open'),
+          hint('enter', openVerb),
           hint('space', 'to reply'),
           hint('ctrl+x', 'to delete'),
           hint('?', 'for shortcuts'),

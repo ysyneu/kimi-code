@@ -453,6 +453,17 @@ export function dispatchSlashCommands(
 export class AgentsViewController {
   constructor(private readonly host: AgentsViewHost) {}
 
+  /**
+   * B2: session ids this TUI PROCESS has successfully attached to at least
+   * once — drives the roster footer's `enter to open` → `enter to return`
+   * verb (`AgentsViewProps.attachedIds`). Lives on the controller instance
+   * itself (constructed once per process, see `KimiTUI`'s constructor), not
+   * on `AgentsViewState` — that state object is recreated per `show()`
+   * after a `close()`, but this memory must survive that and only reset on
+   * an actual process restart. Never persisted to disk.
+   */
+  private readonly attachedSessionIds = new Set<string>();
+
   get isOpen(): boolean {
     return this.host.state.agentsView !== undefined;
   }
@@ -1006,6 +1017,8 @@ export class AgentsViewController {
       // second Enter on the row.
       if (this.host.onOpenSession !== undefined) {
         view.roster.markSeen(session.id);
+        // B2: same attach-succeeded record `onOpen` writes.
+        this.attachedSessionIds.add(session.id);
         void this.persistState(view);
         this.host.onOpenSession(session.id);
       } else {
@@ -1260,6 +1273,7 @@ export class AgentsViewController {
       counts: view.roster.counts(),
       selectedId: view.selectedId,
       originId: view.originSessionId,
+      attachedIds: this.attachedSessionIds,
       serverLabel: this.host.agentsViewServerLabel(),
       modelLabel: this.host.agentsViewModelLabel(),
       confirmDeleteId: view.confirmDeleteId,
@@ -1447,6 +1461,9 @@ export class AgentsViewController {
           view.viewSessions.add(id);
           // Opening a row is the only thing that clears its unseen bit.
           view.roster.markSeen(id);
+          // B2: the footer's open→return verb flip — recorded at the point
+          // the attach actually succeeds, not on keypress.
+          this.attachedSessionIds.add(id);
           void this.persistState(view);
           this.host.onOpenSession(id);
         } else {

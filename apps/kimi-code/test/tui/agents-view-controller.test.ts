@@ -1340,6 +1340,21 @@ describe('AgentsViewController — open', () => {
     expect(b.showStatus).not.toHaveBeenCalled();
   });
 
+  it('the footer verb flips from "enter to open" to "enter to return" after the first successful attach in this process (B2)', async () => {
+    const onOpenSession = vi.fn();
+    const b = await boot([summary('s1'), summary('s2')], { onOpenSession });
+    dir = b.homeDir;
+    b.component().handleInput(DOWN); // onto row s1
+    expect(b.render()).toContain('enter to open');
+
+    b.component().handleInput(ENTER); // attach succeeds via the onOpenSession stub
+    expect(b.render()).toContain('enter to return');
+
+    b.component().handleInput(DOWN); // onto row s2 — never attached
+    expect(b.render()).toContain('enter to open');
+    expect(b.render()).not.toContain('enter to return');
+  });
+
   it('Enter on a row clears its unseen bit and persists the seen timestamp', async () => {
     const onOpenSession = vi.fn();
     const b = await boot([summary('s1', { updatedAt: 1_000 })], { onOpenSession });
