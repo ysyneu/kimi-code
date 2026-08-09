@@ -22,6 +22,8 @@ import { AgentsExitConfirmComponent } from '#/tui/components/agents-view/exit-co
 import { BannerComponent } from '#/tui/components/chrome/banner';
 import { WelcomeComponent } from '#/tui/components/chrome/welcome';
 import { ApprovalPanelComponent } from '#/tui/components/dialogs/approval-panel';
+import { loadTuiConfig } from '#/tui/config';
+import type { AgentsGroupMode } from '#/tui/controllers/agents-view-groups';
 import { KimiTUI, type KimiTUIStartupInput, type TUIState } from '#/tui/kimi-tui';
 import type { ApprovalController } from '#/tui/reverse-rpc/approval/controller';
 import { REPLAY_TURN_LIMIT } from '#/tui/utils/message-replay';
@@ -727,6 +729,45 @@ describe('KimiTUI startup', () => {
     expect(
       (attached as unknown as { agentsViewServerLabel(): string }).agentsViewServerLabel(),
     ).toBe('127.0.0.1:58627');
+  });
+
+  it('agentsViewGroupMode defaults to state and honors the startup tuiConfig, with no disk I/O', () => {
+    // Sync, in-memory read (see `KimiTUI#agentsViewGroupModePref`) — safe to
+    // call directly with no `KIMI_CODE_HOME` sandboxing, unlike
+    // `saveAgentsViewGroupMode` below.
+    const harness = makeHarness();
+    const defaulted = makeDriver(harness, makeStartupInput());
+    expect((defaulted as unknown as { agentsViewGroupMode(): AgentsGroupMode }).agentsViewGroupMode()).toBe(
+      'state',
+    );
+
+    const seeded = makeDriver(harness, makeStartupInput({}, { agentsView: { groupMode: 'directory' } }));
+    expect((seeded as unknown as { agentsViewGroupMode(): AgentsGroupMode }).agentsViewGroupMode()).toBe(
+      'directory',
+    );
+  });
+
+  it('saveAgentsViewGroupMode writes tui.toml and updates the in-memory preference', async () => {
+    const originalEnv = { ...process.env };
+    const dir = mkdtempSync(join(tmpdir(), 'kimi-startup-group-mode-'));
+    process.env['KIMI_CODE_HOME'] = dir;
+
+    try {
+      const harness = makeHarness();
+      const driver = makeDriver(harness, makeStartupInput()) as unknown as {
+        agentsViewGroupMode(): AgentsGroupMode;
+        saveAgentsViewGroupMode(mode: AgentsGroupMode): Promise<void>;
+      };
+
+      await driver.saveAgentsViewGroupMode('directory');
+
+      expect(driver.agentsViewGroupMode()).toBe('directory');
+      const reloaded = await loadTuiConfig();
+      expect(reloaded.agentsView).toEqual({ groupMode: 'directory' });
+    } finally {
+      process.env = { ...originalEnv };
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('applies --auto after picking a session from bare --session', async () => {

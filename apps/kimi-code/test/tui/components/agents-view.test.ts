@@ -121,6 +121,7 @@ function makeProps(overrides: Partial<AgentsViewProps> = {}): AgentsViewProps {
     onQuit: vi.fn(),
     onCtrlC: vi.fn(),
     onDispatchFocusChange: vi.fn(),
+    onGroupModeToggle: vi.fn(),
     ...overrides,
   };
 }
@@ -801,9 +802,8 @@ describe('AgentsViewApp — pin / help / quit', () => {
     expect(opened).toContain('alt+1-9 to open');
     expect(opened).toContain('space to reply');
     expect(opened).toContain('@ to mention');
-    // ctrl+s (switch views) is deliberately absent — no second view mode
-    // exists to switch to, and the brief bans inventing one.
-    expect(opened).not.toContain('ctrl+s');
+    // A6: ctrl+s now cycles the roster's grouping mode.
+    expect(opened).toContain('ctrl+s to switch views');
 
     app.handleInput('?');
     expect(onHelpToggle).toHaveBeenCalledTimes(2);
@@ -915,6 +915,59 @@ describe('AgentsViewApp — pin / help / quit', () => {
     app.handleInput('[113u');
     expect(onQuit).not.toHaveBeenCalled();
     expect(editor.getText()).toBe('q');
+  });
+});
+
+describe('AgentsViewApp — Ctrl+S switches the grouping mode (A6)', () => {
+  const CTRL_S = '\u0013';
+
+  it('Ctrl+S at the roster (no overlay open) fires onGroupModeToggle', () => {
+    const onGroupModeToggle = vi.fn();
+    const app = makeApp({ groups: [group('completed', [row('s1')])], onGroupModeToggle });
+    app.handleInput(CTRL_S);
+    expect(onGroupModeToggle).toHaveBeenCalledTimes(1);
+  });
+
+  it('is global — fires the same way regardless of which item is selected', () => {
+    const onGroupModeToggle = vi.fn();
+    const app = makeApp({
+      groups: [group('completed', [row('s1')])],
+      selectedId: 'group:completed',
+      onGroupModeToggle,
+    });
+    app.handleInput(CTRL_S);
+    expect(onGroupModeToggle).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT fire while the inline rename editor is open (would fire without the overlay guard)', () => {
+    const onGroupModeToggle = vi.fn();
+    const onRenameSubmit = vi.fn();
+    const app = makeApp({
+      groups: [group('completed', [row('s1')])],
+      renameDraft: { sessionId: 's1', text: 's1 title' },
+      onGroupModeToggle,
+      onRenameSubmit,
+    });
+    app.handleInput(CTRL_S);
+    expect(onGroupModeToggle).not.toHaveBeenCalled();
+    // Confirms the key really landed in the rename editor, not just dropped.
+    expect(onRenameSubmit).not.toHaveBeenCalled();
+  });
+
+  it('does NOT fire while the dispatch composer is focused (would fire without the overlay guard)', () => {
+    const onGroupModeToggle = vi.fn();
+    const editor = makeDispatchEditor();
+    const app = makeApp({ dispatchEditor: editor, dispatchFocused: true, onGroupModeToggle });
+    app.handleInput(CTRL_S);
+    expect(onGroupModeToggle).not.toHaveBeenCalled();
+  });
+
+  it('does NOT fire while the ? help grid is open — only ?/Esc are read there', () => {
+    const onGroupModeToggle = vi.fn();
+    const app = makeApp({ onGroupModeToggle });
+    app.handleInput('?');
+    app.handleInput(CTRL_S);
+    expect(onGroupModeToggle).not.toHaveBeenCalled();
   });
 });
 

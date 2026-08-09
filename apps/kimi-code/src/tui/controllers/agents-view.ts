@@ -4,7 +4,7 @@ import { parseIntegerEnv } from '@moonshot-ai/agent-core-v2';
 import type { Event, KimiHarness, Unsubscribe, WireSession } from '@moonshot-ai/kimi-code-sdk';
 import type { Component, Container, ProcessTerminal, TUI } from '@moonshot-ai/pi-tui';
 
-import { AgentsRoster, type AgentsGroup, type AgentsGroupId } from '../agents/roster';
+import { AgentsRoster, type AgentsGroup } from '../agents/roster';
 import { loadAgentsViewState, saveAgentsViewState } from '../agents/roster-persistence';
 import { completeLeadingArg, type ArgCompletionSpec } from '../commands/complete-args';
 import { BUILTIN_SLASH_COMMANDS } from '../commands/registry';
@@ -21,6 +21,7 @@ import {
   type DispatchActivatableCommands,
   type DispatchSubmission,
 } from './agents-view-dispatch';
+import { buildDirectoryGroups, type AgentsGroupMode } from './agents-view-groups';
 
 export interface AgentsViewHost {
   readonly state: {
@@ -39,6 +40,18 @@ export interface AgentsViewHost {
   agentsViewServerLabel(): string;
   /** Dispatch target: every session created from the view opens in this cwd. */
   agentsViewWorkDir(): string;
+  /**
+   * Initial roster grouping mode for a fresh `show()` mount — read from the
+   * host's already-loaded startup config (same "read once, keep in memory"
+   * footing as `agentsViewServerLabel`/`agentsViewWorkDir` above: no disk I/O
+   * on the read path). Ctrl+S (`AgentsViewProps.onGroupModeToggle`) cycles it
+   * thereafter and {@link saveAgentsViewGroupMode} persists the change back
+   * (and updates what this getter returns for the next `show()`).
+   */
+  agentsViewGroupMode(): AgentsGroupMode;
+  /** Persists a Ctrl+S grouping-mode change. Rejections propagate to the
+   *  controller's own flash (same contract as `saveAgentsViewState`). */
+  saveAgentsViewGroupMode(mode: AgentsGroupMode): Promise<void>;
   /** Header label for the model new sessions dispatch with by default. */
   agentsViewModelLabel(): string;
   /**
@@ -221,8 +234,18 @@ export interface AgentsViewState {
    * the component read-only as `AgentsViewProps.pendingExitArmed`.
    */
   pendingExitTimer: ReturnType<typeof setTimeout> | undefined;
-  collapsedGroups: Set<AgentsGroupId>;
+  /**
+   * Group ids currently manually collapsed. State-mode ids (`AgentsGroupId`)
+   * and directory-mode ids (`dir:<workDir>` / `other`, `AgentsGroup.id`'s own
+   * doc) share this one `Set<string>` — a collapse from one mode simply never
+   * matches an id from the other, so switching modes naturally shows
+   * everything expanded again there without any explicit reset.
+   */
+  collapsedGroups: Set<string>;
   completedExpanded: boolean;
+  /** A6: roster grouping — Ctrl+S cycles `state ⇄ directory`; persisted via
+   *  {@link AgentsViewHost.saveAgentsViewGroupMode}. */
+  groupMode: AgentsGroupMode;
   eventUnsubscribe: Unsubscribe;
   /** WS connection-state subscription (wire transport only) — drives the
    *  post-reconnect roster reconciliation. Dies with the view on close(). */
@@ -446,6 +469,7 @@ export class AgentsViewController {
       return;
     }
     if (state.agentsView !== undefined) return;
+    const groupMode = this.host.agentsViewGroupMode();
     const { pins, sessions: viewSessions, seenAt } = persisted;
 
     const roster = new AgentsRoster(pins, seenAt);
@@ -469,6 +493,7 @@ export class AgentsViewController {
     const component = new AgentsViewApp(
       this.buildProps({
         roster,
+        pins,
         dispatch,
         dispatchFocused: false,
         replyTargetId: undefined,
@@ -482,6 +507,7 @@ export class AgentsViewController {
         pendingExitTimer: undefined,
         collapsedGroups: new Set(),
         completedExpanded: false,
+        groupMode,
       }),
       state.terminal,
     );
@@ -566,6 +592,7 @@ export class AgentsViewController {
       pendingExitTimer: undefined,
       collapsedGroups: new Set(),
       completedExpanded: false,
+      groupMode,
       eventUnsubscribe: this.host.harness.onEvent((event) => {
         this.handleGlobalEvent(event);
       }),
@@ -1119,8 +1146,28 @@ export class AgentsViewController {
     this.host.setAttachBadge({ agents: counts.working, awaiting: counts.awaiting });
   }
 
+  /**
+   * Mode-aware group builder (A6) — the single place `buildProps` and the
+   * group-delete-all path (`handleDelete`) both read from, so a directory-mode
+   * `dir:<workDir>` / `other` group id resolves the same way `completed` /
+   * `pinned` already do in state mode. State mode delegates straight to the
+   * unchanged, already-tested `AgentsRoster.groups()`; directory mode computes
+   * fresh buckets from a live row snapshot via the pure `buildDirectoryGroups`
+   * (`agents-view-groups.ts`) — no page-size windowing, no "more" affordance
+   * (see that function's own doc for why).
+   */
+  private currentGroups(
+    view: { roster: AgentsRoster; pins: ReadonlySet<string>; groupMode: AgentsGroupMode },
+    pageSize?: number,
+  ): readonly AgentsGroup[] {
+    return view.groupMode === 'directory'
+      ? buildDirectoryGroups(view.roster.allRows(), view.pins)
+      : view.roster.groups(pageSize);
+  }
+
   private buildProps(view: {
     roster: AgentsRoster;
+    pins: ReadonlySet<string>;
     dispatch: AgentsViewDispatch;
     dispatchFocused: boolean;
     replyTargetId: string | undefined;
@@ -1132,15 +1179,16 @@ export class AgentsViewController {
     renameDraft: { sessionId: string; text: string } | undefined;
     flashMessage: string | undefined;
     pendingExitTimer: ReturnType<typeof setTimeout> | undefined;
-    collapsedGroups: ReadonlySet<AgentsGroupId>;
+    collapsedGroups: ReadonlySet<string>;
     completedExpanded: boolean;
+    groupMode: AgentsGroupMode;
   }): AgentsViewProps {
-    const groups = view.roster
-      .groups(view.completedExpanded ? Number.MAX_SAFE_INTEGER : undefined)
-      .map((group): AgentsGroup => {
+    const groups = this.currentGroups(view, view.completedExpanded ? Number.MAX_SAFE_INTEGER : undefined).map(
+      (group): AgentsGroup => {
         if (!view.collapsedGroups.has(group.id)) return group;
         return { id: group.id, label: group.label, rows: [], collapsedCount: group.rows.length };
-      });
+      },
+    );
     return {
       groups,
       counts: view.roster.counts(),
@@ -1213,6 +1261,7 @@ export class AgentsViewController {
     | 'onQuit'
     | 'onCtrlC'
     | 'onDispatchFocusChange'
+    | 'onGroupModeToggle'
   > {
     return {
       onSelect: (id) => {
@@ -1231,7 +1280,7 @@ export class AgentsViewController {
           return;
         }
         if (id.startsWith('group:')) {
-          const groupId = id.slice('group:'.length) as AgentsGroupId;
+          const groupId = id.slice('group:'.length);
           if (view.collapsedGroups.has(groupId)) view.collapsedGroups.delete(groupId);
           else view.collapsedGroups.add(groupId);
           this.pushProps();
@@ -1417,6 +1466,24 @@ export class AgentsViewController {
         view.dispatch.editor.focused = focused;
         this.pushProps();
       },
+      // Ctrl+S (A6), roster-only — the component only reaches this while no
+      // overlay (rename/dispatch-focused/help) is open (see its own
+      // `handleInput` doc). `view.selectedId` is deliberately left untouched:
+      // it is still a valid row id in the new mode's groups (A5's own
+      // "selection follows by row id" contract, reused as-is — `AgentsViewApp.
+      // syncSelectionFromProps` re-finds it in the freshly rebuilt items list
+      // on the very next `setProps`), so re-anchoring it here would be both
+      // redundant and wrong the one time it WOULD matter (a row paginated out
+      // of view — same pre-existing fallback every other reshuffle already
+      // has, not something this action needs to special-case).
+      onGroupModeToggle: () => {
+        const view = this.host.state.agentsView;
+        if (view === undefined) return;
+        this.clearConfirm(view);
+        view.groupMode = view.groupMode === 'state' ? 'directory' : 'state';
+        this.pushProps();
+        void this.persistGroupMode(view, view.groupMode);
+      },
     };
   }
 
@@ -1430,8 +1497,7 @@ export class AgentsViewController {
     if (isPendingDispatchId(id)) return;
 
     const ids: readonly string[] = id.startsWith('group:')
-      ? (view.roster
-          .groups(Number.MAX_SAFE_INTEGER)
+      ? (this.currentGroups(view, Number.MAX_SAFE_INTEGER)
           .find((group) => group.id === id.slice('group:'.length))
           ?.rows.map((row) => row.id)
           .filter((rowId) => !isPendingDispatchId(rowId)) ?? [])
@@ -1526,6 +1592,27 @@ export class AgentsViewController {
       }
     });
     return this.persistChain;
+  }
+
+  /** Same "never overlap, coalesce bursts" reasoning as {@link persistChain},
+   *  kept as its own chain: it writes a different file (`tui.toml` via
+   *  {@link AgentsViewHost.saveAgentsViewGroupMode}) than {@link persistState}
+   *  does, so there is nothing for the two to serialize against each other. */
+  private groupModePersistChain: Promise<void> = Promise.resolve();
+
+  /** Persist a Ctrl+S grouping-mode change; failures flash, never throw. */
+  private persistGroupMode(view: AgentsViewState, mode: AgentsGroupMode): Promise<void> {
+    this.groupModePersistChain = this.groupModePersistChain.then(async () => {
+      try {
+        await this.host.saveAgentsViewGroupMode(mode);
+      } catch (error) {
+        if (this.host.state.agentsView !== view) return;
+        this.flash(
+          `Failed to persist view mode: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    });
+    return this.groupModePersistChain;
   }
 
   /**

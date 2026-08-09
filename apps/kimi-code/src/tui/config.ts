@@ -51,6 +51,23 @@ export const DEFAULT_STATUS_LINE_CONFIG: StatusLineConfig = {
   command: null,
 };
 
+export const AgentsViewGroupModeSchema = z.enum(['state', 'directory']);
+export type AgentsViewGroupModeConfig = z.infer<typeof AgentsViewGroupModeSchema>;
+
+export const AgentsViewFileConfigSchema = z.object({
+  group_mode: z.string().optional(),
+});
+
+export const AgentsViewConfigSchema = z.object({
+  /** Roster grouping mode the agents view opens in — Ctrl+S there cycles it. */
+  groupMode: AgentsViewGroupModeSchema,
+});
+export type AgentsViewConfig = z.infer<typeof AgentsViewConfigSchema>;
+
+export const DEFAULT_AGENTS_VIEW_CONFIG: AgentsViewConfig = {
+  groupMode: 'state',
+};
+
 export const TuiConfigFileSchema = z.object({
   theme: TuiThemeSchema.optional(),
   disable_paste_burst: z.boolean().optional(),
@@ -71,6 +88,7 @@ export const TuiConfigFileSchema = z.object({
     })
     .optional(),
   status_line: StatusLineFileConfigSchema.optional(),
+  agents_view: AgentsViewFileConfigSchema.optional(),
 });
 
 export const TuiConfigSchema = z.object({
@@ -82,6 +100,9 @@ export const TuiConfigSchema = z.object({
   /** Present in every normalized config; optional only so hand-built test
    * fixtures from before this field existed still typecheck. */
   statusLine: StatusLineConfigSchema.optional(),
+  /** Present in every normalized config; optional only so hand-built test
+   * fixtures from before this field existed still typecheck. */
+  agentsView: AgentsViewConfigSchema.optional(),
 });
 
 export type TuiConfigFileShape = z.infer<typeof TuiConfigFileSchema>;
@@ -105,6 +126,7 @@ export const DEFAULT_TUI_CONFIG: TuiConfig = TuiConfigSchema.parse({
   notifications: DEFAULT_NOTIFICATIONS_CONFIG,
   upgrade: DEFAULT_UPGRADE_PREFERENCES,
   statusLine: DEFAULT_STATUS_LINE_CONFIG,
+  agentsView: DEFAULT_AGENTS_VIEW_CONFIG,
 });
 
 /**
@@ -183,6 +205,13 @@ export function normalizeTuiConfig(
         return known;
       })
       .map((item) => item as StatusLineItem) ?? null;
+  const groupModeRaw = config.agents_view?.group_mode;
+  let groupMode: AgentsViewGroupModeConfig = DEFAULT_AGENTS_VIEW_CONFIG.groupMode;
+  if (groupModeRaw !== undefined) {
+    const parsedGroupMode = AgentsViewGroupModeSchema.safeParse(groupModeRaw);
+    if (parsedGroupMode.success) groupMode = parsedGroupMode.data;
+    else warn(`[tui.toml] ignoring unknown agents_view.group_mode: ${groupModeRaw}`);
+  }
   return TuiConfigSchema.parse({
     theme: config.theme ?? DEFAULT_TUI_CONFIG.theme,
     disablePasteBurst: config.disable_paste_burst ?? DEFAULT_TUI_CONFIG.disablePasteBurst,
@@ -202,6 +231,7 @@ export function normalizeTuiConfig(
           ? null
           : statusLineCommand,
     },
+    agentsView: { groupMode },
   });
 }
 
@@ -244,6 +274,9 @@ notification_condition = "${config.notifications.condition}" # "unfocused" | "al
 
 [upgrade]
 auto_install = ${String(config.upgrade.autoInstall)} # true | false
+
+[agents_view]
+group_mode = "${config.agentsView?.groupMode ?? DEFAULT_AGENTS_VIEW_CONFIG.groupMode}" # "state" | "directory" — ctrl+s in the agents view cycles this
 
 ${statusSection}`;
 }

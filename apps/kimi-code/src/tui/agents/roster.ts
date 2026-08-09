@@ -23,7 +23,15 @@ export interface AgentsRosterRow {
 export type AgentsGroupId = 'awaiting' | 'working' | 'pinned' | 'completed';
 
 export interface AgentsGroup {
-  readonly id: AgentsGroupId;
+  /**
+   * State mode uses the closed `AgentsGroupId` enum; directory mode
+   * (A6, `controllers/agents-view-groups.ts`) mints its own ids
+   * (`dir:<workDir>`, `other`) that this class knows nothing about — a plain
+   * `string` is the only type both grouping strategies can share. Consumers
+   * that only ever see state-mode groups (this file's own `GROUP_LABELS`/
+   * `GROUP_ORDER`) still key off the narrower `AgentsGroupId` internally.
+   */
+  readonly id: string;
   readonly label: string;
   readonly rows: readonly AgentsRosterRow[];
   /**
@@ -333,5 +341,17 @@ export class AgentsRoster {
 
   get(id: string): AgentsRosterRow | undefined {
     return this.rows.get(id);
+  }
+
+  /**
+   * Snapshot of every row currently in the roster, in `Map` insertion order —
+   * the flat input the controller's mode-aware grouping transform needs for
+   * directory mode (`buildDirectoryGroups`, `controllers/agents-view-groups.ts`),
+   * which `groups()` doesn't expose (it only ever buckets by status). A fresh
+   * array each call; the row objects themselves are the same live references
+   * `groups()` already hands out.
+   */
+  allRows(): readonly AgentsRosterRow[] {
+    return [...this.rows.values()];
   }
 }

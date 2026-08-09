@@ -27,6 +27,7 @@ import {
   parseReplyInput,
   type DispatchActivatableCommands,
 } from '@/tui/controllers/agents-view-dispatch';
+import type { AgentsGroupMode } from '@/tui/controllers/agents-view-groups';
 import { currentTheme } from '@/tui/theme';
 import { EXIT_CONFIRM_WINDOW_MS } from '#/tui/constant/kimi-tui';
 
@@ -248,6 +249,9 @@ interface Boot {
   showError: ReturnType<typeof vi.fn>;
   showStatus: ReturnType<typeof vi.fn>;
   setAttachBadge: ReturnType<typeof vi.fn>;
+  /** Every mode `saveAgentsViewGroupMode` was called with, in call order —
+   *  populated only by the default (non-overridden) implementation. */
+  savedGroupModes: AgentsGroupMode[];
   view(): AgentsViewState;
   component(): AgentsViewApp;
   render(): string;
@@ -292,6 +296,15 @@ async function boot(
      * before this option existed.
      */
     warmAgentsViewSkillMenu?: () => Promise<void>;
+    /** Seeds `agentsViewGroupMode()`'s return value; defaults to `'state'`. */
+    groupMode?: AgentsGroupMode;
+    /** Override for `host.agentsViewGroupMode()` itself — sync, like the
+     *  real `KimiTUI` getter. Defaults to returning `opts.groupMode`. */
+    agentsViewGroupMode?: () => AgentsGroupMode;
+    /** Override for `host.saveAgentsViewGroupMode()` — lets a test make a
+     *  Ctrl+S persist reject (proving the controller flashes, not throws).
+     *  Defaults to recording the call into `Boot.savedGroupModes` and resolving. */
+    saveAgentsViewGroupMode?: (mode: AgentsGroupMode) => Promise<void>;
   } = {},
 ): Promise<Boot> {
   const homeDir = await mkdtemp(join(tmpdir(), 'agents-view-controller-'));
@@ -321,6 +334,7 @@ async function boot(
   const showError = vi.fn();
   const showStatus = vi.fn();
   const setAttachBadge = vi.fn();
+  const savedGroupModes: AgentsGroupMode[] = [];
   let currentActivatable = opts.activatableCommands ?? EMPTY_ACTIVATABLE;
   const host: AgentsViewHost = {
     state,
@@ -332,6 +346,12 @@ async function boot(
     },
     agentsViewServerLabel: () => 'test-server',
     agentsViewWorkDir: () => '/home/user/project',
+    agentsViewGroupMode: opts.agentsViewGroupMode ?? (() => opts.groupMode ?? 'state'),
+    saveAgentsViewGroupMode:
+      opts.saveAgentsViewGroupMode ??
+      (async (mode) => {
+        savedGroupModes.push(mode);
+      }),
     agentsViewModelLabel: () => 'test-model',
     agentsViewModelCompletions: () =>
       opts.modelCompletions ?? [
@@ -366,6 +386,7 @@ async function boot(
     showError,
     showStatus,
     setAttachBadge,
+    savedGroupModes,
     view: () => {
       const view = state.agentsView;
       if (view === undefined) throw new Error('agents view is not mounted');
@@ -403,6 +424,7 @@ const CTRL_C = '\u0003';
 const CTRL_X = '\u0018';
 const CTRL_R = '\u0012';
 const CTRL_T = '\u0014';
+const CTRL_S = '\u0013';
 const DOWN = '\u001B[B';
 const LEFT = '\u001B[D';
 const RIGHT = '\u001B[C';
@@ -3553,5 +3575,178 @@ describe('AgentsViewController — reconnect reconciliation (I2)', () => {
     b.fake.emitConnection(true);
     await flush();
     expect(b.fake.wireRows).not.toHaveBeenCalled();
+  });
+});
+
+describe('AgentsViewController — grouping mode (Ctrl+S, A6)', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
+    dir = undefined;
+  });
+
+  it('defaults to state grouping when the host has no persisted preference', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    expect(b.view().groupMode).toBe('state');
+    expect(b.render()).toContain('Completed');
+  });
+
+  it('seeds the initial mode from host.agentsViewGroupMode() at show()', async () => {
+    const b = await boot([summary('s1', { workDir: '/srv/repos/sample-repo' })], { groupMode: 'directory' });
+    dir = b.homeDir;
+    expect(b.view().groupMode).toBe('directory');
+    const out = b.render();
+    expect(out).toContain('/srv/repos/sample-repo');
+    expect(out).not.toContain('Completed');
+  });
+
+  it('Ctrl+S cycles state -> directory -> state', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput(CTRL_S);
+    expect(b.view().groupMode).toBe('directory');
+    b.component().handleInput(CTRL_S);
+    expect(b.view().groupMode).toBe('state');
+  });
+
+  it('the regrouped list is on screen immediately, before persistence settles', async () => {
+    const b = await boot([summary('s1', { workDir: '/srv/repos/sample-repo' })]);
+    dir = b.homeDir;
+    b.component().handleInput(CTRL_S);
+    // No flush() — the render assertion runs before the fire-and-forget
+    // saveAgentsViewGroupMode call has any chance to settle.
+    expect(b.render()).toContain('/srv/repos/sample-repo');
+  });
+
+  it('persists every Ctrl+S toggle via host.saveAgentsViewGroupMode, in order', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput(CTRL_S);
+    await flush();
+    expect(b.savedGroupModes).toEqual(['directory']);
+    b.component().handleInput(CTRL_S);
+    await flush();
+    expect(b.savedGroupModes).toEqual(['directory', 'state']);
+  });
+
+  it('a failed persist still applies the mode in memory and flashes instead of throwing', async () => {
+    const b = await boot([summary('s1')], {
+      saveAgentsViewGroupMode: async () => {
+        throw new Error('disk full');
+      },
+    });
+    dir = b.homeDir;
+    b.component().handleInput(CTRL_S);
+    await flush();
+    expect(b.view().groupMode).toBe('directory');
+    expect(b.view().flashMessage).toContain('disk full');
+  });
+
+  it('any other action clears a pending delete confirm, same as every other action', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(CTRL_X);
+    expect(b.view().confirmDeleteId).toBe('s1');
+    b.component().handleInput(CTRL_S);
+    expect(b.view().confirmDeleteId).toBeUndefined();
+  });
+
+  it('the help grid advertises ctrl+s to switch views', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput('?');
+    const out = b.render();
+    expect(out).toContain('ctrl+s');
+    expect(out).toContain('to switch views');
+  });
+
+  it('directory mode buckets rows by workDir, pinned floats first, directories sort by label, Other last', async () => {
+    const b = await boot([
+      summary('zeta-row', { workDir: '/srv/repos/zeta-app', updatedAt: 300 }),
+      summary('alpha-row', { workDir: '/srv/repos/alpha-app', updatedAt: 200 }),
+      summary('homeless-row', { workDir: '', updatedAt: 100 }),
+    ]);
+    dir = b.homeDir;
+    // Pin zeta-row directly (setup, not exercising the keyboard pin flow) —
+    // same "mutate the view/roster in place for test setup" pattern the
+    // reply-state tests above already use.
+    b.view().roster.setPinned('zeta-row', true);
+
+    b.component().handleInput(CTRL_S);
+    const out = b.render();
+    const pinnedIdx = out.indexOf('Pinned');
+    const alphaIdx = out.indexOf('/srv/repos/alpha-app');
+    const otherIdx = out.indexOf('Other');
+    expect(pinnedIdx).toBeGreaterThan(-1);
+    expect(alphaIdx).toBeGreaterThan(pinnedIdx);
+    expect(otherIdx).toBeGreaterThan(alphaIdx);
+    // zeta-row is pinned — it floats into Pinned, not its own directory group.
+    expect(out).toContain('zeta-row title');
+    expect(out).not.toContain('/srv/repos/zeta-app');
+    expect(out).toContain('homeless-row title');
+  });
+
+  it('selection survives a mode switch, following the row by id (A5 contract reused)', async () => {
+    const b = await boot([
+      summary('s1', { workDir: '/srv/repos/alpha-app', updatedAt: 200 }),
+      summary('s2', { workDir: '/srv/repos/zeta-app', updatedAt: 100 }),
+    ]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN); // off the group header, onto s1 (most recent)
+    expect(b.view().selectedId).toBe('s1');
+
+    b.component().handleInput(CTRL_S);
+    expect(b.view().selectedId).toBe('s1');
+    expect(selectedLine(b.render())).toContain('s1 title');
+  });
+
+  it('Ctrl+X on a directory group header archives only that directory\'s rows (would fail without mode-aware group lookup)', async () => {
+    const b = await boot([
+      summary('a1', { workDir: '/srv/repos/alpha-app' }),
+      summary('a2', { workDir: '/srv/repos/alpha-app' }),
+      summary('z1', { workDir: '/srv/repos/zeta-app' }),
+    ]);
+    dir = b.homeDir;
+    b.component().handleInput(CTRL_S); // directory mode; selection starts on
+    // the first group header — alphabetically first is alpha-app.
+    b.component().handleInput(CTRL_X);
+    expect(b.view().confirmDeleteId).toBe('group:dir:/srv/repos/alpha-app');
+    expect(b.render()).toContain('Archive all sessions in "/srv/repos/alpha-app"?');
+    b.component().handleInput(CTRL_X);
+    await flush();
+    expect(b.fake.deleteSession).toHaveBeenCalledWith('a1');
+    expect(b.fake.deleteSession).toHaveBeenCalledWith('a2');
+    expect(b.fake.deleteSession).not.toHaveBeenCalledWith('z1');
+  });
+
+  it('an in-flight A2 dispatch placeholder buckets under its own (known) workDir, not Other', async () => {
+    const b = await boot([summary('s1')]); // default workDir '/home/user/project'
+    dir = b.homeDir;
+    let resolveCreate: (() => void) | undefined;
+    b.fake.createSession.mockImplementationOnce(
+      () =>
+        new Promise((res) => {
+          resolveCreate = () => res(b.fake.createdSession as unknown as Session);
+        }),
+    );
+
+    b.view().dispatch.editor.onSubmit?.('fix the flaky test');
+    // Still pending — the placeholder is on screen with its real, known
+    // workDir (agentsViewWorkDir()) already, before the real session id exists.
+    b.component().handleInput(CTRL_S);
+    const out = b.render();
+    expect(out).toContain('fix the flaky test');
+    expect(out).not.toContain('Other');
+    expect(out).toContain('/home/user/project');
+    // Same directory as the pre-existing s1 — one group, not two.
+    expect(out).toContain('s1 title');
+
+    resolveCreate?.();
+    await flush();
+    b.controller.close();
   });
 });

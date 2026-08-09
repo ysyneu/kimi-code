@@ -1,9 +1,14 @@
 /**
  * AgentsViewApp — full-screen alt-screen takeover listing the view's OWN
  * sessions (dispatched from or attached through this view — the server-wide
- * list is filtered controller-side) as a grouped roster (Awaiting input /
- * Working / Pinned / Completed), each group separated by a blank spacer
- * line. Mirrors the TasksBrowserApp mount/render contract: mounted by a
+ * list is filtered controller-side) as a grouped roster, each group
+ * separated by a blank spacer line. Two grouping modes, cycled by Ctrl+S
+ * (A6, `props.onGroupModeToggle`): status (Awaiting input / Working / Pinned
+ * / Completed, the default) and directory (grouped by session workdir,
+ * Pinned still floating out first). Which mode is active and how `props.
+ * groups` gets built for it is entirely the controller's call — this
+ * component just renders whatever group list it's handed, unaware of mode.
+ * Mirrors the TasksBrowserApp mount/render contract: mounted by a
  * controller via container swap, `render(width)` returns exactly
  * `terminal.rows` lines (header 4 [brand mark + version / model · cwd /
  * status counts / trailing blank] + body + footer 1, or 2 while the `?` grid
@@ -72,7 +77,7 @@ import {
   type Focusable,
 } from '@moonshot-ai/pi-tui';
 
-import type { AgentsGroup, AgentsGroupId, AgentsRosterRow } from '@/tui/agents/roster';
+import type { AgentsGroup, AgentsRosterRow } from '@/tui/agents/roster';
 import type { CustomEditor } from '@/tui/components/editor/custom-editor';
 import { getVersion } from '#/cli/version';
 import { PRODUCT_NAME } from '#/constant/app';
@@ -167,6 +172,14 @@ export interface AgentsViewProps {
    */
   onCtrlC(): void;
   onDispatchFocusChange(focused: boolean): void;
+  /**
+   * Ctrl+S (A6): cycles the roster's grouping mode `state ⇄ directory`. Only
+   * reachable at the roster with no overlay open — same gating `handleInput`
+   * already applies to every other global shortcut here (rename/dispatch-
+   * focus/help each early-return above it). The regrouped `props.groups` on
+   * the next `setProps` is the only feedback; no toast/mode-name banner.
+   */
+  onGroupModeToggle(): void;
 }
 
 /** Minimum dimensions before we just print a "too small" message. */
@@ -210,10 +223,9 @@ interface RenameState {
  * (the roster list itself stays visible and scrollable behind it — see
  * `render`). Column-aligned per row; `undefined` is a blank cell.
  *
- * `ctrl+s to switch views` is in Claude Code's own reference grid, but its
- * interaction was never observable read-only (no second view mode exists
- * to switch to here) — deliberately absent, not a gap. Every other cell
- * from the reference grid is present.
+ * `ctrl+s to switch views` (A6) cycles the roster between the status
+ * grouping (Pinned / Needs input / Working / Completed) and grouping by
+ * directory.
  */
 type HelpCell = readonly [key: string, hint: string];
 
@@ -231,7 +243,7 @@ const HELP_GRID: readonly (readonly (HelpCell | undefined)[])[] = [
     ['ctrl+t', 'to pin/unpin'],
     ['ctrl+j', 'for newline'],
     ['ctrl+x', 'to delete'],
-    undefined,
+    ['ctrl+s', 'to switch views'],
     ['?', 'to close'],
   ],
 ];
@@ -396,6 +408,13 @@ export class AgentsViewApp extends Container implements Focusable {
     // this just reports the raw keypress.
     if (matchesKey(data, Key.ctrl('c'))) {
       this.props.onCtrlC();
+      return;
+    }
+
+    // Ctrl+S (A6): cycles the roster grouping mode. Global, like Ctrl+X/
+    // Ctrl+C above it — not gated on the current selection kind.
+    if (matchesKey(data, Key.ctrl('s'))) {
+      this.props.onGroupModeToggle();
       return;
     }
 
@@ -846,7 +865,7 @@ export class AgentsViewApp extends Container implements Focusable {
 
   private deleteConfirmCopy(id: string): string {
     if (id.startsWith('group:')) {
-      const groupId = id.slice('group:'.length) as AgentsGroupId;
+      const groupId = id.slice('group:'.length);
       const group = this.props.groups.find((g) => g.id === groupId);
       const label = group?.label ?? groupId;
       const busyCount = group?.rows.filter((r) => r.busy).length ?? 0;

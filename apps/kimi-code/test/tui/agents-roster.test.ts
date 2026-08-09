@@ -608,3 +608,28 @@ describe('roster row mutation (controller actions)', () => {
     expect(row?.unseen).toBe(false); // updatedAt (400) <= seenAt (500)
   });
 });
+
+describe('AgentsRoster — allRows', () => {
+  it('returns every row regardless of status/pinned, in insertion order — the flat input directory-mode grouping (A6) needs', () => {
+    const roster = new AgentsRoster(new Set(['pinned-a']));
+    roster.setAll([summary('pinned-a'), summary('b'), summary('c')]);
+    expect(roster.allRows().map((r) => r.id)).toEqual(['pinned-a', 'b', 'c']);
+  });
+
+  it('reflects remove/upsertLocalRow mutations', () => {
+    const roster = new AgentsRoster(new Set());
+    roster.setAll([summary('a'), summary('b')]);
+    roster.remove('a');
+    roster.upsertLocalRow({ id: 'pending-dispatch:1', title: 'x', workDir: '/work/x', updatedAt: 1, busy: true });
+    expect(roster.allRows().map((r) => r.id)).toEqual(['b', 'pending-dispatch:1']);
+  });
+
+  it('is a fresh snapshot each call, not a live view', () => {
+    const roster = new AgentsRoster(new Set());
+    roster.setAll([summary('a')]);
+    const first = roster.allRows();
+    roster.remove('a');
+    expect(first.map((r) => r.id)).toEqual(['a']);
+    expect(roster.allRows()).toEqual([]);
+  });
+});

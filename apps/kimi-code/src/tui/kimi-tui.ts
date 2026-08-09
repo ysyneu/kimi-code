@@ -95,7 +95,7 @@ import {
 } from './components/messages/user-message';
 import { ActivityPaneComponent, type ActivityPaneMode } from './components/panes/activity-pane';
 import { QueuePaneComponent } from './components/panes/queue-pane';
-import type { TuiConfig } from './config';
+import { DEFAULT_TUI_CONFIG, loadTuiConfig, saveTuiConfig, type TuiConfig } from './config';
 import {
   LLM_NOT_SET_MESSAGE,
   MAIN_AGENT_ID,
@@ -106,6 +106,7 @@ import { CHROME_GUTTER } from './constant/rendering';
 import { MAX_TERMINAL_TITLE_LENGTH } from './constant/terminal';
 import { AgentsViewController } from './controllers/agents-view';
 import type { DispatchActivatableCommands } from './controllers/agents-view-dispatch';
+import type { AgentsGroupMode } from './controllers/agents-view-groups';
 import { AuthFlowController } from './controllers/auth-flow';
 import { BtwPanelController } from './controllers/btw-panel';
 import { ClipboardImageHintController } from './controllers/clipboard-image-hint';
@@ -346,6 +347,16 @@ export class KimiTUI {
   private readonly migrateOnly: boolean;
   private readonly agentsViewServerLabelOverride: string | undefined;
   private readonly agentsViewExitGuard: (() => Promise<number>) | undefined;
+  /**
+   * Roster grouping mode (A6): seeded once from the startup `tuiConfig` (the
+   * same "read once at process start, mutate in memory, `save*` writes
+   * through" footing `theme`/`editorCommand`/`disablePasteBurst`/
+   * `notifications`/`upgrade`/`statusLine` already use via `createInitialAppState`),
+   * NOT re-read from disk on every `show()` — a fresh `tui.toml` load on
+   * every mount would be needless I/O for a value that only ever changes via
+   * `saveAgentsViewGroupMode` in this same process.
+   */
+  private agentsViewGroupModePref: AgentsGroupMode;
   /** Re-entrancy guard: a second stop() while the exit confirmation is on screen is ignored. */
   private exitConfirmInFlight = false;
   private startupNotice: string | undefined;
@@ -436,6 +447,7 @@ export class KimiTUI {
     this.migrateOnly = startupInput.migrateOnly ?? false;
     this.agentsViewServerLabelOverride = startupInput.agentsViewServerLabel;
     this.agentsViewExitGuard = startupInput.agentsViewExitGuard;
+    this.agentsViewGroupModePref = startupInput.tuiConfig.agentsView?.groupMode ?? 'state';
     this.startupNotice = startupInput.startupNotice;
     this.state = createTUIState(tuiOptions);
     this.uninstallRainbowDance = installRainbowDance(() => {
@@ -1637,6 +1649,32 @@ export class KimiTUI {
     const alias = availableModels[model];
     const effective = alias === undefined ? undefined : effectiveModelAlias(alias);
     return effective?.displayName ?? effective?.model ?? model;
+  }
+
+  /**
+   * Agents-view roster grouping mode (A6, Ctrl+S) — sync read of the
+   * in-memory preference; see `agentsViewGroupModePref`'s own doc for why
+   * this is never a disk read (same "read once at startup, mutate in
+   * memory" footing `theme`/`editorCommand`/`disablePasteBurst`/
+   * `notifications`/`upgrade`/`statusLine` already use).
+   */
+  agentsViewGroupMode(): AgentsGroupMode {
+    return this.agentsViewGroupModePref;
+  }
+
+  /** Persists a Ctrl+S grouping-mode change (failures propagate so the
+   *  controller's own flash surfaces them — see `AgentsViewController.
+   *  persistGroupMode`) and updates the in-memory preference so the next
+   *  `show()` in this process sees it without a fresh disk read. */
+  async saveAgentsViewGroupMode(mode: AgentsGroupMode): Promise<void> {
+    let config: TuiConfig;
+    try {
+      config = await loadTuiConfig();
+    } catch {
+      config = DEFAULT_TUI_CONFIG;
+    }
+    await saveTuiConfig({ ...config, agentsView: { groupMode: mode } });
+    this.agentsViewGroupModePref = mode;
   }
 
   /**
