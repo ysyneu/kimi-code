@@ -10,7 +10,7 @@
  * Run: pnpm exec vitest run test/tui/components/agents-view-rows.test.ts
  */
 import chalk from 'chalk';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import type { AgentsRosterRow } from '@/tui/agents/roster';
 import {
@@ -18,6 +18,7 @@ import {
   renderGroupHeader,
   renderMoreRow,
   renderRosterRow,
+  SPINNER_FRAME_MS,
   spinnerFrames,
 } from '@/tui/components/agents-view/rows';
 import { darkColors } from '@/tui/theme/colors';
@@ -427,6 +428,26 @@ describe('spinnerFrames — ping-pong asterisk bloom', () => {
   it('the second half mirrors the first half in reverse (ping-pong, not a forward loop)', () => {
     const frames = spinnerFrames('darwin');
     expect(frames.slice(6)).toEqual(frames.slice(0, 6).toReversed());
+  });
+
+  it('frame index advances in order — a few consecutive 120ms ticks map to consecutive frames (B5)', () => {
+    // The busy glyph reads Date.now() directly (not row.updatedAt) — fake
+    // timers are what let this pin the clock at each tick deterministically.
+    const frames = spinnerFrames();
+    vi.useFakeTimers();
+    try {
+      for (let tick = 0; tick < frames.length + 2; tick++) {
+        vi.setSystemTime(tick * SPINNER_FRAME_MS);
+        const line = strip(renderRosterRow(row({ busy: true }), false, false, 80));
+        expect(line.slice(2, 3)).toBe(frames[tick % frames.length]);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cadence constant is 120', () => {
+    expect(SPINNER_FRAME_MS).toBe(120);
   });
 });
 

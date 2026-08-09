@@ -40,7 +40,10 @@ export function spinnerFrames(platform: NodeJS.Platform = process.platform): rea
   return [...charset, ...charset.toReversed()];
 }
 
-const SPINNER_FRAME_MS = 120;
+/** Frame cadence for both the ping-pong sequence below AND the controller's
+ *  repaint ticker that samples it (`AgentsViewController.syncBusyTicker`) —
+ *  exported so the two stay the same number instead of two copies drifting. */
+export const SPINNER_FRAME_MS = 120;
 
 function spinnerFrame(nowMs: number): string {
   const frames = spinnerFrames();

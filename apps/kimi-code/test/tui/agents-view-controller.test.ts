@@ -11,6 +11,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { loadAgentsViewState, saveAgentsViewState } from '@/tui/agents/roster-persistence';
 import type { ArgCompletionSpec } from '@/tui/commands/complete-args';
 import type { AgentsViewApp } from '@/tui/components/agents-view/app';
+import { SPINNER_FRAME_MS } from '@/tui/components/agents-view/rows';
 import type { CustomEditor } from '@/tui/components/editor/custom-editor';
 import {
   AgentsViewController,
@@ -691,6 +692,20 @@ describe('AgentsViewController — live roster events', () => {
     expect(b.view().busyTicker).toBeDefined();
     b.fake.emit({ type: 'event.session.work_changed', sessionId: 's1', busy: false, pending_interaction: 'none' });
     expect(b.view().busyTicker).toBeUndefined();
+  });
+
+  it('the spinner ticker repaints at the 120ms frame cadence, not the old 400ms sample rate (B5)', async () => {
+    const setIntervalSpy = vi.spyOn(globalThis, 'setInterval');
+    try {
+      const b = await boot([summary('s1')]);
+      dir = b.homeDir;
+      b.fake.emit({ type: 'event.session.work_changed', sessionId: 's1', busy: true, pending_interaction: 'none' });
+      expect(b.view().busyTicker).toBeDefined();
+      const tickerCall = setIntervalSpy.mock.calls.find(([, ms]) => ms === SPINNER_FRAME_MS);
+      expect(tickerCall).toBeDefined();
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
   });
 });
 

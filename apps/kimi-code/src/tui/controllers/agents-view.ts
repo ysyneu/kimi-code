@@ -10,7 +10,7 @@ import { completeLeadingArg, type ArgCompletionSpec } from '../commands/complete
 import { BUILTIN_SLASH_COMMANDS } from '../commands/registry';
 import type { KimiSlashCommand } from '../commands/types';
 import { AgentsViewApp, type AgentsViewProps } from '../components/agents-view/app';
-import { rosterRowName } from '../components/agents-view/rows';
+import { rosterRowName, SPINNER_FRAME_MS } from '../components/agents-view/rows';
 import type { CustomEditor } from '../components/editor/custom-editor';
 import { DELETE_ARM_WINDOW_MS, EXIT_CONFIRM_WINDOW_MS } from '#/tui/constant/kimi-tui';
 import type { Theme } from '#/tui/theme';
@@ -1777,9 +1777,11 @@ export class AgentsViewController {
 
   /**
    * Spinner heartbeat: roster events are rare (busy on / busy off), so while
-   * any row is working a 400 ms re-render keeps the spinner animating. Runs
-   * only while the component is mounted; detach / close / an idle roster
-   * stops it.
+   * any row is working a repaint every {@link SPINNER_FRAME_MS} keeps the
+   * spinner animating at the same cadence `rows.ts`'s frame selection
+   * advances on (B5) — same constant, imported rather than a second copy of
+   * `120`. Runs only while the component is mounted; detach / close / an
+   * idle roster stops it.
    */
   private syncBusyTicker(): void {
     const view = this.host.state.agentsView;
@@ -1795,7 +1797,7 @@ export class AgentsViewController {
           return;
         }
         this.pushProps();
-      }, 400);
+      }, SPINNER_FRAME_MS);
       // A render heartbeat must never hold the event loop open on its own.
       view.busyTicker.unref();
     } else if ((!anyBusy || view.detached) && view.busyTicker !== undefined) {
