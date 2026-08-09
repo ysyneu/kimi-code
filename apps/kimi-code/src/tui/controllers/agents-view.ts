@@ -676,6 +676,21 @@ export class AgentsViewController {
       this.handleOpen(id);
       return true;
     };
+    // Ctrl+C parity with the main REPL (editor-keyboard.ts's own onCtrlC):
+    // `AgentsViewApp.handleInput` routes every key to the editor while
+    // `dispatchFocused`, so without this the editor's `CustomEditor.
+    // handleInput` sees Ctrl+C, finds `onCtrlC` unset, and does nothing —
+    // the two-stage exit can never arm from a focused composer. Mirrors the
+    // main REPL exactly: clear the draft if present, then defer to the same
+    // arm/quit machine the list-focused Ctrl+C uses (`triggerCtrlC`) —
+    // reached identically for a new dispatch or an open reply panel, since
+    // both share this one editor instance.
+    dispatch.editor.onCtrlC = () => {
+      const view = this.host.state.agentsView;
+      if (view === undefined) return;
+      if (dispatch.editor.getText().length > 0) dispatch.editor.setText('');
+      this.triggerCtrlC(view);
+    };
 
     this.host.setAgentsView({
       component,
@@ -1464,6 +1479,48 @@ export class AgentsViewController {
   }
 
   /**
+   * The controller's own two-stage confirm-to-exit state machine — arm vs.
+   * quit is decided by whether a timer is already running. The timer (not
+   * the component) owns the auto-disarm because only the controller has
+   * `state.ui.requestRender()` to repaint on a silent timeout.
+   *
+   * Shared by every Ctrl+C source: the roster itself (`buildCallbacks`'s
+   * `onCtrlC`, list-focused) and the dispatch composer (`dispatch.editor.
+   * onCtrlC`, wired in `show()` — reached identically whether the composer
+   * targets a new dispatch or an open reply panel, since both share the one
+   * `dispatch.editor` instance). Deliberately does not touch
+   * `dispatchFocused`/`replyTargetId`: matching the class docstring's own
+   * "Ctrl+C is independent of Esc/origin" invariant, closing a focused
+   * composer or reply panel is Esc's job, not Ctrl+C's.
+   *
+   * I5: a delete overlay (row arm or header confirm) is not a modal for
+   * Ctrl+C's own two-stage exit — unlike Esc (`onQuit`, via
+   * `quitOrCancelConfirm`), which still absorbs a confirming Ctrl+C as an
+   * arm-cancel if the overlay is still up at that point. Clearing it HERE,
+   * on the first press, is what keeps the two from ever colliding: by the
+   * time a second Ctrl+C reaches `quitOrCancelConfirm` below, there is
+   * nothing left for it to absorb, so it really exits — matching the
+   * footer's own promise instead of silently cancelling the arm on what the
+   * user was told was the confirming press.
+   */
+  private triggerCtrlC(view: AgentsViewState): void {
+    if (view.pendingExitTimer !== undefined) {
+      clearTimeout(view.pendingExitTimer);
+      view.pendingExitTimer = undefined;
+      this.quitOrCancelConfirm(view);
+      return;
+    }
+    this.clearDeleteOverlays(view);
+    view.pendingExitTimer = setTimeout(() => {
+      const current = this.host.state.agentsView;
+      if (current === undefined || current.pendingExitTimer === undefined) return;
+      current.pendingExitTimer = undefined;
+      this.pushProps();
+    }, EXIT_CONFIRM_WINDOW_MS);
+    this.pushProps();
+  }
+
+  /**
    * B1: first Ctrl+X on a roster ROW — arms it in place instead of opening
    * the group-header's confirm dialog. A BUSY row's turn is stopped
    * immediately, optimistically (the summary already reads `stopped · ...`
@@ -1731,37 +1788,13 @@ export class AgentsViewController {
         // Esc during a delete confirm or arm cancels it, not the view.
         this.quitOrCancelConfirm(view);
       },
-      // Every Ctrl+C press reports here unconditionally — arm vs. quit is
-      // decided by whether a timer is already running. The timer (not the
-      // component) owns the auto-disarm because only the controller has
-      // `state.ui.requestRender()` to repaint on a silent timeout.
-      //
-      // I5: a delete overlay (row arm or header confirm) is not a modal for
-      // Ctrl+C's own two-stage exit — unlike Esc (`onQuit` above, via
-      // `quitOrCancelConfirm`), which still absorbs a confirming Ctrl+C as
-      // an arm-cancel if the overlay is still up at that point. Clearing it
-      // HERE, on the first press, is what keeps the two from ever
-      // colliding: by the time a second Ctrl+C reaches `quitOrCancelConfirm`
-      // below, there is nothing left for it to absorb, so it really exits —
-      // matching the footer's own promise instead of silently cancelling
-      // the arm on what the user was told was the confirming press.
+      // Every Ctrl+C press reports here unconditionally — the arm/quit state
+      // machine itself lives in `triggerCtrlC` (shared with the dispatch
+      // composer's own Ctrl+C, wired in `show()`).
       onCtrlC: () => {
         const view = this.host.state.agentsView;
         if (view === undefined) return;
-        if (view.pendingExitTimer !== undefined) {
-          clearTimeout(view.pendingExitTimer);
-          view.pendingExitTimer = undefined;
-          this.quitOrCancelConfirm(view);
-          return;
-        }
-        this.clearDeleteOverlays(view);
-        view.pendingExitTimer = setTimeout(() => {
-          const current = this.host.state.agentsView;
-          if (current === undefined || current.pendingExitTimer === undefined) return;
-          current.pendingExitTimer = undefined;
-          this.pushProps();
-        }, EXIT_CONFIRM_WINDOW_MS);
-        this.pushProps();
+        this.triggerCtrlC(view);
       },
       onDispatchFocusChange: (focused) => {
         const view = this.host.state.agentsView;

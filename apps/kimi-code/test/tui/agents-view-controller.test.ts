@@ -638,6 +638,88 @@ describe('AgentsViewController — Ctrl+C two-stage exit confirm (fix round 1)',
   });
 });
 
+// A focused composer routes every key to the editor (`AgentsViewApp.
+// handleInput`'s `dispatchFocused` branch), so Ctrl+C only reaches the
+// exit machine above if the editor itself is wired to report it
+// (`dispatch.editor.onCtrlC`, in `show()`). Without that wiring these all
+// fail: `CustomEditor.handleInput` finds `onCtrlC` unset and silently
+// drops the keypress.
+describe('AgentsViewController — Ctrl+C reaches the focused dispatch composer (parity with the main REPL)', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
+    dir = undefined;
+  });
+
+  const BACKSPACE = String.fromCodePoint(127);
+
+  it('Ctrl+C on a focused, EMPTY composer reaches the two-stage exit arm', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput('d'); // focus the composer
+    b.component().handleInput(BACKSPACE); // back to empty, still focused
+    expect(b.view().dispatch.editor.getText()).toBe('');
+    expect(b.view().dispatchFocused).toBe(true);
+
+    b.component().handleInput(CTRL_C);
+
+    expect(b.view().pendingExitTimer).toBeDefined();
+    expect(b.render()).toContain('Press Ctrl-C again to exit');
+  });
+
+  it('a second Ctrl+C from the focused, empty composer closes the view — same as list-focused', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput('d');
+    b.component().handleInput(BACKSPACE);
+
+    b.component().handleInput(CTRL_C);
+    b.component().handleInput(CTRL_C);
+
+    expect(b.controller.isOpen).toBe(false);
+  });
+
+  it('Ctrl+C on a focused composer WITH TEXT clears the draft and arms the exit hint (matches editor-keyboard.ts onCtrlC)', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    for (const ch of 'fix') b.component().handleInput(ch);
+    expect(b.view().dispatch.editor.getText()).toBe('fix');
+
+    b.component().handleInput(CTRL_C);
+
+    expect(b.view().dispatch.editor.getText()).toBe('');
+    expect(b.view().pendingExitTimer).toBeDefined();
+  });
+
+  it('Ctrl+C on an empty REPLY composer reaches the exit arm and leaves the panel open — only Esc closes panels', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN); // select row s1
+    b.component().handleInput(SPACE); // open the reply panel on s1
+    expect(b.view().replyTargetId).toBe('s1');
+    expect(b.view().dispatch.editor.getText()).toBe('');
+
+    b.component().handleInput(CTRL_C);
+
+    expect(b.view().pendingExitTimer).toBeDefined();
+    expect(b.view().replyTargetId).toBe('s1');
+  });
+
+  it('a second Ctrl+C from an open reply composer closes the view without submitting the reply', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(SPACE);
+
+    b.component().handleInput(CTRL_C);
+    b.component().handleInput(CTRL_C);
+
+    expect(b.controller.isOpen).toBe(false);
+  });
+});
+
 describe('AgentsViewController — live roster events', () => {
   let dir: string | undefined;
   afterEach(async () => {
