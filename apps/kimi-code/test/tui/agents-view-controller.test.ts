@@ -128,9 +128,14 @@ interface FakeHarness {
   listSessions: ReturnType<typeof vi.fn>;
   resumeSession: ReturnType<typeof vi.fn>;
   deleteSession: ReturnType<typeof vi.fn>;
-  /** B1: the roster's Ctrl+X arm calls this (not `deleteSession`) to stop a
-   *  BUSY row's turn without archiving it. */
-  cancelSession: ReturnType<typeof vi.fn>;
+  // B1: the roster's Ctrl+X arm calls this (not `deleteSession`) to stop a
+  // BUSY row's turn without archiving it. Explicitly Promise-returning —
+  // same reason as `wirePrompt`/`createSession` below: the staleness-guard
+  // test feeds this `mockImplementationOnce` a `() => new Promise(...)` to
+  // hold the rejection open by hand, and the bare `ReturnType<typeof
+  // vi.fn>` other fields use resolves that parameter to a void-returning
+  // signature, which no-misused-promises then flags.
+  cancelSession: ReturnType<typeof vi.fn<(...args: unknown[]) => Promise<void>>>;
   renameSession: ReturnType<typeof vi.fn>;
   // Explicitly Promise-returning — see `wirePrompt`'s own comment below: A2's
   // placeholder tests feed this `mockImplementationOnce` a
@@ -922,6 +927,33 @@ describe('AgentsViewController — row delete arm (B1)', () => {
 
     expect(b.view().armedDeleteId).toBeUndefined();
     expect(b.view().roster.get('s1')).toBeUndefined();
+  });
+
+  it('a stale cancelSession rejection landing after the view is closed and reopened produces no flash (would fail without the staleness guard)', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    let rejectCancel: ((error: Error) => void) | undefined;
+    b.fake.cancelSession.mockImplementationOnce(
+      () =>
+        new Promise((_res, rej) => {
+          rejectCancel = rej;
+        }),
+    );
+    b.fake.emit({ type: 'event.session.work_changed', sessionId: 's1', busy: true, pending_interaction: 'none' });
+    b.component().handleInput(DOWN); // onto s1, Working
+    b.component().handleInput(CTRL_X); // arms + optimistically stops; cancelSession left pending
+    expect(b.view().armedDeleteId).toBe('s1');
+
+    // Close and reopen — a fresh AgentsViewState — before the rejection
+    // lands, the exact race the guard exists for.
+    b.controller.close();
+    await b.controller.show();
+    expect(b.view().armedDeleteId).toBeUndefined();
+
+    rejectCancel?.(new Error('stop broke'));
+    await flush();
+
+    expect(b.view().flashMessage).toBeUndefined();
   });
 });
 

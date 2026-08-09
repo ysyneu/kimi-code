@@ -1382,6 +1382,12 @@ export class AgentsViewController {
     }, DELETE_ARM_WINDOW_MS);
     if (row.busy) {
       void this.host.harness.cancelSession(id).catch((error: unknown) => {
+        // Same staleness guard as `persistGroupMode`/`handleDelete`'s own
+        // async continuations: `view` is captured at arm time, but the
+        // rejection can land after the user has closed AND reopened the
+        // agents view (a fresh `AgentsViewState`) — without this check a
+        // stale "Failed to stop" toast would bleed into that new view.
+        if (this.host.state.agentsView !== view) return;
         this.flash(`Failed to stop: ${error instanceof Error ? error.message : String(error)}`);
       });
     }
