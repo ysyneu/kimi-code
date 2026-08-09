@@ -2062,6 +2062,13 @@ export class KimiTUI {
     this.tasksBrowserController.close();
     this.agentsViewController.close();
     this.btwPanelController.clear();
+    // M7: a deferred approval/question mount belongs to the session that
+    // raised it — carrying it across a switch means a later flush (e.g.
+    // `close()` in agents mode) mounts the OLD session's panel over the
+    // NEW session's chat. Discard rather than run it: the runtime it would
+    // reverse-RPC into no longer belongs to the session on screen.
+    this.deferredApprovalMount = undefined;
+    this.deferredQuestionMount = undefined;
     this.state.footer.setBackgroundCounts({ bashTasks: 0, agentTasks: 0 });
     this.streamingUI.setTodoList([]);
     this.streamingUI.setTurnId(undefined);

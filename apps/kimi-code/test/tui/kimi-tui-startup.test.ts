@@ -1940,6 +1940,39 @@ describe('KimiTUI startup', () => {
   });
 });
 
+describe('KimiTUI resetSessionRuntime — deferred panel slots (M7)', () => {
+  interface DeferredPanelDriver extends StartupDriver {
+    resetSessionRuntime(): void;
+    flushDeferredPanels(): void;
+  }
+
+  it('a deferred approval/question mount from the session being left does not survive a runtime reset, so a later flush mounts nothing', async () => {
+    const harness = makeHarness();
+    const driver = makeDriver(harness, makeStartupInput()) as unknown as DeferredPanelDriver;
+    await driver.init();
+
+    // Simulates the state right after `showApprovalPanel`/`showQuestionDialog`
+    // deferred a reverse-RPC show for the session being left (the roster
+    // takeover was on screen) — see `isAgentsViewTakeoverActive`.
+    const approvalMount = vi.fn();
+    const questionMount = vi.fn();
+    const withDeferred = driver as unknown as {
+      deferredApprovalMount: (() => void) | undefined;
+      deferredQuestionMount: (() => void) | undefined;
+    };
+    withDeferred.deferredApprovalMount = approvalMount;
+    withDeferred.deferredQuestionMount = questionMount;
+
+    driver.resetSessionRuntime();
+    expect(withDeferred.deferredApprovalMount).toBeUndefined();
+    expect(withDeferred.deferredQuestionMount).toBeUndefined();
+
+    driver.flushDeferredPanels();
+    expect(approvalMount).not.toHaveBeenCalled();
+    expect(questionMount).not.toHaveBeenCalled();
+  });
+});
+
 // ── Agents-view attach (Enter on a row → full chat UI) ──
 
 describe('KimiTUI agents-view attach', () => {
