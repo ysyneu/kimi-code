@@ -1084,17 +1084,18 @@ describe('AgentsViewApp — Ctrl+C reports to the controller (R4 parity, fix rou
     expect(onQuit).not.toHaveBeenCalled();
   });
 
-  it('renders the armed footer hint with the running-agent count when pendingExitArmed is true', () => {
+  it('renders the armed footer hint (hyphenated "Ctrl-C", B4) with the running-agent count', () => {
     const app = makeApp({ pendingExitArmed: true, counts: { awaiting: 0, working: 3, completed: 0 } });
     const out = render(app);
-    expect(out).toContain('Press Ctrl+C again to exit');
+    expect(out).toContain('Press Ctrl-C again to exit');
+    expect(out).not.toContain('Press Ctrl+C again to exit');
     expect(out).toContain('3 agents will keep running');
   });
 
-  it('omits the running-agent suffix when nothing is working', () => {
+  it('omits the running-agent suffix when nothing is working or awaiting input', () => {
     const app = makeApp({ pendingExitArmed: true, counts: { awaiting: 0, working: 0, completed: 0 } });
     const out = render(app);
-    expect(out).toContain('Press Ctrl+C again to exit');
+    expect(out).toContain('Press Ctrl-C again to exit');
     expect(out).not.toContain('will keep running');
   });
 
@@ -1105,9 +1106,21 @@ describe('AgentsViewApp — Ctrl+C reports to the controller (R4 parity, fix rou
     expect(out).not.toContain('1 agents');
   });
 
+  it('the count sums awaiting + working (B4) — a row blocked on the user counts the same as a busy one', () => {
+    const app = makeApp({ pendingExitArmed: true, counts: { awaiting: 2, working: 1, completed: 0 } });
+    const out = render(app);
+    expect(out).toContain('3 agents will keep running');
+  });
+
+  it('completed/idle rows never count toward the keep-running suffix', () => {
+    const app = makeApp({ pendingExitArmed: true, counts: { awaiting: 0, working: 0, completed: 5 } });
+    const out = render(app);
+    expect(out).not.toContain('will keep running');
+  });
+
   it('shows no hint at all when pendingExitArmed is false', () => {
     const app = makeApp({ pendingExitArmed: false, counts: { awaiting: 0, working: 3, completed: 0 } });
-    expect(render(app)).not.toContain('Press Ctrl+C again to exit');
+    expect(render(app)).not.toContain('Press Ctrl-C again to exit');
   });
 });
 

@@ -548,7 +548,7 @@ describe('AgentsViewController — Ctrl+C two-stage exit confirm (fix round 1)',
     b.component().handleInput(CTRL_C);
     expect(b.view().pendingExitTimer).toBeDefined();
     expect(b.ui.requestRender).toHaveBeenCalled();
-    expect(b.render()).toContain('Press Ctrl+C again to exit');
+    expect(b.render()).toContain('Press Ctrl-C again to exit');
   });
 
   it('a second Ctrl+C within the window closes the view', async () => {

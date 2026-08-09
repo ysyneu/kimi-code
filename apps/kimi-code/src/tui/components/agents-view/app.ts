@@ -91,7 +91,6 @@ import type { AgentsGroup, AgentsRosterRow } from '@/tui/agents/roster';
 import type { CustomEditor } from '@/tui/components/editor/custom-editor';
 import { getVersion } from '#/cli/version';
 import { PRODUCT_NAME } from '#/constant/app';
-import { CTRL_C_HINT } from '#/tui/constant/kimi-tui';
 import { currentTheme } from '#/tui/theme';
 import { printableChar, isPrintableChar } from '@/tui/utils/printable-key';
 
@@ -227,6 +226,15 @@ const HEADER_HEIGHT = 4;
 /** Small brand mark reused from the welcome banner (`chrome/welcome.ts`) —
  *  no new ASCII art invented for this view. */
 const LOGO = ['▐█▛█▛█▌', '▐█████▌'] as const;
+
+/**
+ * B4: this view's own Ctrl+C arm copy. The main REPL's shared
+ * `CTRL_C_HINT` (`#/tui/constant/kimi-tui.ts`) spells it "Ctrl+C"; the
+ * parity spec calls for the hyphenated "Ctrl-C" here specifically, so this
+ * is a local, deliberately separate string rather than a shared one — other
+ * ctrl-key copy in this view is untouched.
+ */
+const CTRL_C_ARM_HINT = 'Press Ctrl-C again to exit';
 
 let cachedVersion: string | undefined;
 function kimiVersion(): string {
@@ -848,11 +856,13 @@ export class AgentsViewApp extends Container implements Focusable {
     if (this.props.pendingExitArmed) {
       // Ctrl+C armed: replaces the whole footer, same as the main REPL's
       // transient exit hint — the two-stage confirm is the most urgent
-      // signal on screen while it's live.
-      const working = this.props.counts.working;
+      // signal on screen while it's live. The keep-running count (B4) is
+      // both buckets with a turn actually in flight or waiting on the user
+      // (awaiting + working) — completed/idle rows never count.
+      const keepRunning = this.props.counts.awaiting + this.props.counts.working;
       const runningNote =
-        working > 0 ? ` · ${String(working)} agent${working === 1 ? '' : 's'} will keep running` : '';
-      left = compose(currentTheme.boldFg('warning', CTRL_C_HINT + runningNote));
+        keepRunning > 0 ? ` · ${String(keepRunning)} agent${keepRunning === 1 ? '' : 's'} will keep running` : '';
+      left = compose(currentTheme.boldFg('warning', CTRL_C_ARM_HINT + runningNote));
     } else if (this.draftFor(this.props.renameDraft?.sessionId ?? this.rename?.id ?? '') !== undefined) {
       left = compose(hint('enter', 'to save'), hint('esc', 'to cancel'));
     } else if (this.props.dispatchFocused) {
