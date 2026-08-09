@@ -2338,6 +2338,52 @@ describe('AgentsViewController — dispatch', () => {
   });
 });
 
+// ── I2: the roster composer has no shell route either — `!` must not enter
+// bash mode there (the main chat editor already vetoes it; the dispatch
+// editor never got the same wiring). ──
+
+describe('AgentsViewController — bash-mode veto on the roster composer (I2)', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
+    dir = undefined;
+  });
+
+  it('`!` on the empty roster composer vetoes bash mode with a flashed hint instead of switching', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+
+    b.component().handleInput('!');
+
+    expect(b.view().dispatch.editor.inputMode).toBe('prompt');
+    // The veto swallows the keystroke — same as the main chat editor's own
+    // gate (custom-editor.ts): not entered as literal text either.
+    expect(b.view().dispatch.editor.getText()).toBe('');
+    expect(b.view().flashMessage).toBe('Shell commands (!) are not available in agents view.');
+    expect(b.fake.createSession).not.toHaveBeenCalled();
+  });
+
+  it('`!cmd` never carries the exclamation into what gets dispatched — the veto swallows only the `!` keystroke', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+
+    b.component().handleInput('!');
+    b.component().handleInput('cmd');
+
+    // No bash mode was ever entered, so "cmd" landed as ordinary text —
+    // never "!cmd": there is no path left from here to a shell command
+    // silently running as an agent prompt.
+    expect(b.view().dispatch.editor.inputMode).toBe('prompt');
+    expect(b.view().dispatch.editor.getText()).toBe('cmd');
+
+    b.view().dispatch.editor.onSubmit?.(b.view().dispatch.editor.getText());
+    await flush();
+    expect(b.fake.createdSession.prompt).toHaveBeenCalledWith('cmd');
+  });
+});
+
 // ── A2: optimistic dispatch placeholder row (+ B7 shift+enter attach) ──
 
 describe('AgentsViewController — A2 optimistic dispatch placeholder', () => {

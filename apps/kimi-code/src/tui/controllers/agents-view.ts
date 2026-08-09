@@ -598,6 +598,18 @@ export class AgentsViewController {
     dispatch.onExit = () => {
       this.close();
     };
+    // I2: the roster composer has no one-shot shell route either — same
+    // reasoning as the main chat editor's own agents-view veto
+    // (editor-keyboard.ts's `onBashModeAttempt`, same hint copy). Routed
+    // through `notifyUser` so the hint is visible while the roster is
+    // mounted (`host.showStatus` alone would render into the detached
+    // UI-tree child `show()`'s own `state.ui.clear()` already replaced).
+    dispatch.editor.onBashModeAttempt = () => {
+      const view = this.host.state.agentsView;
+      if (view === undefined) return false;
+      this.notifyUser(view, 'Shell commands (!) are not available in agents view.');
+      return true;
+    };
     // Esc inside the focused editor returns focus to the list (the editor's
     // own autocomplete-cancel wins over this when a dropdown is open).
     // The reply panel is closed the same way as a submit: back to the "new
