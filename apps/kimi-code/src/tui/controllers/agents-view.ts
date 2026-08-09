@@ -1687,6 +1687,16 @@ export class AgentsViewController {
       // decided by whether a timer is already running. The timer (not the
       // component) owns the auto-disarm because only the controller has
       // `state.ui.requestRender()` to repaint on a silent timeout.
+      //
+      // I5: a delete overlay (row arm or header confirm) is not a modal for
+      // Ctrl+C's own two-stage exit — unlike Esc (`onQuit` above, via
+      // `quitOrCancelConfirm`), which still absorbs a confirming Ctrl+C as
+      // an arm-cancel if the overlay is still up at that point. Clearing it
+      // HERE, on the first press, is what keeps the two from ever
+      // colliding: by the time a second Ctrl+C reaches `quitOrCancelConfirm`
+      // below, there is nothing left for it to absorb, so it really exits —
+      // matching the footer's own promise instead of silently cancelling
+      // the arm on what the user was told was the confirming press.
       onCtrlC: () => {
         const view = this.host.state.agentsView;
         if (view === undefined) return;
@@ -1696,6 +1706,7 @@ export class AgentsViewController {
           this.quitOrCancelConfirm(view);
           return;
         }
+        this.clearDeleteOverlays(view);
         view.pendingExitTimer = setTimeout(() => {
           const current = this.host.state.agentsView;
           if (current === undefined || current.pendingExitTimer === undefined) return;

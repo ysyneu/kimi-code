@@ -602,16 +602,35 @@ describe('AgentsViewController — Ctrl+C two-stage exit confirm (fix round 1)',
     }
   });
 
-  it('a pending row delete arm (B1) still absorbs a confirming second Ctrl+C as a cancel, matching onQuit', async () => {
+  // I5: the delete arm is not a modal for Ctrl+C's own two-stage exit — the
+  // FIRST Ctrl+C clears it (same press that arms the exit hint), so by the
+  // time the SECOND (confirming) press reaches quitOrCancelConfirm there is
+  // nothing left to absorb: the view really closes, matching the footer's
+  // own promise. Esc keeps the old absorb-as-cancel behavior (see "Esc
+  // while armed cancels the arm instead of quitting" above) — only Ctrl+C
+  // is exempted here.
+  it('a pending row delete arm (B1) does not survive the first Ctrl+C — the second press really exits', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
     b.component().handleInput(DOWN); // onto row s1
     b.component().handleInput(CTRL_X); // arms the row for delete
     expect(b.view().armedDeleteId).toBe('s1');
-    b.component().handleInput(CTRL_C); // arms the exit hint
-    b.component().handleInput(CTRL_C); // confirming press
-    expect(b.controller.isOpen).toBe(true);
+    b.component().handleInput(CTRL_C); // clears the arm AND arms the exit hint
     expect(b.view().armedDeleteId).toBeUndefined();
+    expect(b.view().pendingExitTimer).toBeDefined();
+    b.component().handleInput(CTRL_C); // confirming press
+    expect(b.controller.isOpen).toBe(false);
+  });
+
+  it('a pending GROUP delete confirm (header) does not survive the first Ctrl+C either', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput(CTRL_X); // group header, no row selected — arms confirmDeleteId
+    expect(b.view().confirmDeleteId).toBeDefined();
+    b.component().handleInput(CTRL_C);
+    expect(b.view().confirmDeleteId).toBeUndefined();
+    b.component().handleInput(CTRL_C);
+    expect(b.controller.isOpen).toBe(false);
   });
 });
 
