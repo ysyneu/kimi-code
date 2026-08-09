@@ -580,6 +580,20 @@ export class CustomEditor extends Editor {
     // hook, empty buffer, or the hook itself returns `false`) falls through
     // to `super.handleInput` below unchanged.
     if (this.onShiftEnterSubmit !== undefined && matchesKey(normalized, 'shift+enter')) {
+      // An open @file-mention/slash dropdown must resolve into the buffer
+      // FIRST, the same accept step a plain Enter gets via pi-tui's own
+      // `tui.select.confirm` handling — otherwise the raw, unexpanded
+      // `@partial`/`/partial` text would go out as the literal prompt.
+      // Unlike Enter (which falls through to submit for a resolved `/`
+      // selection), this always stops after accepting: Shift+Enter's own
+      // dispatch-and-attach effect is deliberate enough not to also fire as
+      // a side effect of picking a completion the user was still typing
+      // toward, so a second Shift+Enter against the now-resolved text is
+      // what actually submits it.
+      if (this.isShowingAutocomplete()) {
+        this.acceptHighlightedAutocomplete();
+        return;
+      }
       const text = this.getExpandedText().trim();
       if (text.length > 0 && this.onShiftEnterSubmit(text)) {
         this.setText('');

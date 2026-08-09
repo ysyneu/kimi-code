@@ -779,29 +779,10 @@ export class Editor implements Component, Focusable {
 			}
 
 			if (kb.matches(data, "tui.select.confirm")) {
-				const selected = this.autocompleteList.getSelectedItem();
-				if (selected && this.autocompleteProvider) {
-					this.pushUndoSnapshot();
-					this.lastAction = null;
-					const result = this.autocompleteProvider.applyCompletion(
-						this.state.lines,
-						this.state.cursorLine,
-						this.state.cursorCol,
-						selected,
-						this.autocompletePrefix,
-					);
-					this.state.lines = result.lines;
-					this.state.cursorLine = result.cursorLine;
-					this.setCursorCol(result.cursorCol);
-
-					if (this.autocompletePrefix.startsWith("/")) {
-						this.cancelAutocomplete();
-						// Fall through to submit
-					} else {
-						this.cancelAutocomplete();
-						if (this.onChange) this.onChange(this.getText());
-						return;
-					}
+				const prefix = this.autocompletePrefix;
+				if (this.acceptHighlightedAutocomplete()) {
+					if (!prefix.startsWith("/")) return;
+					// Fall through to submit
 				}
 			}
 		}
@@ -2406,6 +2387,43 @@ export class Editor implements Component, Focusable {
 
 	public isShowingAutocomplete(): boolean {
 		return this.autocompleteState !== null;
+	}
+
+	/**
+	 * Applies the currently highlighted autocomplete suggestion into the
+	 * buffer — the same accept step a plain Enter takes via
+	 * `tui.select.confirm` above. Returns `true` when a suggestion was
+	 * actually applied (autocomplete was open AND something was selected),
+	 * `false` when there was nothing to accept. Note this does NOT replicate
+	 * Enter's own extra "fall through to submit" step for a `/`-prefixed
+	 * selection above — only the accept itself; a caller that wants that
+	 * continuation reads `autocompletePrefix` (via `this.autocompletePrefix`
+	 * from within the class, or its own copy of it snapshotted before
+	 * calling, since accepting clears it) and decides on its own. `protected`
+	 * so a subclass intercepting a different key for its own submit variant
+	 * (see `CustomEditor.onShiftEnterSubmit`) can get the same
+	 * accept-before-acting behavior Enter gets for free, without reaching
+	 * into the private autocomplete fields this method already owns.
+	 */
+	protected acceptHighlightedAutocomplete(): boolean {
+		if (!this.autocompleteState || !this.autocompleteList || !this.autocompleteProvider) return false;
+		const selected = this.autocompleteList.getSelectedItem();
+		if (!selected) return false;
+		this.pushUndoSnapshot();
+		this.lastAction = null;
+		const result = this.autocompleteProvider.applyCompletion(
+			this.state.lines,
+			this.state.cursorLine,
+			this.state.cursorCol,
+			selected,
+			this.autocompletePrefix,
+		);
+		this.state.lines = result.lines;
+		this.state.cursorLine = result.cursorLine;
+		this.setCursorCol(result.cursorCol);
+		this.cancelAutocomplete();
+		if (this.onChange) this.onChange(this.getText());
+		return true;
 	}
 
 	private updateAutocomplete(): void {

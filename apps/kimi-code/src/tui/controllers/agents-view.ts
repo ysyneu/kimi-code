@@ -176,6 +176,22 @@ export interface AgentsViewState {
    * promise they hold settles.
    */
   replyBarriers: Map<string, Promise<void>>;
+  /**
+   * A2 optimistic placeholders currently in flight — placeholder id → the
+   * fields `AgentsRoster.upsertLocalRow` was given when it was inserted
+   * (everything but `busy`, which is always `true` for a live placeholder).
+   * A WS reconnect's `refreshRoster` reseeds the whole roster from the
+   * server's row list via `AgentsRoster.setAllRows` — a full clear + reseed
+   * with no server-side representation for a client-only placeholder, which
+   * would otherwise wipe it until `createSession` resolves. `refreshRoster`
+   * re-asserts every entry here immediately after that reseed instead, so
+   * the row survives a reconnect landing mid-dispatch. Populated when a
+   * placeholder is inserted in `handleDispatch`, deleted on both resolution
+   * paths (promotion to the real id, and removal on a `createSession`
+   * failure) — this map's keys are always exactly the roster's
+   * currently-live placeholder ids.
+   */
+  pendingDispatchPlaceholders: Map<string, { title: string; workDir: string; updatedAt: number }>;
   selectedId: string | undefined;
   /**
    * The session id this SAME roster-attach lifecycle was last backed out of
@@ -527,6 +543,7 @@ export class AgentsViewController {
       replyFailures: new Map(),
       replyAttempts: new Map(),
       replyBarriers: new Map(),
+      pendingDispatchPlaceholders: new Map(),
       selectedId: undefined,
       originSessionId: undefined,
       confirmDeleteId: undefined,
@@ -752,6 +769,13 @@ export class AgentsViewController {
     }
     if (this.host.state.agentsView !== view) return;
     view.roster.setAllRows(rows.filter((row) => view.viewSessions.has(row.id)));
+    // A2: `setAllRows` has no server-side row for a client-only placeholder
+    // still in flight — re-assert every one immediately, BEFORE the dangling
+    // -selection check below (a reconnect landing mid-dispatch must not read
+    // as "the selected row vanished" when it's about to be put right back).
+    for (const [id, placeholder] of view.pendingDispatchPlaceholders) {
+      view.roster.upsertLocalRow({ id, busy: true, ...placeholder });
+    }
     // A session that vanished during the drop must not leave a dangling
     // selection behind.
     if (view.selectedId !== undefined && view.roster.get(view.selectedId) === undefined) {
@@ -793,7 +817,16 @@ export class AgentsViewController {
    * to it immediately via the same `host.onOpenSession` path a manual Enter/
    * → on a roster row uses — the placeholder bridges the roster view for
    * however long `createSession` takes, then the view hands off to attach
-   * the moment it can.
+   * the moment it can. That attach can detach the roster view (`view.
+   * detached`) before the first turn's own `activateSkill`/`prompt` call
+   * settles — a rejection reaching the final catch below routes to
+   * `host.showError` instead of `flash` in that case, since `flash`'s
+   * `pushProps()` silently no-ops while detached (see `handleRename`'s own
+   * catch for the same host-level fallback).
+   *
+   * `view.pendingDispatchPlaceholders` mirrors whatever placeholder this
+   * call currently has live — see its own doc for why (a WS reconnect's
+   * `refreshRoster` needs it to survive its full roster reseed).
    */
   private async handleDispatch(
     submission: DispatchSubmission,
@@ -818,13 +851,13 @@ export class AgentsViewController {
     let placeholderId: string | undefined;
     if (isPlainDispatch) {
       placeholderId = `${PENDING_DISPATCH_ID_PREFIX}${randomUUID()}`;
-      view.roster.upsertLocalRow({
-        id: placeholderId,
+      const placeholderFields = {
         title: submission.text,
         workDir: this.host.agentsViewWorkDir(),
         updatedAt: Date.now(),
-        busy: true,
-      });
+      };
+      view.pendingDispatchPlaceholders.set(placeholderId, placeholderFields);
+      view.roster.upsertLocalRow({ id: placeholderId, busy: true, ...placeholderFields });
       view.selectedId = placeholderId;
       this.syncBusyTicker();
       this.pushProps();
@@ -839,6 +872,7 @@ export class AgentsViewController {
       if (this.host.state.agentsView !== view) return;
       if (placeholderId !== undefined) {
         view.roster.remove(placeholderId);
+        view.pendingDispatchPlaceholders.delete(placeholderId);
         if (view.selectedId === placeholderId) view.selectedId = undefined;
         this.syncBusyTicker();
       }
@@ -853,6 +887,7 @@ export class AgentsViewController {
     void this.persistState(view);
     if (placeholderId !== undefined) {
       view.roster.remove(placeholderId);
+      view.pendingDispatchPlaceholders.delete(placeholderId);
       view.roster.upsertLocalRow({
         id: session.id,
         title: submission.text,
@@ -906,7 +941,13 @@ export class AgentsViewController {
       }
     } catch (error) {
       if (this.host.state.agentsView !== view) return;
-      this.flash(`Dispatch failed: ${error instanceof Error ? error.message : String(error)}`);
+      const message = `Dispatch failed: ${error instanceof Error ? error.message : String(error)}`;
+      // B7 can have already detached the roster view (options.attach above)
+      // by the time this rejects — flash()'s pushProps() silently no-ops
+      // while detached, so the failure needs the same host-level surface
+      // handleRename's own catch uses instead of vanishing unseen.
+      if (view.detached) this.host.showError(message);
+      else this.flash(message);
     }
   }
 
