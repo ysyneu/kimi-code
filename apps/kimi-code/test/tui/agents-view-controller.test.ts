@@ -35,6 +35,15 @@ function strip(text: string): string {
   return text.replaceAll(ANSI_SGR, '');
 }
 
+/** The single rendered line carrying the `❯` selection pointer, or
+ *  `undefined` if nothing is selected (never happens once the roster has
+ *  rows). Used to assert WHERE the cursor visually landed — not just what
+ *  the controller's `selectedId` says — since the two can diverge (see the
+ *  reorder-selection-follow tests below). */
+function selectedLine(out: string): string | undefined {
+  return out.split('\n').find((line) => line.trimStart().startsWith('❯'));
+}
+
 /** Minimal Terminal stub — only `rows` is read by the component. */
 function fakeTerminal(rows: number, columns = 120): Terminal {
   return {
@@ -861,6 +870,107 @@ describe('AgentsViewController — reorder pinned rows (shift+↑↓)', () => {
     await flush();
     const state = await loadAgentsViewState(b.homeDir);
     expect([...state.pins]).toEqual(['p1']);
+  });
+
+  it('shift+↓ moves the ❯ marker onto the row at its new render position, not just the controller id', async () => {
+    // Upgrades the "selection follows it" case above with a check of the
+    // actually-rendered cursor, not only `view().selectedId` — the two can
+    // diverge (see the next test) even though `selectedId` alone always
+    // looks right (`onReorderPinned` never used to touch it).
+    const b = await boot([summary('p1'), summary('p2')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN); // p1
+    b.component().handleInput(CTRL_T); // pin p1
+    b.component().handleInput(DOWN); // completed header
+    b.component().handleInput(DOWN); // p2
+    b.component().handleInput(CTRL_T); // pin p2
+    await waitForViewState(b.homeDir, { pins: new Set(['p1', 'p2']), sessions: new Set(['p1', 'p2']) });
+    b.component().handleInput(UP); // back onto p1 (top of the pinned group)
+
+    b.component().handleInput(SHIFT_DOWN);
+
+    expect(selectedLine(b.render())).toContain('p1 title');
+  });
+
+  it('re-anchors the marker onto the moved row even when the controller selectedId was left stale by a concurrent push (would fail without the onReorderPinned fix)', async () => {
+    // Simulates a real-world race: something OTHER than this keypress (e.g.
+    // a WS-reconnect `refreshRoster` wiping a dangling selection) pushes
+    // `view.selectedId` out of sync with the component's own on-screen
+    // cursor right before the reorder fires. The component still computes
+    // the CORRECT row id to reorder (it reads its own local cursor), but
+    // without `onReorderPinned` re-asserting `view.selectedId = id`, the
+    // controller's next `pushProps()` carries the stale/undefined id and
+    // `AgentsViewApp.syncSelectionFromProps` falls back to its last-known
+    // raw index into the POST-reorder array — landing the ❯ marker on
+    // whatever now sits at that index (a different row, or the group
+    // header) instead of following the row that actually moved.
+    const b = await boot([summary('p1'), summary('p2'), summary('p3')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN); // p1
+    b.component().handleInput(CTRL_T); // pin p1
+    b.component().handleInput(DOWN); // completed header
+    b.component().handleInput(DOWN); // p2
+    b.component().handleInput(CTRL_T); // pin p2
+    await waitForViewState(b.homeDir, { pins: new Set(['p1', 'p2']), sessions: new Set(['p1', 'p2', 'p3']) });
+    // Selection is on p2 (bottom of the pinned group) — the component's own
+    // cursor is correctly there, matching what's on screen.
+    expect(b.view().selectedId).toBe('p2');
+
+    // Corrupt the controller's copy, as a concurrent event would — the
+    // component's local cursor is untouched by this.
+    b.view().selectedId = undefined;
+
+    b.component().handleInput(SHIFT_UP); // reorder p2 up past p1
+
+    // p2 is still the row that moved (the reorder read the component's own
+    // cursor, not the corrupted controller field) — persistence proves the
+    // swap happened on the right row regardless of the marker bug.
+    await vi.waitFor(async () => {
+      const state = await loadAgentsViewState(b.homeDir);
+      expect([...state.pins]).toEqual(['p2', 'p1']);
+    });
+    // The fix: selection re-anchors onto p2 (the row that moved), both in
+    // controller state and on screen — not on p1 (whatever the stale index
+    // happened to land on) or the group header.
+    expect(b.view().selectedId).toBe('p2');
+    expect(selectedLine(b.render())).toContain('p2 title');
+  });
+
+  it('double shift+↑ moves the SAME row twice, re-anchoring correctly after each press even under a repeated selectedId desync', async () => {
+    const b = await boot([summary('p1'), summary('p2'), summary('p3'), summary('p4')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN); // p1
+    b.component().handleInput(CTRL_T); // pin p1
+    b.component().handleInput(DOWN); // completed header
+    b.component().handleInput(DOWN); // p2
+    b.component().handleInput(CTRL_T); // pin p2
+    b.component().handleInput(DOWN); // completed header
+    b.component().handleInput(DOWN); // p3
+    b.component().handleInput(CTRL_T); // pin p3
+    await waitForViewState(b.homeDir, {
+      pins: new Set(['p1', 'p2', 'p3']),
+      sessions: new Set(['p1', 'p2', 'p3', 'p4']),
+    });
+    // Selection sits on p3 (bottom of the pinned group, order [p1, p2, p3]).
+    expect(b.view().selectedId).toBe('p3');
+
+    // First press: desync before it fires, same as the single-press test.
+    b.view().selectedId = undefined;
+    b.component().handleInput(SHIFT_UP); // p3: pos2 -> pos1 ([p1, p3, p2])
+    expect(b.view().selectedId).toBe('p3');
+    expect(selectedLine(b.render())).toContain('p3 title');
+
+    // Second press: desync again — the SAME row keeps moving, not whatever
+    // the stale index would otherwise land on.
+    b.view().selectedId = undefined;
+    b.component().handleInput(SHIFT_UP); // p3: pos1 -> pos0 ([p3, p1, p2])
+    expect(b.view().selectedId).toBe('p3');
+    expect(selectedLine(b.render())).toContain('p3 title');
+
+    await vi.waitFor(async () => {
+      const state = await loadAgentsViewState(b.homeDir);
+      expect([...state.pins]).toEqual(['p3', 'p1', 'p2']);
+    });
   });
 });
 

@@ -1359,6 +1359,21 @@ export class AgentsViewController {
         const view = this.host.state.agentsView;
         if (view === undefined) return;
         this.clearConfirm(view);
+        // Re-anchor selection onto the row BEFORE reordering + pushing props,
+        // rather than trusting `view.selectedId` already matches `id` (the
+        // caller only invokes this for the currently-selected row, but
+        // nothing before this line enforces that `view.selectedId` agrees —
+        // an intervening push with a not-yet-resolved `selectedId` (e.g. a
+        // WS-reconnect `refreshRoster` landing between the row being
+        // selected and this keypress) leaves `view.selectedId` stale/
+        // undefined while the component's own on-screen cursor hasn't
+        // moved; `syncSelectionFromProps` then falls back to that stale
+        // index into the POST-reorder row array, which can land the ❯
+        // marker on the group header or the wrong row instead of following
+        // the one just moved). Setting it explicitly here makes the reorder
+        // action own its own "selection follows the moved row" contract
+        // instead of depending on an ambient invariant maintained elsewhere.
+        view.selectedId = id;
         view.roster.reorderPinned(id, delta);
         this.pushProps();
         void this.persistState(view);
