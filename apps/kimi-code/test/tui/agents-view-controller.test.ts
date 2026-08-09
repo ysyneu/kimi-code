@@ -16,6 +16,7 @@ import {
   AgentsViewController,
   dispatchSlashCommands,
   hintDeferredPermissionOnce,
+  LOAD_TRUST_CONCURRENCY,
   replyRpcTimeoutMs,
   type AgentsViewHost,
   type AgentsViewState,
@@ -274,6 +275,14 @@ async function boot(
      * real host's no-op-on-failure/no-op-if-already-warmed behavior.
      */
     warmedActivatableCommands?: DispatchActivatableCommands;
+    /**
+     * Override for `host.warmAgentsViewSkillMenu()` itself — lets a test
+     * hold the warm-up open (e.g. `() => new Promise(() => {})`, never
+     * resolving) to prove `show()`'s paint doesn't wait on it. Defaults to
+     * the same "apply `warmedActivatableCommands` and resolve" behavior as
+     * before this option existed.
+     */
+    warmAgentsViewSkillMenu?: () => Promise<void>;
   } = {},
 ): Promise<Boot> {
   const homeDir = await mkdtemp(join(tmpdir(), 'agents-view-controller-'));
@@ -321,9 +330,11 @@ async function boot(
         { value: 'kimi-thinking', description: 'Kimi Thinking' },
       ],
     agentsViewActivatableCommands: () => currentActivatable,
-    warmAgentsViewSkillMenu: async () => {
-      if (opts.warmedActivatableCommands !== undefined) currentActivatable = opts.warmedActivatableCommands;
-    },
+    warmAgentsViewSkillMenu:
+      opts.warmAgentsViewSkillMenu ??
+      (async () => {
+        if (opts.warmedActivatableCommands !== undefined) currentActivatable = opts.warmedActivatableCommands;
+      }),
     setAttachBadge,
     getCurrentSessionId: () => opts.currentSessionId ?? '',
     onOpenSession: opts.onOpenSession,
@@ -2739,6 +2750,67 @@ describe('AgentsViewController — workspace trust', () => {
     await flush();
     expect(b.view().roster.get('s1')?.trusted).toBeUndefined();
     expect(b.render()).not.toContain('untrusted');
+  });
+
+  // A4: a roster accumulated over a long-lived home can hold far more rows
+  // than any single boot's session count here — `loadTrust` must never fire
+  // more than LOAD_TRUST_CONCURRENCY trust RPCs at once, however large `ids`
+  // is, so the burst can't compete unbounded with the terminal's own
+  // keypress-dispatch/render work on the same event loop.
+  it('loadTrust bounds concurrent trust RPCs to LOAD_TRUST_CONCURRENCY', async () => {
+    const rows = Array.from({ length: LOAD_TRUST_CONCURRENCY * 3 }, (_, i) => summary(`s${i}`));
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const pending: Array<() => void> = [];
+    const b = await boot(rows, {
+      wire: true,
+      trust: () =>
+        new Promise<boolean>((resolve) => {
+          inFlight += 1;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          pending.push(() => {
+            inFlight -= 1;
+            resolve(true);
+          });
+        }),
+    });
+    dir = b.homeDir;
+    await flush();
+    // Every worker's first RPC is already in flight — the bound holds from
+    // the very first tick, not just "eventually" after some backlog drains.
+    expect(pending.length).toBe(LOAD_TRUST_CONCURRENCY);
+    expect(maxInFlight).toBeLessThanOrEqual(LOAD_TRUST_CONCURRENCY);
+    // Release them one at a time; each release immediately backfills from
+    // the remaining ids, and the bound must keep holding as it does.
+    while (pending.length > 0) {
+      pending.shift()!();
+      await flush();
+      expect(maxInFlight).toBeLessThanOrEqual(LOAD_TRUST_CONCURRENCY);
+    }
+    expect(b.view().roster.get(`s${rows.length - 1}`)?.trusted).toBe(true);
+  });
+
+  // A4: pins the mechanism `show()`'s own doc comments already promise —
+  // trust/skill warm-up "must never block or break show()". Holding both
+  // warm-up calls open (never resolving) and asserting the roster still
+  // painted proves `show()` doesn't await either one, and that focus lands
+  // on the roster before any warm-up work could possibly have finished —
+  // the exact ordering this task's brief calls out as the regression shape
+  // to guard against ("input handler registered late").
+  it('show() paints the roster and sets focus without waiting on trust/skill warm-up', async () => {
+    const b = await boot([summary('s1'), summary('s2')], {
+      wire: true,
+      trust: () => new Promise<boolean>(() => {}), // never resolves
+      warmAgentsViewSkillMenu: () => new Promise<void>(() => {}), // never resolves
+    });
+    dir = b.homeDir;
+    // controller.show() has already returned inside boot() at this point —
+    // both warm-up promises above are still pending (they can never
+    // resolve), yet the paint must already have happened.
+    expect(b.ui.setFocus).toHaveBeenCalledWith(b.component());
+    expect(b.ui.requestRender).toHaveBeenCalledWith(true);
+    expect(b.render()).toContain('s1 title');
+    expect(b.render()).toContain('s2 title');
   });
 });
 

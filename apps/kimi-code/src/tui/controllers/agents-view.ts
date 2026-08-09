@@ -249,6 +249,18 @@ const DEFAULT_SERVER_TIMEOUT_MS = 4000;
 const REPLY_RPC_TIMEOUT_MARGIN_MS = 2_000;
 
 /**
+ * Bounds {@link AgentsViewController.loadTrust}'s fan-out. A roster
+ * accumulated over a long-lived home can hold hundreds of rows; firing one
+ * `getWorkspaceTrustForSession` RPC per row unconditionally would put that
+ * many concurrent HTTP round-trips in flight the moment the roster paints —
+ * all landing on the same event loop the terminal uses for keypress
+ * dispatch and render. A small worker pool pulling from a shared cursor
+ * (same shape as `feedback/upload.ts`'s `uploadParts`) keeps steady
+ * progress without the unbounded burst.
+ */
+export const LOAD_TRUST_CONCURRENCY = 8;
+
+/**
  * Bounds how long the view waits for a reply RPC before treating it as
  * failed. The server chain this RPC funnels through can legitimately stack
  * TWO instances of the same server bound in series on a cold resume
@@ -709,21 +721,28 @@ export class AgentsViewController {
     const rpc = this.host.harness.wireRpc();
     if (rpc === undefined) return;
     let changed = false;
-    await Promise.all(
-      ids.map(async (id) => {
+    let nextIndex = 0;
+    const worker = async (): Promise<void> => {
+      while (true) {
+        const index = nextIndex;
+        nextIndex += 1;
+        const id = ids[index];
+        if (id === undefined) return;
         // Archived sessions never entered the roster; setTrusted would no-op.
-        if (view.roster.get(id) === undefined) return;
+        if (view.roster.get(id) === undefined) continue;
         let trusted: boolean | undefined;
         try {
           trusted = await rpc.getWorkspaceTrustForSession(id);
         } catch {
-          return;
+          continue;
         }
         if (this.host.state.agentsView !== view) return;
         view.roster.setTrusted(id, trusted);
         changed = true;
-      }),
-    );
+      }
+    };
+    const workerCount = Math.min(LOAD_TRUST_CONCURRENCY, ids.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
     if (changed && this.host.state.agentsView === view) this.pushProps();
   }
 
