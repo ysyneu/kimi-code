@@ -433,7 +433,19 @@ export class EditorKeyboardController {
     // Cancel any running `!` shell command (treated as a streaming phase) in
     // addition to the agent turn, so Esc / Ctrl+C interrupts it too.
     this.host.cancelRunningShellCommand();
-    void this.host.session?.cancel();
+    const session = this.host.session;
+    if (session === undefined) return;
+    // A failed cancel must surface (matches cancelCurrentCompaction below):
+    // the in-process harness a normal chat session runs on almost never
+    // rejects here, but an agents-view attach always rides the wire
+    // transport, where the abort is a real network round trip that can
+    // fail. Without a `.catch()`, a rejection here is a silently swallowed
+    // promise — Ctrl+C would look like a total no-op instead of a reported
+    // failure the user can retry.
+    void session.cancel().catch((error: unknown) => {
+      const message = formatErrorMessage(error);
+      this.host.showError(`Failed to cancel: ${message}`);
+    });
   }
 
   private cancelCurrentCompaction(): void {

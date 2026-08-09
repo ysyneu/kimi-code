@@ -17,6 +17,7 @@ interface Harness {
   readonly btwCloseOrCancel: ReturnType<typeof vi.fn>;
   readonly returnToAgentsView: ReturnType<typeof vi.fn>;
   readonly showStatus: ReturnType<typeof vi.fn>;
+  readonly showError: ReturnType<typeof vi.fn>;
 }
 
 function createHarness(options: { streamingPhase?: string; isCompacting?: boolean } = {}): Harness {
@@ -33,6 +34,7 @@ function createHarness(options: { streamingPhase?: string; isCompacting?: boolea
   const btwCloseOrCancel = vi.fn(() => false);
   const returnToAgentsView = vi.fn(() => false);
   const showStatus = vi.fn();
+  const showError = vi.fn();
   const session = { cancel: vi.fn(async () => {}), cancelCompaction };
 
   const host = {
@@ -52,6 +54,7 @@ function createHarness(options: { streamingPhase?: string; isCompacting?: boolea
     cancelRunningShellCommand,
     returnToAgentsView,
     showStatus,
+    showError,
   } as unknown as EditorKeyboardHost;
 
   const controller = new EditorKeyboardController(
@@ -70,6 +73,7 @@ function createHarness(options: { streamingPhase?: string; isCompacting?: boolea
     btwCloseOrCancel,
     returnToAgentsView,
     showStatus,
+    showError,
   };
 }
 
@@ -150,6 +154,25 @@ describe('EditorKeyboardController double-Esc undo', () => {
     expect(cancelRunningShellCommand).toHaveBeenCalled();
     const session = host.session as unknown as { cancel: ReturnType<typeof vi.fn> };
     expect(session.cancel).toHaveBeenCalled();
+  });
+
+  it('surfaces a failed session.cancel() instead of swallowing it silently (A3)', async () => {
+    // cancelCurrentStream's session.cancel() is fire-and-forget — over the
+    // wire transport (agents-view attach) the abort is a real network call
+    // that can reject. Without a `.catch()` here, a rejection would be a
+    // completely silent no-op: Ctrl+C looks like it did nothing at all.
+    const { editor, host, showError } = createHarness({ streamingPhase: 'waiting' });
+    const session = host.session as unknown as { cancel: ReturnType<typeof vi.fn> };
+    session.cancel = vi.fn(async () => {
+      throw new Error('abort rejected');
+    });
+
+    pressCtrlC(editor);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(session.cancel).toHaveBeenCalled();
+    expect(showError).toHaveBeenCalledWith(expect.stringContaining('abort rejected'));
   });
 });
 

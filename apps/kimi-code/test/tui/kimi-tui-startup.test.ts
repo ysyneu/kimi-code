@@ -137,6 +137,7 @@ function makeSession(overrides: Record<string, unknown> = {}) {
     setPlanMode: vi.fn(async () => {}),
     getGoal: vi.fn(async () => ({ goal: null })),
     prompt: vi.fn(async () => {}),
+    cancel: vi.fn(async () => {}),
     onEvent: vi.fn((_listener: (event: Event) => void) => () => {}),
     getResumeState: vi.fn(() => null),
     listSkills: vi.fn(async () => []),
@@ -2473,6 +2474,122 @@ describe('KimiTUI agents-view attach', () => {
     } as Event);
 
     expect(driver.state.appState.streamingPhase).toBe('idle');
+  });
+
+  it('Ctrl+C while attached to an already-busy session cancels the turn — the same session.cancel() path the main chat surface uses (A3)', async () => {
+    // Attach to a session that is ALREADY busy server-side. Ctrl+C's
+    // cancel-vs-arm-exit decision (editor-keyboard.ts's onCtrlC) reads
+    // `appState.streamingPhase` — the same field the busy-seed test above
+    // (R9 I1) proves gets seeded to 'waiting' from the real status on
+    // attach. Assert on the call, not on rendering: this is what actually
+    // reaches the server (Session.cancel() -> rpc.cancel() -> wire
+    // transport's `:abort`), regardless of how the transcript repaints.
+    const session = makeAttachSession('ses-attached');
+    session.getStatus.mockResolvedValue({
+      model: 'k2',
+      thinkingEffort: 'off',
+      permission: 'manual',
+      planMode: false,
+      contextTokens: 10,
+      maxContextTokens: 100,
+      contextUsage: 0.1,
+      busy: true,
+    });
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(driver.state.appState.streamingPhase).toBe('waiting');
+
+    driver.state.editor.onCtrlC?.();
+
+    expect(session.cancel).toHaveBeenCalled();
+  });
+
+  it('Ctrl+C while attached and a turn starts live (not busy at attach time) also cancels it (A3)', async () => {
+    const session = makeAttachSession('ses-attached');
+    session.getStatus.mockResolvedValue({
+      model: 'k2',
+      thinkingEffort: 'off',
+      permission: 'manual',
+      planMode: false,
+      contextTokens: 10,
+      maxContextTokens: 100,
+      contextUsage: 0.1,
+      busy: false,
+    });
+    let sessionEventListener: ((event: Event) => void) | undefined;
+    session.onEvent.mockImplementation((listener: (event: Event) => void) => {
+      sessionEventListener = listener;
+      return () => {
+        sessionEventListener = undefined;
+      };
+    });
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(driver.state.appState.streamingPhase).toBe('idle');
+
+    sessionEventListener?.({
+      type: 'turn.started',
+      agentId: 'main',
+      sessionId: 'ses-attached',
+      turnId: 1,
+    } as Event);
+    sessionEventListener?.({
+      type: 'assistant.delta',
+      agentId: 'main',
+      sessionId: 'ses-attached',
+      turnId: 1,
+      delta: 'hello',
+    } as Event);
+
+    expect(driver.state.appState.streamingPhase).not.toBe('idle');
+
+    driver.state.editor.onCtrlC?.();
+
+    expect(session.cancel).toHaveBeenCalled();
+  });
+
+  it('Ctrl+C while attached and idle does NOT cancel — it arms the same double-press exit hint the main chat surface uses (A3)', async () => {
+    // Required behavior #2: idle Ctrl+C must match the main chat surface,
+    // not the roster's own arm/confirm (that's a separate mechanism gated
+    // on `state.agentsView`, untouched here — see the roster-level Ctrl+C
+    // tests). A single idle Ctrl+C must not call session.cancel(); it
+    // arms `armPendingExit('ctrl-c', ...)`, requiring a second press
+    // within the window to quit.
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+    const stop = vi.spyOn(driver, 'stop').mockResolvedValue(undefined);
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(driver.state.appState.streamingPhase).toBe('idle');
+
+    driver.state.editor.onCtrlC?.();
+
+    expect(session.cancel).not.toHaveBeenCalled();
+    expect(stop).not.toHaveBeenCalled();
+
+    // Second press within the window behaves exactly like main chat: quits.
+    driver.state.editor.onCtrlC?.();
+    expect(stop).toHaveBeenCalled();
   });
 
   it('a second turn.started with no intervening turn.ended finalizes the previous turn instead of concatenating its text into the new one (adjacent fix)', async () => {
