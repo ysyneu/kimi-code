@@ -218,13 +218,16 @@ This subcommand has no flags.
 | `Alt-1` – `Alt-9` | Open the Nth visible session, same as `Enter` |
 | `@` | Mention a file by path in the bottom input box |
 | `Ctrl-J` | Insert a newline in the bottom input box |
+| `Shift-Enter` | In the bottom input box, dispatch the new session and attach to it right away — plain text only, not while replying and not with a `/model` / `/agent` / skill / plugin prefix |
 | `Ctrl-X` | Archive the selected session (press twice to confirm); on a group header, archive the whole group. A session's running turn is cancelled first |
 | `Ctrl-R` | Rename the session |
 | `Ctrl-T` | Pin or unpin the session; pinned sessions move to the Pinned group |
+| `Ctrl-S` | Toggle the roster between grouping by status (Pinned / Needs input / Working / Completed) and grouping by working directory |
 | `?` | Show the shortcut list |
 | `Esc` | Quit |
+| `Ctrl-C` | Double-press to quit: the first press arms a confirmation, the second press (within a few seconds) actually quits. Pressing any other key in between clears the arm |
 
-The bottom input box dispatches a new session in the current working directory: typing any text focuses the box, and `Enter` creates the session with that text as its first prompt. Two slash commands are available there as prefixes — `/model <alias>` and `/agent <profile>` stage a model or agent override for the new session's first prompt (e.g. `/agent reviewer Review the changes on this branch`); `/help` shows its help. Typing exactly `exit` or `/exit` there and pressing `Enter` closes the agents view instead, the same as `Esc`. Pressing `Space` on a session row switches this same box to reply mode instead: `Enter` sends the text straight to that session as typed — no new session, and no slash interpretation, so a leading `/model` or `/agent` in a reply goes through as plain text rather than being treated as an override — and `Esc` returns to dispatching a new one.
+The bottom input box dispatches a new session in the current working directory: typing any text focuses the box, and `Enter` creates the session with that text as its first prompt (`Shift-Enter` also attaches to it right away — see the table above). Slash commands are available there as prefixes: `/model <alias>` and `/agent <profile>` stage a model or agent override for the new session's first prompt (e.g. `/agent reviewer Review the changes on this branch`), and a skill or plugin command (e.g. `/skill:reviewcode`) stages that activation instead, applied as the session's first action in place of a prompt. Other slash commands the CLI recognizes elsewhere — including `/help` — are not runnable from this box; dispatching one shows a message telling you to attach to a session first instead. Typing exactly `exit` or `/exit` there and pressing `Enter` closes the agents view instead, the same as `Esc`. Pressing `Space` on a session row switches this same box to reply mode instead: `Enter` sends the text straight to that session as typed — no new session, and no slash interpretation, so a leading `/model` or `/agent` in a reply goes through as plain text rather than being treated as an override — and `Esc` returns to dispatching a new one.
 
 #### Server Lifecycle
 
@@ -238,7 +241,6 @@ The agents view talks to a local Kimi server on this machine only:
 - Sessions created or attached from the agents view run on the server's engine; they cannot be reopened with `kimi --resume` — re-enter them through `kimi agents`.
 - The list only shows sessions the view itself created or attached on the local Kimi server; sessions started with the plain `kimi` command or created by other clients (for example `kimi web`) do not appear.
 - For the whole `kimi agents` run — in the view and in any attached session — `!` shell commands are disabled.
-- Inside the view, skill and plugin slash commands are unavailable.
 - Inside an attached session, configuration slash commands such as `/model` are not yet available.
 
 ### `kimi doctor`
