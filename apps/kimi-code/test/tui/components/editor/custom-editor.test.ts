@@ -116,6 +116,59 @@ describe('CustomEditor onNonEscapeInput', () => {
   });
 });
 
+describe('CustomEditor onShiftEnterSubmit', () => {
+  // xterm modifyOtherKeys CSI 27 ; <modifier+1> ; <keycode> ~ — modifier=2
+  // (shift), keycode=13 (Enter). Matches `matchesKey(data, 'shift+enter')`
+  // independent of Kitty-protocol state, unlike the plain `\x1b\r`/`\n`
+  // fallbacks pi-tui only recognizes once Kitty is active.
+  const SHIFT_ENTER = '[27;2;13~';
+
+  it('consumes shift+enter when the hook returns true — clears the buffer, no newline inserted', () => {
+    const editor = makeEditor();
+    const onShiftEnterSubmit = vi.fn(() => true);
+    editor.onShiftEnterSubmit = onShiftEnterSubmit;
+    editor.setText('fix the flaky test');
+
+    editor.handleInput(SHIFT_ENTER);
+
+    expect(onShiftEnterSubmit).toHaveBeenCalledWith('fix the flaky test');
+    expect(editor.getText()).toBe('');
+  });
+
+  it('falls through to the base editor default (newline) when the hook returns false', () => {
+    const editor = makeEditor();
+    const onShiftEnterSubmit = vi.fn(() => false);
+    editor.onShiftEnterSubmit = onShiftEnterSubmit;
+    editor.setText('/model kimi-k2 fix the flaky test');
+
+    editor.handleInput(SHIFT_ENTER);
+
+    expect(onShiftEnterSubmit).toHaveBeenCalledWith('/model kimi-k2 fix the flaky test');
+    // Declined: the keystroke fell through to pi-tui's own newline-insert —
+    // the buffer keeps its text plus a new empty line, nothing is cleared.
+    expect(editor.getLines()).toEqual(['/model kimi-k2 fix the flaky test', '']);
+  });
+
+  it('with no hook wired, shift+enter keeps the base editor default (newline) — every OTHER editor instance', () => {
+    const editor = makeEditor();
+    editor.setText('some text');
+
+    editor.handleInput(SHIFT_ENTER);
+
+    expect(editor.getLines()).toEqual(['some text', '']);
+  });
+
+  it('an empty buffer never calls the hook (nothing to submit)', () => {
+    const editor = makeEditor();
+    const onShiftEnterSubmit = vi.fn(() => true);
+    editor.onShiftEnterSubmit = onShiftEnterSubmit;
+
+    editor.handleInput(SHIFT_ENTER);
+
+    expect(onShiftEnterSubmit).not.toHaveBeenCalled();
+  });
+});
+
 describe('CustomEditor onLeftArrowEmpty', () => {
   const LEFT = '\u001B[D';
 

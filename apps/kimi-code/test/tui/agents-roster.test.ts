@@ -563,4 +563,48 @@ describe('roster row mutation (controller actions)', () => {
     roster.setTitle('missing', 'noop');
     expect(roster.get('missing')).toBeUndefined();
   });
+
+  it('upsertLocalRow inserts a busy row into the working group (A2 placeholder)', () => {
+    const roster = new AgentsRoster(new Set());
+    roster.upsertLocalRow({
+      id: 'pending-dispatch:1',
+      title: 'fix the flaky test',
+      workDir: '/work/x',
+      updatedAt: 5_000,
+      busy: true,
+    });
+    const row = roster.get('pending-dispatch:1');
+    expect(row).toEqual({
+      id: 'pending-dispatch:1',
+      title: 'fix the flaky test',
+      workDir: '/work/x',
+      updatedAt: 5_000,
+      busy: true,
+      pendingInteraction: 'none',
+      pinned: false,
+      unseen: true,
+    });
+    expect(roster.groups().find((g) => g.id === 'working')?.rows.map((r) => r.id)).toEqual([
+      'pending-dispatch:1',
+    ]);
+  });
+
+  it('upsertLocalRow on an id already in the roster overwrites in place — never a second row (A2 dedupe)', () => {
+    const roster = new AgentsRoster(new Set());
+    roster.upsertLocalRow({ id: 'a', title: 'first', workDir: '/work/a', updatedAt: 1_000, busy: true });
+    roster.upsertLocalRow({ id: 'a', title: 'second', workDir: '/work/a', updatedAt: 2_000, busy: true });
+    expect(roster.groups().flatMap((g) => g.rows).map((r) => r.id)).toEqual(['a']);
+    expect(roster.get('a')?.title).toBe('second');
+  });
+
+  it('upsertLocalRow under an id the caller already pinned/has seen derives pinned/unseen consistently', () => {
+    const pins = new Set(['a']);
+    const seenAt = new Map([['a', 500]]);
+    const roster = new AgentsRoster(pins, seenAt);
+    // busy wins over pinned in groupOf — still lands in Working, not Pinned.
+    roster.upsertLocalRow({ id: 'a', title: 'x', workDir: '/work/a', updatedAt: 400, busy: true });
+    const row = roster.get('a');
+    expect(row?.pinned).toBe(true);
+    expect(row?.unseen).toBe(false); // updatedAt (400) <= seenAt (500)
+  });
 });

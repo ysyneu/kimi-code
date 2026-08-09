@@ -118,11 +118,16 @@ interface FakeHarness {
   resumeSession: ReturnType<typeof vi.fn>;
   deleteSession: ReturnType<typeof vi.fn>;
   renameSession: ReturnType<typeof vi.fn>;
-  createSession: ReturnType<typeof vi.fn>;
+  // Explicitly Promise-returning — see `wirePrompt`'s own comment below: A2's
+  // placeholder tests feed this `mockImplementationOnce` a
+  // `() => new Promise(...)` to hold session creation open by hand.
+  createSession: ReturnType<typeof vi.fn<(...args: unknown[]) => Promise<Session>>>;
   session: { getContext: ReturnType<typeof vi.fn>; steer: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> };
   createdSession: {
     id: string;
-    prompt: ReturnType<typeof vi.fn>;
+    // Same reason as `createSession` above — the B7 attach test holds this
+    // open to prove attach fires before the first prompt call settles.
+    prompt: ReturnType<typeof vi.fn<(...args: unknown[]) => Promise<void>>>;
     activateSkill: ReturnType<typeof vi.fn>;
     activatePluginCommand: ReturnType<typeof vi.fn>;
   };
@@ -1329,6 +1334,65 @@ describe('AgentsViewDispatch — editor wiring', () => {
     expect(onSubmit).toHaveBeenCalledWith({ text: '/exit' });
   });
 
+  it('B7: a plain shift+enter submission fires onShiftEnterSubmit and reports consumed', () => {
+    const dispatch = makeDispatch();
+    const onShiftEnterSubmit = vi.fn();
+    dispatch.onShiftEnterSubmit = onShiftEnterSubmit;
+    const consumed = dispatch.editor.onShiftEnterSubmit?.('fix the flaky test');
+    expect(consumed).toBe(true);
+    expect(onShiftEnterSubmit).toHaveBeenCalledWith({ text: 'fix the flaky test' });
+  });
+
+  it('B7: shift+enter on a /model dispatch declines — no attach shortcut for slash dispatches', () => {
+    const dispatch = makeDispatch();
+    const onShiftEnterSubmit = vi.fn();
+    dispatch.onShiftEnterSubmit = onShiftEnterSubmit;
+    const consumed = dispatch.editor.onShiftEnterSubmit?.('/model kimi-k2 fix the flaky test');
+    expect(consumed).toBe(false);
+    expect(onShiftEnterSubmit).not.toHaveBeenCalled();
+  });
+
+  it('B7: shift+enter on a skill/plugin dispatch declines', () => {
+    const dispatch = makeDispatch({
+      commands: [],
+      skillCommandMap: new Map([['skill:reviewcode', 'reviewcode']]),
+      pluginCommandMap: new Map(),
+    });
+    const onShiftEnterSubmit = vi.fn();
+    dispatch.onShiftEnterSubmit = onShiftEnterSubmit;
+    const consumed = dispatch.editor.onShiftEnterSubmit?.('/skill:reviewcode check the auth module');
+    expect(consumed).toBe(false);
+    expect(onShiftEnterSubmit).not.toHaveBeenCalled();
+  });
+
+  it('B7: shift+enter while replying declines — a reply stays multi-line-capable', () => {
+    const dispatch = makeDispatch();
+    dispatch.replying = true;
+    const onShiftEnterSubmit = vi.fn();
+    dispatch.onShiftEnterSubmit = onShiftEnterSubmit;
+    const consumed = dispatch.editor.onShiftEnterSubmit?.('a multi-line reply in progress');
+    expect(consumed).toBe(false);
+    expect(onShiftEnterSubmit).not.toHaveBeenCalled();
+  });
+
+  it('B7: a parse error (too short) declines silently — no onError, no onShiftEnterSubmit', () => {
+    const dispatch = makeDispatch();
+    const onError = vi.fn();
+    const onShiftEnterSubmit = vi.fn();
+    dispatch.onError = onError;
+    dispatch.onShiftEnterSubmit = onShiftEnterSubmit;
+    const consumed = dispatch.editor.onShiftEnterSubmit?.('ab');
+    expect(consumed).toBe(false);
+    expect(onError).not.toHaveBeenCalled();
+    expect(onShiftEnterSubmit).not.toHaveBeenCalled();
+  });
+
+  it('B7: with no onShiftEnterSubmit host wired, shift+enter declines (falls through to newline)', () => {
+    const dispatch = makeDispatch();
+    const consumed = dispatch.editor.onShiftEnterSubmit?.('fix the flaky test');
+    expect(consumed).toBe(false);
+  });
+
   it('installAutocomplete suggests only the installed commands — no /help', async () => {
     const dispatch = makeDispatch();
     dispatch.installAutocomplete(dispatchSlashCommands(() => [], () => EMPTY_ACTIVATABLE));
@@ -1773,6 +1837,254 @@ describe('AgentsViewController — dispatch', () => {
     await flush();
     expect(b.render()).toContain('Dispatch failed: workspace rejected');
     b.controller.close(); // clear the pending flash timer
+  });
+});
+
+// ── A2: optimistic dispatch placeholder row (+ B7 shift+enter attach) ──
+
+describe('AgentsViewController — A2 optimistic dispatch placeholder', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
+    dir = undefined;
+  });
+
+  /** Holds `createSession` open until the test lets it resolve, so the
+   *  SYNCHRONOUS placeholder can be inspected before the real id exists. */
+  function deferCreateSession(b: Boot): { resolve: () => void } {
+    let resolve: (() => void) | undefined;
+    b.fake.createSession.mockImplementationOnce(
+      () =>
+        new Promise((res) => {
+          resolve = () => res(b.fake.createdSession as unknown as Session);
+        }),
+    );
+    return {
+      resolve: () => resolve?.(),
+    };
+  }
+
+  it('Enter synchronously inserts a busy, selected placeholder row before createSession resolves', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    const deferred = deferCreateSession(b);
+
+    b.view().dispatch.editor.onSubmit?.('fix the flaky test');
+    // No `await flush()` yet — createSession is still pending, so this is
+    // exactly what the user sees synchronously on Enter.
+    const out = b.render();
+    expect(out).toContain('fix the flaky test');
+    expect(out).toContain('Working');
+
+    const placeholderId = b.view().selectedId;
+    expect(placeholderId).not.toBeUndefined();
+    expect(placeholderId).not.toBe('s1');
+    const row = b.view().roster.get(placeholderId!);
+    expect(row?.busy).toBe(true);
+    expect(row?.title).toBe('fix the flaky test');
+    // Never leaks into the persisted registry/pins — it's a local id, not a
+    // real session.
+    expect(b.view().viewSessions.has(placeholderId!)).toBe(false);
+
+    deferred.resolve();
+    await flush();
+    b.controller.close();
+  });
+
+  it('reconciles the placeholder to the real session id on success, keeping selection', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    const deferred = deferCreateSession(b);
+
+    b.view().dispatch.editor.onSubmit?.('fix the flaky test');
+    const placeholderId = b.view().selectedId!;
+
+    deferred.resolve();
+    await flush();
+
+    // The placeholder id is gone — promoted in place, not left behind.
+    expect(b.view().roster.get(placeholderId)).toBeUndefined();
+    expect(b.view().selectedId).toBe('new-session');
+    const realRow = b.view().roster.get('new-session');
+    expect(realRow?.busy).toBe(true);
+    expect(realRow?.title).toBe('fix the flaky test');
+    expect(b.view().viewSessions.has('new-session')).toBe(true);
+    const out = b.render();
+    expect(out).toContain('fix the flaky test');
+    expect(out).toContain('Working');
+  });
+
+  it('dedupes against a same-session event.session.created echo that lands while the placeholder is alive', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    const deferred = deferCreateSession(b);
+
+    b.view().dispatch.editor.onSubmit?.('fix the flaky test');
+    deferred.resolve();
+    await flush();
+
+    // The server's own echo for the same session, landing after the local
+    // promotion already happened.
+    b.fake.emit({
+      type: 'event.session.created',
+      session: {
+        id: 'new-session',
+        title: 'fix the flaky test',
+        last_prompt: 'fix the flaky test',
+        metadata: { cwd: '/home/user/project' },
+        updated_at: new Date().toISOString(),
+        busy: true,
+        pending_interaction: 'none',
+      },
+    });
+
+    const rowCount = b
+      .view()
+      .roster.groups(Number.MAX_SAFE_INTEGER)
+      .flatMap((group) => group.rows)
+      .filter((row) => row.id === 'new-session' || row.title === 'fix the flaky test').length;
+    expect(rowCount).toBe(1);
+  });
+
+  it('a failing createSession removes the placeholder row instead of leaving it stuck', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.fake.createSession.mockRejectedValueOnce(new Error('workspace rejected'));
+
+    b.view().dispatch.editor.onSubmit?.('fix the flaky test');
+    const placeholderId = b.view().selectedId!;
+    expect(b.view().roster.get(placeholderId)).not.toBeUndefined();
+
+    await flush();
+
+    expect(b.view().roster.get(placeholderId)).toBeUndefined();
+    expect(b.view().selectedId).toBeUndefined();
+    expect(b.render()).toContain('Dispatch failed: workspace rejected');
+    const out = b.render();
+    expect(out).not.toContain('fix the flaky test');
+    b.controller.close(); // clear the pending flash timer
+  });
+
+  it('a /model dispatch (slash) gets no placeholder — pre-A2 behaviour unchanged', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    const deferred = deferCreateSession(b);
+
+    b.view().dispatch.editor.onSubmit?.('/model kimi-k2 fix the flaky test');
+    // Nothing local was inserted — selection stays whatever it was
+    // (untouched), and there is no fabricated row in the roster yet.
+    expect(b.view().selectedId).toBeUndefined();
+    const out = b.render();
+    expect(out).not.toContain('fix the flaky test');
+
+    deferred.resolve();
+    await flush();
+  });
+
+  it('a skill activation dispatch gets no placeholder either', async () => {
+    const b = await boot([summary('s1')], {
+      activatableCommands: {
+        commands: [],
+        skillCommandMap: new Map([['skill:reviewcode', 'reviewcode']]),
+        pluginCommandMap: new Map(),
+      },
+    });
+    dir = b.homeDir;
+    const deferred = deferCreateSession(b);
+
+    b.view().dispatch.editor.onSubmit?.('/skill:reviewcode check the auth module');
+    expect(b.view().selectedId).toBeUndefined();
+
+    deferred.resolve();
+    await flush();
+    expect(b.fake.createdSession.activateSkill).toHaveBeenCalledWith('reviewcode', 'check the auth module');
+  });
+
+  it('a placeholder row declines attach/reply/rename/pin/delete until it resolves', async () => {
+    const onOpenSession = vi.fn();
+    const b = await boot([summary('s1')], { onOpenSession });
+    dir = b.homeDir;
+    const deferred = deferCreateSession(b);
+
+    b.view().dispatch.editor.onSubmit?.('fix the flaky test');
+    const placeholderId = b.view().selectedId!;
+    // The placeholder sorts to the top of Working and is pre-selected, so
+    // every key below targets it via the normal list-focused routing —
+    // exactly the keys a user could press during the pending window.
+    expect(b.view().dispatchFocused).toBe(false);
+
+    b.component().handleInput(ENTER); // attach
+    expect(onOpenSession).not.toHaveBeenCalled();
+    expect(b.showStatus).toHaveBeenCalledWith('Still dispatching — try again in a moment');
+
+    b.showStatus.mockClear();
+    b.component().handleInput(SPACE); // reply
+    expect(b.view().replyTargetId).toBeUndefined();
+    expect(b.showStatus).toHaveBeenCalledWith('Still dispatching — try again in a moment');
+
+    b.showStatus.mockClear();
+    b.component().handleInput(CTRL_R); // rename
+    expect(b.view().renameDraft).toBeUndefined();
+    expect(b.showStatus).toHaveBeenCalledWith('Still dispatching — try again in a moment');
+    // The component's own inline-rename toggle can still be entered locally
+    // (it doesn't ask the controller first) — typing and submitting must
+    // not reach `renameSession` with the fabricated id either.
+    b.component().handleInput('z');
+    b.component().handleInput(ENTER);
+    expect(b.fake.renameSession).not.toHaveBeenCalled();
+
+    b.showStatus.mockClear();
+    b.component().handleInput(CTRL_T); // pin
+    expect(b.view().roster.get(placeholderId)?.pinned).toBe(false);
+    expect(b.showStatus).toHaveBeenCalledWith('Still dispatching — try again in a moment');
+
+    b.showStatus.mockClear();
+    b.component().handleInput(CTRL_X); // delete
+    expect(b.view().confirmDeleteId).toBeUndefined();
+    expect(b.showStatus).toHaveBeenCalledWith('Still dispatching — try again in a moment');
+    expect(b.fake.deleteSession).not.toHaveBeenCalled();
+
+    deferred.resolve();
+    await flush();
+  });
+
+  it('B7: shift+enter dispatches identically, then attaches the moment the real id exists', async () => {
+    const onOpenSession = vi.fn();
+    const b = await boot([summary('s1')], { onOpenSession });
+    dir = b.homeDir;
+    // Hold the FIRST prompt call open so we can prove attach fires as soon
+    // as createSession resolves — independent of whether the first turn's
+    // prompt has finished.
+    b.fake.createdSession.prompt.mockImplementationOnce(() => new Promise(() => {}));
+
+    b.view().dispatch.editor.onShiftEnterSubmit?.('fix the flaky test');
+    // Placeholder visible synchronously, same as plain Enter.
+    const placeholderId = b.view().selectedId!;
+    expect(b.view().roster.get(placeholderId)?.busy).toBe(true);
+    expect(onOpenSession).not.toHaveBeenCalled();
+
+    await flush();
+
+    // The real id is known and attach already fired — the still-pending
+    // `prompt()` call did not block it.
+    expect(onOpenSession).toHaveBeenCalledWith('new-session');
+    expect(b.view().viewSessions.has('new-session')).toBe(true);
+    expect(b.view().roster.get('new-session')).not.toBeUndefined();
+  });
+
+  it('B7: shift+enter with no attach seam falls back to the same status hint as a manual attach', async () => {
+    const b = await boot([summary('s1')]); // no onOpenSession
+    dir = b.homeDir;
+
+    b.view().dispatch.editor.onShiftEnterSubmit?.('fix the flaky test');
+    await flush();
+
+    expect(b.showStatus).toHaveBeenCalledWith('Attach is not available from this host');
+    // Dispatch itself still happened normally — only the attach hop declined.
+    expect(b.view().viewSessions.has('new-session')).toBe(true);
+    expect(b.fake.createdSession.prompt).toHaveBeenCalledWith('fix the flaky test');
   });
 });
 
