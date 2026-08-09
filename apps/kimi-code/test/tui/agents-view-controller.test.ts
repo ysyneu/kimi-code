@@ -1723,10 +1723,15 @@ describe('parseReplyInput', () => {
     expect(parseReplyInput('fix the flaky test')).toEqual({ text: 'fix the flaky test' });
   });
 
-  it('still rejects empty and too-short input with the same message as dispatch mode', () => {
-    expect(parseReplyInput('')).toEqual({ error: 'Too short — describe the task' });
-    expect(parseReplyInput('   ')).toEqual({ error: 'Too short — describe the task' });
-    expect(parseReplyInput('ab')).toEqual({ error: 'Too short — describe the task' });
+  it('I3: rejects only empty/whitespace-only input — not dispatch mode\'s 3-char floor', () => {
+    expect(parseReplyInput('')).toEqual({ error: 'Reply cannot be empty' });
+    expect(parseReplyInput('   ')).toEqual({ error: 'Reply cannot be empty' });
+    // A short confirmation is the single most common roster reply — the
+    // dispatch parser's MIN_NON_SPACE_CHARS floor does not apply here.
+    expect(parseReplyInput('ab')).toEqual({ text: 'ab' });
+    expect(parseReplyInput('ok')).toEqual({ text: 'ok' });
+    expect(parseReplyInput('y')).toEqual({ text: 'y' });
+    expect(parseReplyInput('no')).toEqual({ text: 'no' });
   });
 });
 
@@ -3193,11 +3198,25 @@ describe('AgentsViewController — reply mode (space)', () => {
     dir = b.homeDir;
     b.component().handleInput(DOWN);
     b.component().handleInput(SPACE);
-    b.view().dispatch.editor.onSubmit?.('ab'); // too short
+    b.view().dispatch.editor.onSubmit?.(''); // I3: reply mode rejects only empty input
     await flush();
     expect(b.view().replyTargetId).toBeUndefined();
-    expect(b.render()).toContain('Too short — describe the task');
+    expect(b.render()).toContain('Reply cannot be empty');
     b.controller.close(); // clear the pending flash timer
+  });
+
+  it('I3: a short confirmation reply ("ok") sends instead of erroring', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(SPACE);
+    b.view().dispatch.editor.onSubmit?.('ok');
+    await flush();
+    expect(b.fake.wirePrompt).toHaveBeenCalledWith({
+      sessionId: 's1',
+      input: [{ type: 'text', text: 'ok' }],
+    });
+    expect(b.view().replyTargetId).toBeUndefined();
   });
 
   it('after a reply submit, a subsequent plain submission creates a NEW session (round-trip proof)', async () => {

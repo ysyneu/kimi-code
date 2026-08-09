@@ -179,13 +179,16 @@ const EXIT_COMMANDS = new Set(['exit', '/exit']);
  * slash-command surface to route to inside a reply, so treating one as a
  * `/model`/`/agent` override (or rejecting it as session-only) would either
  * silently swallow the user's actual text or reject text that was never a
- * command in the first place. The only check kept is the same too-short
- * floor `parseDispatchInput` already applies, so a stray Enter can't send a
- * blank prompt to the target session.
+ * command in the first place. Unlike `parseDispatchInput`'s
+ * `MIN_NON_SPACE_CHARS` floor, this only rejects empty/whitespace-only
+ * input — a stray Enter can't send a blank prompt to the target session —
+ * NOT anything shorter than 3 characters: a roster reply is very often a
+ * short confirmation ("ok", "y", "no"), and rejecting those isn't a
+ * different problem than a blank send, so it doesn't get a different floor.
  */
 export function parseReplyInput(raw: string): DispatchParseResult {
-  if (raw.replaceAll(/\s/g, '').length < MIN_NON_SPACE_CHARS) {
-    return { error: 'Too short — describe the task' };
+  if (raw.trim() === '') {
+    return { error: 'Reply cannot be empty' };
   }
   return { text: raw };
 }
