@@ -251,7 +251,7 @@ describe('AgentsViewApp — full-screen rendering', () => {
     expect(lines[3]?.trim()).toBe('');
   });
 
-  it('drops the server label from the header — Claude Code has no server-label slot there', () => {
+  it('drops the server label from the header — the header layout has no server-label slot', () => {
     const out = render(makeApp({ serverLabel: '127.0.0.1:58627' }));
     expect(out).not.toContain('127.0.0.1:58627');
   });

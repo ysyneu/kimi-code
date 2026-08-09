@@ -125,7 +125,7 @@ export interface AgentsViewProps {
    */
   readonly attachedIds: ReadonlySet<string>;
   /** "embedded" or host:port of the connected kap-server. Not currently shown
-   *  by the header chrome (Claude Code's header has no server-label slot),
+   *  by the header chrome (the header layout has no server-label slot),
    *  but kept on the props contract for the host wiring that supplies it. */
   readonly serverLabel: string;
   /** Header label for the model new sessions dispatch with by default. */
@@ -667,8 +667,7 @@ export class AgentsViewApp extends Container implements Focusable {
    * alt+1..9: opens the Nth session ROW in the current visible-item order
    * (group headers, spacers and the collapsed "more" row do not count).
    * Same effect as Enter on that row (`onOpen`). `n` beyond the row count
-   * is a no-op — no number badges are rendered (Claude's own view shows
-   * none either, per the parity spec).
+   * is a no-op — no number badges are rendered on the rows themselves.
    */
   private openNthRow(n: number): void {
     let count = 0;
@@ -847,7 +846,7 @@ export class AgentsViewApp extends Container implements Focusable {
   }
 
   /**
-   * Terse, `" · "`-joined hints (Claude Code's register) instead of an
+   * Terse, `" · "`-joined hints instead of an
    * always-on verbose bar — rename/pin/quit live in the `?` grid instead of
    * every row footer. Returns 2 lines while the `?` grid is open, 1
    * otherwise (see `render`'s header/footer height accounting).
