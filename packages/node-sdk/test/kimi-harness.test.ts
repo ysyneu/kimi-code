@@ -84,3 +84,47 @@ read_byte_budget = 65536
     expect(harness.imageLimits?.maxEdgePx()).toBe(900);
   });
 });
+
+describe('KimiHarness.cancelSession', () => {
+  // B1 (agents-view roster Ctrl+X arm): stops a session's in-flight turn by
+  // id alone, with no cached `Session` in play — unlike `Session.cancel()`,
+  // which needs a resumed/created `Session` object first.
+  function harnessWithRpc(cancel: (input: { sessionId: string }) => Promise<void>): KimiHarness {
+    class SpyRpc extends SDKRpcClientBase {
+      override async cancel(input: { sessionId: string }): Promise<void> {
+        await cancel(input);
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      protected async getRpc(): Promise<any> {
+        throw new Error('no core calls expected — cancelSession must not need a resumed core session');
+      }
+    }
+    return new KimiHarness(new SpyRpc(), {
+      homeDir: '/tmp/home',
+      configPath: '/tmp/config.toml',
+      auth: { status: async () => ({ providers: [] }) } as never,
+      telemetry: recordingTelemetry([]),
+      ensureConfigFile: async () => undefined,
+      onClose: () => undefined,
+    });
+  }
+
+  it('delegates to rpc.cancel keyed by the normalized session id', async () => {
+    const calls: { sessionId: string }[] = [];
+    const harness = harnessWithRpc(async (input) => {
+      calls.push(input);
+    });
+
+    await harness.cancelSession('  ses_123  ');
+
+    expect(calls).toEqual([{ sessionId: 'ses_123' }]);
+  });
+
+  it('propagates a rejection from the underlying cancel call', async () => {
+    const harness = harnessWithRpc(async () => {
+      throw new Error('abort rejected');
+    });
+
+    await expect(harness.cancelSession('ses_1')).rejects.toThrow('abort rejected');
+  });
+});

@@ -264,6 +264,22 @@ export class KimiHarness {
     await this.rpc.deleteSession({ sessionId });
   }
 
+  /**
+   * Aborts a session's in-flight turn WITHOUT closing/detaching it —
+   * distinct from `deleteSession`, which archives it. Addressed purely by
+   * id, the same shape as `deleteSession`: unlike `Session.cancel()`, this
+   * needs no cached `Session` (a caller that never attached/created the
+   * session locally, e.g. the agents-view roster's Ctrl+X arm stopping a
+   * BUSY row it only ever saw as a list entry, has none). `rpc.cancel` is
+   * itself already session-id-scoped either way (`SDKRpcClientBase.cancel`
+   * routes through the in-process gateway by id; `SDKRpcClientWire.cancel`
+   * is a plain `POST .../abort` keyed by id) — this is nothing more than
+   * that same call with no `Session` object in between.
+   */
+  async cancelSession(id: string): Promise<void> {
+    await this.rpc.cancel({ sessionId: normalizeSessionId(id) });
+  }
+
   async renameSession(input: RenameSessionInput): Promise<void> {
     await this.rpc.renameSession(input);
     this.activeSessions.get(input.id)?.emitMetaUpdated({ title: input.title });
