@@ -317,6 +317,10 @@ async function boot(
      *  Ctrl+S persist reject (proving the controller flashes, not throws).
      *  Defaults to recording the call into `Boot.savedGroupModes` and resolving. */
     saveAgentsViewGroupMode?: (mode: AgentsGroupMode) => Promise<void>;
+    /** Override for `host.agentsViewWorkDir()`; defaults to a fixed fake
+     *  path. A real directory is needed for `@`-mention autocomplete tests —
+     *  `FileMentionProvider` falls back to a real filesystem scan. */
+    workDir?: string;
   } = {},
 ): Promise<Boot> {
   const homeDir = await mkdtemp(join(tmpdir(), 'agents-view-controller-'));
@@ -357,7 +361,7 @@ async function boot(
       state.agentsView = value;
     },
     agentsViewServerLabel: () => 'test-server',
-    agentsViewWorkDir: () => '/home/user/project',
+    agentsViewWorkDir: () => opts.workDir ?? '/home/user/project',
     agentsViewGroupMode: opts.agentsViewGroupMode ?? (() => opts.groupMode ?? 'state'),
     saveAgentsViewGroupMode:
       opts.saveAgentsViewGroupMode ??
@@ -3473,8 +3477,9 @@ describe('AgentsViewController — dispatch editor mount', () => {
   });
 });
 
-describe('AgentsViewController — Esc on the slash menu clears the composer (B11)', () => {
+describe('AgentsViewController — Esc on the slash menu clears the composer (B11, narrowed by I4)', () => {
   let dir: string | undefined;
+  let extraDir: string | undefined;
   afterEach(async () => {
     if (dir !== undefined) {
       // maxRetries: a fire-and-forget persistState can still be mid-write
@@ -3482,6 +3487,10 @@ describe('AgentsViewController — Esc on the slash menu clears the composer (B1
       await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
     }
     dir = undefined;
+    if (extraDir !== undefined) {
+      await rm(extraDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
+    extraDir = undefined;
   });
 
   /** Same wait shape the @-mention functional test uses: the autocomplete
@@ -3534,6 +3543,47 @@ describe('AgentsViewController — Esc on the slash menu clears the composer (B1
     expect(b.view().dispatch.editor.isShowingAutocomplete()).toBe(false);
     expect(b.view().replyTargetId).toBe('s1');
     expect(b.view().dispatch.editor.getText()).toBe('/mo');
+  });
+
+  // I4: hasAutocompleteActivity() (the editor's own Esc-routing gate) is
+  // true for an open dropdown AND for a pending debounce/abort timer — so
+  // this hook also fires for a mid-sentence @-mention and for a keystroke
+  // still inside the debounce window. B11's own stated scope is the slash
+  // menu only ("`/` and whatever else was typed keeps sitting in the
+  // composer") — a draft that isn't itself a slash command in progress
+  // must survive Esc here.
+  it('I4: Esc dismissing a mid-sentence @-mention dropdown closes it but preserves the whole draft', async () => {
+    const workDir = await mkdtemp(join(tmpdir(), 'agents-view-i4-mention-'));
+    extraDir = workDir;
+    await writeFile(join(workDir, 'readme.md'), '# hi');
+    const b = await boot([summary('s1')], { workDir });
+    dir = b.homeDir;
+
+    for (const ch of 'fix the bug in @') b.component().handleInput(ch);
+    await waitForAutocomplete();
+    expect(b.view().dispatch.editor.isShowingAutocomplete()).toBe(true);
+
+    b.component().handleInput(ESC);
+
+    expect(b.view().dispatch.editor.isShowingAutocomplete()).toBe(false);
+    // The draft is not a slash command — B11's scope — so it survives whole.
+    expect(b.view().dispatch.editor.getText()).toBe('fix the bug in @');
+  });
+
+  it('I4: Esc landing inside the debounce window (nothing shown yet) preserves the draft', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+
+    // No waitForAutocomplete(): the debounce timer is armed but hasn't
+    // fired yet — hasAutocompleteActivity() is already true (a pending
+    // timer counts, not just a visible dropdown), so this exercises the
+    // same Esc-routing gate before anything is on screen.
+    for (const ch of 'fix the bug in @') b.component().handleInput(ch);
+    expect(b.view().dispatch.editor.isShowingAutocomplete()).toBe(false);
+
+    b.component().handleInput(ESC);
+
+    expect(b.view().dispatch.editor.getText()).toBe('fix the bug in @');
   });
 });
 

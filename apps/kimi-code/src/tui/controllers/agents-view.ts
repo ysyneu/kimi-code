@@ -622,15 +622,26 @@ export class AgentsViewController {
     };
     // B11: Esc closing the slash/@-mention dropdown never reaches `onEscape`
     // above (pi-tui's own hasAutocompleteActivity() gate intercepts it
-    // first) — without this the menu closes but `/` and whatever else was
-    // typed keeps sitting in the composer. Scoped to the plain "new
+    // first and always closes the dropdown itself before this fires — see
+    // `CustomEditor.handleInput`'s Esc branch). Scoped to the plain "new
     // session" composer: reply mode has no slash-command surface
     // (`parseReplyInput` never interprets `/`) and clearing an in-progress
     // reply out from under the user is not this item's concern.
+    //
+    // I4: `hasAutocompleteActivity()` is true for an open dropdown AND for
+    // a pending debounce/abort timer with nothing on screen yet — so this
+    // also fires mid-sentence, e.g. `fix the bug in @src/x` while the
+    // `@`-mention menu is still resolving. B11's own stated scope is the
+    // slash menu specifically ("the menu closes but `/` and whatever else
+    // was typed keeps sitting in the composer" — this comment's own
+    // pre-fix wording), so the whole-buffer wipe only belongs to that case:
+    // clear only when the draft is itself a slash command in progress: a
+    // mid-sentence `@`-mention dismissal or a debounce-pending Esc must
+    // preserve the draft instead.
     dispatch.editor.onEscapeAutocompleteCancel = () => {
       const view = this.host.state.agentsView;
-      if (view !== undefined && view.replyTargetId !== undefined) return;
-      dispatch.editor.setText('');
+      if (view === undefined || view.replyTargetId !== undefined) return;
+      if (dispatch.editor.getText().trim().startsWith('/')) dispatch.editor.setText('');
     };
     // B8: → on an EMPTY composer attaches to the selected row — the same
     // `handleOpen` Enter/→ on the row itself already calls, just reached
