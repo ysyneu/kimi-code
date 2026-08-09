@@ -1303,7 +1303,7 @@ describe('AgentsViewController — rename', () => {
     expect(b.view().renameDraft).toBeUndefined();
   });
 
-  it('a failed rename rolls the row title back and reports the error', async () => {
+  it('a failed rename rolls the row title back and flashes the error on the mounted roster', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
     b.fake.renameSession.mockRejectedValueOnce(new Error('rename broke'));
@@ -1312,7 +1312,10 @@ describe('AgentsViewController — rename', () => {
     b.component().handleInput('X');
     b.component().handleInput(ENTER);
     await flush();
-    expect(b.showError).toHaveBeenCalledWith(expect.stringContaining('rename broke'));
+    // The roster owns the screen here — the error must land on its own
+    // visible flash line, not in the detached chat transcript.
+    expect(b.view().flashMessage).toContain('rename broke');
+    expect(b.showError).not.toHaveBeenCalled();
     expect(b.render()).toContain('s1 title');
     expect(b.render()).not.toContain('s1 titleX');
   });

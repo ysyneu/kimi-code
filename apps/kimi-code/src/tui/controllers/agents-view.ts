@@ -1851,9 +1851,9 @@ export class AgentsViewController {
     } catch (error) {
       if (this.host.state.agentsView !== view) return;
       view.roster.setTitle(id, previousTitle);
-      this.host.showError(
-        `Rename failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      this.notifyUser(view, `Rename failed: ${error instanceof Error ? error.message : String(error)}`, {
+        error: true,
+      });
       this.pushProps();
     }
   }
