@@ -989,6 +989,10 @@ describe('AgentsViewApp — pin / help / quit', () => {
     expect(opened).toContain('@ to mention');
     // A6: ctrl+s now cycles the roster's grouping mode.
     expect(opened).toContain('ctrl+s to switch views');
+    // M2: esc closes the grid (see the test below) — the grid's own hint
+    // must say so, not claim it quits the view.
+    expect(opened).toContain('esc to close');
+    expect(opened).not.toContain('esc to quit');
 
     app.handleInput('?');
     expect(onHelpToggle).toHaveBeenCalledTimes(2);

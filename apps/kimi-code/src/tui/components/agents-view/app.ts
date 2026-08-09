@@ -345,7 +345,10 @@ const HELP_GRID: readonly (readonly (HelpCell | undefined)[])[] = [
     ['alt+1-9', 'to open'],
     ['space', 'to reply'],
     ['@', 'to mention'],
-    ['esc', 'to quit'],
+    // M2: Esc while the grid is open closes the grid (see `handleInput`'s
+    // `helpVisible` branch) — it does not quit the view. `?` below is the
+    // grid's other close key; this is honest about the other one.
+    ['esc', 'to close'],
   ],
   [
     ['ctrl+r', 'to rename'],
