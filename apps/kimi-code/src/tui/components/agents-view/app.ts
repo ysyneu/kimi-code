@@ -854,7 +854,7 @@ export class AgentsViewApp extends Container implements Focusable {
         working > 0 ? ` · ${String(working)} agent${working === 1 ? '' : 's'} will keep running` : '';
       left = compose(currentTheme.boldFg('warning', CTRL_C_HINT + runningNote));
     } else if (this.draftFor(this.props.renameDraft?.sessionId ?? this.rename?.id ?? '') !== undefined) {
-      left = compose(hint('enter', 'to submit'), hint('esc', 'to cancel'));
+      left = compose(hint('enter', 'to save'), hint('esc', 'to cancel'));
     } else if (this.props.dispatchFocused) {
       if (this.props.replyTargetId !== undefined) {
         // Panel open: empty input still offers "enter to open" (attach) and

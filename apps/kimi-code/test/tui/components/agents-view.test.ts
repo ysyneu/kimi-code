@@ -833,6 +833,13 @@ describe('AgentsViewApp — rename', () => {
     expect(out).toContain('draft text');
   });
 
+  it('the footer reads "enter to save · esc to cancel" while renaming (B9)', () => {
+    const out = render(makeApp({ groups, selectedId: 's1', renameDraft: { sessionId: 's1', text: 'draft text' } }));
+    expect(out).toContain('enter to save');
+    expect(out).toContain('esc to cancel');
+    expect(out).not.toContain('enter to submit');
+  });
+
   it('the rename-draft row also carries the selection background fill — rename can only start on the selected row, so it always applies (fix round 1)', () => {
     const previousChalkLevel = chalk.level;
     chalk.level = 3;
