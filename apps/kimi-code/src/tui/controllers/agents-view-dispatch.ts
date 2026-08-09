@@ -183,6 +183,20 @@ export class AgentsViewDispatch {
    *  checked in reply mode; see `EXIT_COMMANDS`. */
   onExit: (() => void) | undefined;
   /**
+   * B7: fires in place of `onSubmit` when Shift+Enter (not Enter) submits a
+   * PLAIN, non-slash dispatch — reuses `parseDispatchInput`, but only for
+   * the plain-text submission shape (`model`/`profile`/`activation` all
+   * undefined). A `/model`/`/agent`/skill/plugin dispatch, or any submission
+   * while `replying`, declines instead (see `handleShiftEnterSubmit`) so
+   * Shift+Enter keeps `editor`'s default newline-insert there — matching the
+   * A2 optimistic-placeholder carve-out (no placeholder for a slash
+   * dispatch; a reply still needs to be multi-line-capable). Wired to
+   * `editor.onShiftEnterSubmit`, whose `boolean` return tells the editor
+   * whether to clear itself (consumed) or leave the keystroke alone
+   * (declined).
+   */
+  onShiftEnterSubmit: ((parsed: DispatchSubmission) => void) | undefined;
+  /**
    * Set by the controller for the duration of reply mode (see
    * `AgentsViewController.onReplyRequest` / `exitReplyMode`). Switches
    * `handleEditorSubmit` from `parseDispatchInput` to `parseReplyInput` —
@@ -215,6 +229,7 @@ export class AgentsViewDispatch {
     this.editor.onSubmit = (raw) => {
       this.handleEditorSubmit(raw);
     };
+    this.editor.onShiftEnterSubmit = (raw) => this.handleShiftEnterSubmit(raw);
   }
 
   /** Whitelist slash completion; the array is pre-filtered by the caller. */
@@ -248,5 +263,25 @@ export class AgentsViewDispatch {
       return;
     }
     this.onSubmit?.(parsed);
+  }
+
+  /**
+   * `editor.onShiftEnterSubmit`'s callback: `true` = consumed (the editor
+   * clears its own text), `false` = declined (the keystroke falls through
+   * to the editor's default newline-insert). Declines silently — never
+   * `onError` — so a Shift+Enter that doesn't qualify behaves exactly like
+   * it always has (just a newline), not a surprise error toast mid-typing.
+   */
+  private handleShiftEnterSubmit(raw: string): boolean {
+    if (this.onShiftEnterSubmit === undefined) return false;
+    if (this.replying) return false;
+    if (EXIT_COMMANDS.has(raw.trim())) return false;
+    const parsed = parseDispatchInput(raw, this.getActivatableCommands());
+    if ('error' in parsed) return false;
+    if (parsed.model !== undefined || parsed.profile !== undefined || parsed.activation !== undefined) {
+      return false;
+    }
+    this.onShiftEnterSubmit(parsed);
+    return true;
   }
 }

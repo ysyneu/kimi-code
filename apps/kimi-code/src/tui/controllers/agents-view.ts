@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import { parseIntegerEnv } from '@moonshot-ai/agent-core-v2';
 import type { Event, KimiHarness, Unsubscribe, WireSession } from '@moonshot-ai/kimi-code-sdk';
 import type { Component, Container, ProcessTerminal, TUI } from '@moonshot-ai/pi-tui';
@@ -307,6 +309,27 @@ const DISPATCH_AGENT_COMMAND: KimiSlashCommand = {
 const DISPATCH_BUILTIN_WHITELIST: ReadonlySet<string> = new Set(['model']);
 
 /**
+ * Prefix for the client-fabricated id an optimistic dispatch placeholder
+ * (A2) carries until `handleDispatch` learns the real session id — never
+ * sent to the SDK, never persisted (it never touches `viewSessions`/
+ * `pins`/`seenAt`), purely a local `AgentsRoster` row key. A colon-bearing
+ * prefix keeps it visibly distinct from any real session id (see the
+ * `wireRow`/`summary` id shapes throughout this module's own tests — plain
+ * slugs, never containing `:`).
+ */
+const PENDING_DISPATCH_ID_PREFIX = 'pending-dispatch:';
+
+function isPendingDispatchId(id: string): boolean {
+  return id.startsWith(PENDING_DISPATCH_ID_PREFIX);
+}
+
+/** Shown when a row action targets a placeholder still waiting on its real
+ *  session id (`isPendingDispatchId`) — every action that needs a REAL
+ *  session (open/reply/rename/pin/delete) declines with this hint instead
+ *  of acting on a fabricated id. */
+const DISPATCHING_HINT = 'Still dispatching — try again in a moment';
+
+/**
  * The dispatch autocomplete whitelist: `/model` filtered out of
  * `BUILTIN_SLASH_COMMANDS` (its copy is not reinvented here, only its
  * argument completion is added), the dispatch-local `/agent` item, and every
@@ -458,6 +481,13 @@ export class AgentsViewController {
         return;
       }
       void this.handleDispatch(submission);
+    };
+    // B7: shift+Enter never targets a reply (see `AgentsViewDispatch.
+    // handleShiftEnterSubmit`'s own `replying` guard) — identical dispatch,
+    // then attach the moment the real session id exists (see
+    // `handleDispatch`'s `attach` option).
+    dispatch.onShiftEnterSubmit = (submission) => {
+      void this.handleDispatch(submission, { attach: true });
     };
     dispatch.onError = (message) => {
       const view = this.host.state.agentsView;
@@ -740,10 +770,35 @@ export class AgentsViewController {
    * config, so they never reach `createSession`. A staged skill/plugin
    * activation instead calls `activateSkill`/`activatePluginCommand` in
    * place of `prompt` — neither is literal text the model should see
-   * verbatim (see `DispatchActivation`'s doc comment). The new roster row
-   * arrives on its own via the `event.session.created` subscription.
+   * verbatim (see `DispatchActivation`'s doc comment).
+   *
+   * A2 optimistic placeholder: for a PLAIN, non-slash submission (`model`/
+   * `profile`/`activation` all undefined — a `/model`/`/agent`/skill/plugin
+   * dispatch keeps the pre-A2 behaviour, matching the task brief's own
+   * carve-out) a local row is inserted into the roster SYNCHRONOUSLY, before
+   * the `createSession` await — busy (spinner), selected, named after the
+   * raw prompt text — so the row is on screen the instant Enter is pressed
+   * instead of waiting 1–30s for the server's own `event.session.created`
+   * echo. Once `createSession` resolves, the placeholder is promoted IN
+   * PLACE to the real session id (`AgentsRoster.upsertLocalRow`'s own doc
+   * explains why this alone prevents a double row: `Map.set` on a key
+   * already in the map overwrites, so a same-id echo arriving afterward just
+   * refreshes the same entry). A `createSession` failure removes the
+   * placeholder instead of leaving a dead row behind — same "Dispatch
+   * failed: …" flash the pre-A2 failure path already used, chosen over an
+   * in-row failed-glyph because a placeholder has no server-side session to
+   * retry or delete.
+   *
+   * `options.attach` (B7 — shift+Enter): once the real id is known, attaches
+   * to it immediately via the same `host.onOpenSession` path a manual Enter/
+   * → on a roster row uses — the placeholder bridges the roster view for
+   * however long `createSession` takes, then the view hands off to attach
+   * the moment it can.
    */
-  private async handleDispatch(submission: DispatchSubmission): Promise<void> {
+  private async handleDispatch(
+    submission: DispatchSubmission,
+    options: { attach?: boolean } = {},
+  ): Promise<void> {
     const view = this.host.state.agentsView;
     if (view === undefined) return;
     // Validate before mutate: `Session.prompt` carries no overrides — the
@@ -757,18 +812,77 @@ export class AgentsViewController {
       this.flash('Dispatch failed: /model and /agent overrides require the wire transport');
       return;
     }
+
+    const isPlainDispatch =
+      submission.model === undefined && submission.profile === undefined && submission.activation === undefined;
+    let placeholderId: string | undefined;
+    if (isPlainDispatch) {
+      placeholderId = `${PENDING_DISPATCH_ID_PREFIX}${randomUUID()}`;
+      view.roster.upsertLocalRow({
+        id: placeholderId,
+        title: submission.text,
+        workDir: this.host.agentsViewWorkDir(),
+        updatedAt: Date.now(),
+        busy: true,
+      });
+      view.selectedId = placeholderId;
+      this.syncBusyTicker();
+      this.pushProps();
+    }
+
+    let session: Awaited<ReturnType<KimiHarness['createSession']>>;
     try {
-      const session = await this.host.harness.createSession({
+      session = await this.host.harness.createSession({
         workDir: this.host.agentsViewWorkDir(),
       });
-      // Register BEFORE the first RPC call: the server's
-      // `event.session.created` echo only enters the roster when the id is
-      // already in the view's registry. The new row is pre-selected so the
-      // dispatch is visibly confirmed the moment it lands.
-      view.viewSessions.add(session.id);
-      void this.persistState(view);
+    } catch (error) {
+      if (this.host.state.agentsView !== view) return;
+      if (placeholderId !== undefined) {
+        view.roster.remove(placeholderId);
+        if (view.selectedId === placeholderId) view.selectedId = undefined;
+        this.syncBusyTicker();
+      }
+      this.flash(`Dispatch failed: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+
+    // Register BEFORE the first RPC call: the server's
+    // `event.session.created` echo only enters the roster when the id is
+    // already in the view's registry.
+    view.viewSessions.add(session.id);
+    void this.persistState(view);
+    if (placeholderId !== undefined) {
+      view.roster.remove(placeholderId);
+      view.roster.upsertLocalRow({
+        id: session.id,
+        title: submission.text,
+        workDir: this.host.agentsViewWorkDir(),
+        updatedAt: Date.now(),
+        busy: true,
+      });
+      if (view.selectedId === placeholderId) view.selectedId = session.id;
+    } else {
+      // The new row is pre-selected so the dispatch is visibly confirmed the
+      // moment it lands — the slash-command paths have no placeholder to
+      // promote, so this is the first time `selectedId` moves onto it.
       view.selectedId = session.id;
-      this.pushProps();
+    }
+    this.pushProps();
+
+    if (options.attach === true) {
+      // Same "no attach seam" fallback `onOpen` already uses — B7 is the
+      // same attach contract, just reached via shift+Enter instead of a
+      // second Enter on the row.
+      if (this.host.onOpenSession !== undefined) {
+        view.roster.markSeen(session.id);
+        void this.persistState(view);
+        this.host.onOpenSession(session.id);
+      } else {
+        this.host.showStatus('Attach is not available from this host');
+      }
+    }
+
+    try {
       const { activation } = submission;
       if (activation !== undefined) {
         if (activation.kind === 'skill') {
@@ -1063,6 +1177,12 @@ export class AgentsViewController {
           this.pushProps();
           return;
         }
+        // A2 placeholder: has no real session behind it yet — attaching
+        // would hand the host an id no session actually owns.
+        if (isPendingDispatchId(id)) {
+          this.host.showStatus(DISPATCHING_HINT);
+          return;
+        }
         if (this.host.onOpenSession !== undefined) {
           // Attaching a row reaffirms its registry membership (in practice it
           // is already registered — the roster only lists registry rows).
@@ -1078,6 +1198,13 @@ export class AgentsViewController {
       onDeleteRequest: (id) => {
         const view = this.host.state.agentsView;
         if (view === undefined) return;
+        // A2 placeholder: nothing server-side to archive yet — see
+        // `handleDispatch`'s own failure path for how a placeholder that
+        // never becomes a real session is cleaned up instead.
+        if (isPendingDispatchId(id)) {
+          this.host.showStatus(DISPATCHING_HINT);
+          return;
+        }
         view.confirmDeleteId = id;
         this.pushProps();
       },
@@ -1092,6 +1219,10 @@ export class AgentsViewController {
         const view = this.host.state.agentsView;
         if (view === undefined) return;
         this.clearConfirm(view);
+        if (isPendingDispatchId(id)) {
+          this.host.showStatus(DISPATCHING_HINT);
+          return;
+        }
         const row = view.roster.get(id);
         if (row === undefined) return;
         view.renameDraft = { sessionId: id, text: row.title };
@@ -1102,6 +1233,16 @@ export class AgentsViewController {
         if (view === undefined) return;
         this.clearConfirm(view);
         view.renameDraft = undefined;
+        // A2 placeholder: `onRenameBegin` already declines starting a rename
+        // on one, but the component's OWN inline rename editor is a local
+        // toggle it can enter on any row without asking the controller
+        // first (`Ctrl+R` sets its `this.rename` unconditionally) — this is
+        // the backstop that keeps a rename typed against that local state
+        // from ever reaching `harness.renameSession` with a fabricated id.
+        if (isPendingDispatchId(id)) {
+          this.pushProps();
+          return;
+        }
         const row = view.roster.get(id);
         // Esc-cancel resubmits the original title: unchanged = cancel.
         if (row === undefined || text === row.title || text.trim() === '') {
@@ -1114,12 +1255,22 @@ export class AgentsViewController {
         const view = this.host.state.agentsView;
         if (view === undefined) return;
         this.clearConfirm(view);
+        // A2 placeholder: pinning would persist the fabricated id into the
+        // pins Set — it never survives the promotion to the real id.
+        if (isPendingDispatchId(id)) {
+          this.host.showStatus(DISPATCHING_HINT);
+          return;
+        }
         void this.handlePinToggle(id);
       },
       onReplyRequest: (id) => {
         const view = this.host.state.agentsView;
         if (view === undefined) return;
         this.clearConfirm(view);
+        if (isPendingDispatchId(id)) {
+          this.host.showStatus(DISPATCHING_HINT);
+          return;
+        }
         const row = view.roster.get(id);
         if (row === undefined) return;
         view.replyTargetId = id;
@@ -1197,12 +1348,18 @@ export class AgentsViewController {
   private async handleDelete(id: string): Promise<void> {
     const view = this.host.state.agentsView;
     if (view === undefined) return;
+    // `onDeleteRequest` already declines a bare placeholder id (see its own
+    // guard) — this only remains reachable via a GROUP delete below, where
+    // the filter is what actually matters: `deleteSession` has nothing
+    // server-side to archive for a row that hasn't become a real session yet.
+    if (isPendingDispatchId(id)) return;
 
     const ids: readonly string[] = id.startsWith('group:')
       ? (view.roster
           .groups(Number.MAX_SAFE_INTEGER)
           .find((group) => group.id === id.slice('group:'.length))
-          ?.rows.map((row) => row.id) ?? [])
+          ?.rows.map((row) => row.id)
+          .filter((rowId) => !isPendingDispatchId(rowId)) ?? [])
       : [id];
     if (ids.length === 0) return;
 

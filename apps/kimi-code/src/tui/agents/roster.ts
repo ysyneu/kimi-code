@@ -150,6 +150,39 @@ export class AgentsRoster {
     }
   }
 
+  /**
+   * Inserts or overwrites a single row from a LOCAL source — the agents-view
+   * controller's own optimistic dispatch placeholder (A2) and its
+   * placeholder→real-id promotion, never a server list/event. Reusing the
+   * SAME `id` on a later call (the promotion step: remove the placeholder
+   * id, upsert under the real one) is how a same-session
+   * `event.session.created` echo that lands afterward dedupes automatically
+   * — `Map.set` on a key already in use overwrites in place, it never grows
+   * a second entry. `pinned`/`unseen` are derived the same way every other
+   * seed path derives them, so a row landing under an id the caller already
+   * pinned or has already seen (never true for a fresh placeholder, but true
+   * once promoted to a real id the user pinned in an earlier session)
+   * behaves like any other row.
+   */
+  upsertLocalRow(row: {
+    readonly id: string;
+    readonly title: string;
+    readonly workDir: string;
+    readonly updatedAt: number;
+    readonly busy: boolean;
+  }): void {
+    this.rows.set(row.id, {
+      id: row.id,
+      title: row.title,
+      workDir: row.workDir,
+      updatedAt: row.updatedAt,
+      busy: row.busy,
+      pendingInteraction: 'none',
+      pinned: this.pins.has(row.id),
+      unseen: this.isUnseen(row.id, row.updatedAt),
+    });
+  }
+
   applyEvent(event: Event): void {
     switch (event.type) {
       case 'session.meta.updated': {

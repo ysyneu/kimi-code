@@ -168,6 +168,21 @@ export class CustomEditor extends Editor {
    */
   public onBashModeAttempt?: () => boolean;
   public onShiftTab?: () => void;
+  /**
+   * Opt-in Shift+Enter submit variant. pi-tui's own default for Shift+Enter
+   * is "insert a newline" (`tui.input.newLine`) — every OTHER editor
+   * instance (the main chat composer's `shift+enter: newline` tip) keeps
+   * that default because this stays `undefined` there. When set,
+   * Shift+Enter offers this hook FIRST: return `true` to consume the key
+   * (the editor then clears its own text — the same submit contract a plain
+   * Enter has) or `false` to decline, leaving the keystroke to fall through
+   * to the base editor's newline-insert unchanged. Used by the agents-view
+   * dispatch composer's B7 "dispatch + attach" shortcut
+   * (`AgentsViewDispatch`), which declines while replying to an existing
+   * session (so a reply can still be multi-line) or for a slash-command
+   * submission (no attach shortcut for those).
+   */
+  public onShiftEnterSubmit?: (text: string) => boolean;
   /** 'bash' when entering a `!` shell command. The `!` is never part of the
    *  text buffer — it is a separate mode + prompt symbol (see handleInput). */
   public inputMode: 'prompt' | 'bash' = 'prompt';
@@ -556,6 +571,20 @@ export class CustomEditor extends Editor {
     // fall through so pi-tui can still accept the selected item with Tab.
     if (matchesKey(normalized, Key.tab) && !this.isShowingAutocomplete()) {
       return;
+    }
+
+    // Shift+Enter: offer the opt-in submit variant before pi-tui's own
+    // newline-insert gets a chance to run. `getExpandedText` (not `getText`)
+    // matches what a plain Enter submits — paste markers expanded — so the
+    // two submit paths hand the callback identical text. A decline (no
+    // hook, empty buffer, or the hook itself returns `false`) falls through
+    // to `super.handleInput` below unchanged.
+    if (this.onShiftEnterSubmit !== undefined && matchesKey(normalized, 'shift+enter')) {
+      const text = this.getExpandedText().trim();
+      if (text.length > 0 && this.onShiftEnterSubmit(text)) {
+        this.setText('');
+        return;
+      }
     }
 
     // Enter bash mode: typing `!` at the start of an empty prompt. The `!` is
