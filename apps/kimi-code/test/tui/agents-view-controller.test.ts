@@ -1500,15 +1500,28 @@ describe('parseDispatchInput', () => {
     });
   });
 
-  it('any other slash command that is not a known skill/plugin command is rejected as session-only', () => {
+  it('B6: a slash command the registry knows but this composer cannot run gets the rejection toast', () => {
     expect(parseDispatchInput('/yolo fix the flaky test', EMPTY_ACTIVATABLE)).toEqual({
-      error: '"/yolo" is only available inside a session',
+      toast: "/yolo isn't available in agent view — attach to a session to run it",
     });
     expect(parseDispatchInput('/help', EMPTY_ACTIVATABLE)).toEqual({
-      error: '"/help" is only available inside a session',
+      toast: "/help isn't available in agent view — attach to a session to run it",
     });
+  });
+
+  it("B6: a registry command's alias also resolves to the toast, named as typed", () => {
+    // 'help' registers 'h' and '?' as aliases (commands/registry.ts).
+    expect(parseDispatchInput('/h', EMPTY_ACTIVATABLE)).toEqual({
+      toast: "/h isn't available in agent view — attach to a session to run it",
+    });
+  });
+
+  it('B6: a slash token that matches no known command, skill or plugin is plain dispatch text, not rejected', () => {
     expect(parseDispatchInput('/modelx fix the flaky test', EMPTY_ACTIVATABLE)).toEqual({
-      error: '"/modelx" is only available inside a session',
+      text: '/modelx fix the flaky test',
+    });
+    expect(parseDispatchInput('/gibberish do the thing', EMPTY_ACTIVATABLE)).toEqual({
+      text: '/gibberish do the thing',
     });
   });
 
@@ -1608,9 +1621,15 @@ describe('parseDispatchInput', () => {
       });
     });
 
-    it('an unknown command name still falls through to the session-only rejection, even with a non-empty activatable set', () => {
+    it('an unrecognized command name is plain dispatch text even with a non-empty activatable set', () => {
       expect(parseDispatchInput('/not-a-real-command fix it', activatable)).toEqual({
-        error: '"/not-a-real-command" is only available inside a session',
+        text: '/not-a-real-command fix it',
+      });
+    });
+
+    it('B6: a registry-known command still gets the toast, not a skill/plugin lookup miss', () => {
+      expect(parseDispatchInput('/compact', activatable)).toEqual({
+        toast: "/compact isn't available in agent view — attach to a session to run it",
       });
     });
   });
@@ -1661,9 +1680,25 @@ describe('AgentsViewDispatch — editor wiring', () => {
     const onError = vi.fn();
     dispatch.onSubmit = onSubmit;
     dispatch.onError = onError;
-    dispatch.editor.onSubmit?.('/yolo');
+    dispatch.editor.onSubmit?.('ab');
     expect(onSubmit).not.toHaveBeenCalled();
-    expect(onError).toHaveBeenCalledWith('"/yolo" is only available inside a session');
+    expect(onError).toHaveBeenCalledWith('Too short — describe the task');
+  });
+
+  it('B6: a known-but-unsuitable slash command goes to onError with the rejection toast, restores the composer text (pi-tui already cleared it pre-submit), and never reaches onSubmit', () => {
+    const dispatch = makeDispatch();
+    const onSubmit = vi.fn();
+    const onError = vi.fn();
+    dispatch.onSubmit = onSubmit;
+    dispatch.onError = onError;
+    // Mirrors real submitValue(): pi-tui clears the buffer before onSubmit fires.
+    dispatch.editor.setText('');
+    dispatch.editor.onSubmit?.('/yolo fix the flaky test');
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith(
+      "/yolo isn't available in agent view — attach to a session to run it",
+    );
+    expect(dispatch.editor.getText()).toBe('/yolo fix the flaky test');
   });
 
   it('exit or /exit in dispatch mode fires onExit instead of onSubmit/onError', () => {
@@ -2186,14 +2221,26 @@ describe('AgentsViewController — dispatch', () => {
     b.controller.close(); // clear the pending flash timer
   });
 
-  it('a rejected slash command flashes the error and creates nothing', async () => {
+  it('B6: a known-but-unsuitable slash command flashes the rejection toast, restores the composer text, and creates nothing', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
+    // Mirrors real submitValue(): pi-tui clears the buffer before onSubmit fires.
+    b.view().dispatch.editor.setText('');
     b.view().dispatch.editor.onSubmit?.('/yolo fix the flaky test');
     await flush();
     expect(b.fake.createSession).not.toHaveBeenCalled();
-    expect(b.render()).toContain('"/yolo" is only available inside a session');
+    expect(b.render()).toContain("/yolo isn't available in agent view — attach to a session to run it");
+    expect(b.view().dispatch.editor.getText()).toBe('/yolo fix the flaky test');
     b.controller.close(); // clear the pending flash timer
+  });
+
+  it('B6: an unrecognized /gibberish string dispatches as plain text (no toast, no rejection)', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.view().dispatch.editor.onSubmit?.('/gibberish fix the flaky test');
+    await flush();
+    expect(b.fake.createSession).toHaveBeenCalledTimes(1);
+    expect(b.fake.createdSession.prompt).toHaveBeenCalledWith('/gibberish fix the flaky test');
   });
 
   it('too-short input flashes the Too short hint', async () => {

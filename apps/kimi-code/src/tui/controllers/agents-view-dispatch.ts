@@ -16,6 +16,7 @@
 
 import type { TUI } from '@moonshot-ai/pi-tui';
 
+import { findBuiltInSlashCommand } from '../commands/registry';
 import { resolveSkillCommand } from '../commands/resolve';
 import type { KimiSlashCommand } from '../commands/types';
 import { CustomEditor } from '../components/editor/custom-editor';
@@ -58,7 +59,19 @@ export interface DispatchSubmission {
   readonly activation?: DispatchActivation;
 }
 
-export type DispatchParseResult = DispatchSubmission | { readonly error: string };
+/**
+ * B6: a command name that positively resolves against the builtin registry
+ * (`findBuiltInSlashCommand` — name or alias) but isn't in this composer's
+ * runnable set (`/model`/`/agent`/a resolved skill or plugin command, all
+ * handled before this ever gets returned). Distinct from `error` so the
+ * caller can react differently: the composer text is restored instead of
+ * staying cleared, and the message is the fixed rejection toast copy, not a
+ * generic parse error.
+ */
+export type DispatchParseResult =
+  | DispatchSubmission
+  | { readonly error: string }
+  | { readonly toast: string };
 
 /** `Too short` floor: at least this many non-space characters. */
 const MIN_NON_SPACE_CHARS = 3;
@@ -101,12 +114,17 @@ function resolveDispatchActivation(
  * override for the first prompt; a leading skill or plugin-command name
  * (resolved against `activatable`, the same maps the main chat's own
  * dispatcher uses) stages a skill/plugin activation instead — see
- * `DispatchActivation`. Any other leading slash command only exists inside a
- * session and is rejected, as is empty / near-empty input. `/model` or
- * `/agent` with no argument is rejected with a command-specific usage hint
- * rather than falling through to the generic too-short message. Skill/
- * plugin-command args carry no minimum length (matching the main chat, which
- * applies none either — many skills take no arguments at all).
+ * `DispatchActivation`. A leading slash command that positively resolves
+ * against the builtin registry (`findBuiltInSlashCommand` — name or alias)
+ * but isn't runnable from this composer (B6) is rejected with a `toast`
+ * result naming it. Anything else starting with `/` isn't a command we can
+ * identify at all — rather than reject text that only happens to start with
+ * a slash (a path, a stray character), it's treated as ordinary prompt text,
+ * same as if there were no leading slash. `/model` or `/agent` with no
+ * argument is rejected with a command-specific usage hint rather than
+ * falling through to the generic too-short message. Skill/plugin-command
+ * args carry no minimum length (matching the main chat, which applies none
+ * either — many skills take no arguments at all).
  */
 export function parseDispatchInput(
   raw: string,
@@ -121,21 +139,26 @@ export function parseDispatchInput(
     const spaceIndex = trimmed.search(/\s/);
     const command = spaceIndex === -1 ? trimmed : trimmed.slice(0, spaceIndex);
     const rest = spaceIndex === -1 ? '' : trimmed.slice(spaceIndex).trim();
-    if (command !== '/model' && command !== '/agent') {
+    if (command === '/model' || command === '/agent') {
+      const argSpaceIndex = rest.search(/\s/);
+      const argument = argSpaceIndex === -1 ? rest : rest.slice(0, argSpaceIndex);
+      text = argSpaceIndex === -1 ? '' : rest.slice(argSpaceIndex).trim();
+      if (argument === '') {
+        const placeholder = command === '/model' ? '<alias>' : '<profile>';
+        const noun = command === '/model' ? 'model alias' : 'profile name';
+        return { error: `${command} needs a ${noun} and a task — ${command} ${placeholder} <task>` };
+      }
+      if (command === '/model') model = argument;
+      else profile = argument;
+    } else {
       const activation = resolveDispatchActivation(command.slice(1), rest, activatable);
       if (activation !== undefined) return { text: '', activation };
-      return { error: `"${command}" is only available inside a session` };
+      if (findBuiltInSlashCommand(command.slice(1)) !== undefined) {
+        return { toast: `${command} isn't available in agent view — attach to a session to run it` };
+      }
+      // Not a command we recognize at all — literal prompt text, `text`
+      // already holds the whole trimmed line.
     }
-    const argSpaceIndex = rest.search(/\s/);
-    const argument = argSpaceIndex === -1 ? rest : rest.slice(0, argSpaceIndex);
-    text = argSpaceIndex === -1 ? '' : rest.slice(argSpaceIndex).trim();
-    if (argument === '') {
-      const placeholder = command === '/model' ? '<alias>' : '<profile>';
-      const noun = command === '/model' ? 'model alias' : 'profile name';
-      return { error: `${command} needs a ${noun} and a task — ${command} ${placeholder} <task>` };
-    }
-    if (command === '/model') model = argument;
-    else profile = argument;
   }
 
   if (text.replaceAll(/\s/g, '').length < MIN_NON_SPACE_CHARS) {
@@ -258,6 +281,14 @@ export class AgentsViewDispatch {
     const parsed = this.replying
       ? parseReplyInput(raw)
       : parseDispatchInput(raw, this.getActivatableCommands());
+    if ('toast' in parsed) {
+      // B6: known command, not runnable here — nothing dispatches, and
+      // unlike a generic error the composer gets its (already-cleared-by-
+      // pi-tui) text back so the user can edit it.
+      this.editor.setText(raw);
+      this.onError?.(parsed.toast);
+      return;
+    }
     if ('error' in parsed) {
       this.onError?.(parsed.error);
       return;
@@ -277,7 +308,7 @@ export class AgentsViewDispatch {
     if (this.replying) return false;
     if (EXIT_COMMANDS.has(raw.trim())) return false;
     const parsed = parseDispatchInput(raw, this.getActivatableCommands());
-    if ('error' in parsed) return false;
+    if ('error' in parsed || 'toast' in parsed) return false;
     if (parsed.model !== undefined || parsed.profile !== undefined || parsed.activation !== undefined) {
       return false;
     }
