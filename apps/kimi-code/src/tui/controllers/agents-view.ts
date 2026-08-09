@@ -608,6 +608,20 @@ export class AgentsViewController {
       const view = this.host.state.agentsView;
       if (view !== undefined) this.closeReplyPanel(view);
     };
+    // B8: → on an EMPTY composer attaches to the selected row — the same
+    // `handleOpen` Enter/→ on the row itself already calls, just reached
+    // from inside the composer instead of the list. No selection (or a
+    // reply-mode composer, which has its own empty-Enter attach path via
+    // `handleReplyPanelKey`) declines and lets pi-tui's own empty-buffer
+    // cursor-right no-op run.
+    dispatch.editor.onRightArrowEmpty = () => {
+      const view = this.host.state.agentsView;
+      if (view === undefined || view.replyTargetId !== undefined) return false;
+      const id = view.selectedId;
+      if (id === undefined) return false;
+      this.handleOpen(id);
+      return true;
+    };
 
     this.host.setAgentsView({
       component,
@@ -1408,6 +1422,55 @@ export class AgentsViewController {
     this.pushProps();
   }
 
+  /**
+   * The single "open" handler for an id from the roster: a row attaches
+   * (hands off to `host.onOpenSession`), `more:completed` expands the
+   * truncated Completed band, and a `group:<id>` toggles that group's
+   * collapse — same three-way dispatch Enter/→ on the list already used
+   * inline here before B8 extracted it. `AgentsViewProps.onOpen` (Enter/→ on
+   * a row or header, alt+1..9, the reply panel's empty-Enter) and the
+   * dispatch composer's B8 →-on-empty hook (`AgentsViewHost.show`'s
+   * `dispatch.editor.onRightArrowEmpty`) both call this directly — one
+   * attach entry point, not a parallel implementation.
+   */
+  private handleOpen(id: string): void {
+    const view = this.host.state.agentsView;
+    if (view === undefined) return;
+    this.clearDeleteOverlays(view);
+    if (id === 'more:completed') {
+      view.completedExpanded = true;
+      this.pushProps();
+      return;
+    }
+    if (id.startsWith('group:')) {
+      const groupId = id.slice('group:'.length);
+      if (view.collapsedGroups.has(groupId)) view.collapsedGroups.delete(groupId);
+      else view.collapsedGroups.add(groupId);
+      this.pushProps();
+      return;
+    }
+    // A2 placeholder: has no real session behind it yet — attaching
+    // would hand the host an id no session actually owns.
+    if (isPendingDispatchId(id)) {
+      this.host.showStatus(DISPATCHING_HINT);
+      return;
+    }
+    if (this.host.onOpenSession !== undefined) {
+      // Attaching a row reaffirms its registry membership (in practice it
+      // is already registered — the roster only lists registry rows).
+      view.viewSessions.add(id);
+      // Opening a row is the only thing that clears its unseen bit.
+      view.roster.markSeen(id);
+      // B2: the footer's open→return verb flip — recorded at the point
+      // the attach actually succeeds, not on keypress.
+      this.attachedSessionIds.add(id);
+      void this.persistState(view);
+      this.host.onOpenSession(id);
+    } else {
+      this.host.showStatus('Attach is not available from this host');
+    }
+  }
+
   private buildCallbacks(): Pick<
     AgentsViewProps,
     | 'onSelect'
@@ -1434,41 +1497,7 @@ export class AgentsViewController {
         if (this.clearDeleteOverlays(view)) this.pushProps();
       },
       onOpen: (id) => {
-        const view = this.host.state.agentsView;
-        if (view === undefined) return;
-        this.clearDeleteOverlays(view);
-        if (id === 'more:completed') {
-          view.completedExpanded = true;
-          this.pushProps();
-          return;
-        }
-        if (id.startsWith('group:')) {
-          const groupId = id.slice('group:'.length);
-          if (view.collapsedGroups.has(groupId)) view.collapsedGroups.delete(groupId);
-          else view.collapsedGroups.add(groupId);
-          this.pushProps();
-          return;
-        }
-        // A2 placeholder: has no real session behind it yet — attaching
-        // would hand the host an id no session actually owns.
-        if (isPendingDispatchId(id)) {
-          this.host.showStatus(DISPATCHING_HINT);
-          return;
-        }
-        if (this.host.onOpenSession !== undefined) {
-          // Attaching a row reaffirms its registry membership (in practice it
-          // is already registered — the roster only lists registry rows).
-          view.viewSessions.add(id);
-          // Opening a row is the only thing that clears its unseen bit.
-          view.roster.markSeen(id);
-          // B2: the footer's open→return verb flip — recorded at the point
-          // the attach actually succeeds, not on keypress.
-          this.attachedSessionIds.add(id);
-          void this.persistState(view);
-          this.host.onOpenSession(id);
-        } else {
-          this.host.showStatus('Attach is not available from this host');
-        }
+        this.handleOpen(id);
       },
       onDeleteRequest: (id) => {
         const view = this.host.state.agentsView;

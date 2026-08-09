@@ -160,6 +160,14 @@ export class CustomEditor extends Editor {
    */
   public onLeftArrowEmpty?: () => boolean;
   /**
+   * Called when → is pressed in an empty editor. Return `true` to consume
+   * the key (e.g. agents-view roster composer, B8: attach to the selected
+   * row — same direction-of-travel as `onLeftArrowEmpty`'s return-to-roster,
+   * mirrored); return `false` to fall through to the editor default (a
+   * no-op on an empty buffer).
+   */
+  public onRightArrowEmpty?: () => boolean;
+  /**
    * Called when the user tries to enter bash (`!`) mode — the typed `!`
    * keystroke on an empty prompt, or a `!…` paste into one. Return `true`
    * to veto the mode switch (agents view: the wire surface has no one-shot
@@ -554,6 +562,13 @@ export class CustomEditor extends Editor {
       if (this.getText().length === 0 && this.onLeftArrowEmpty) {
         if (this.onLeftArrowEmpty()) return;
         // fall through: on an empty buffer pi-tui's cursor-left is a no-op
+      }
+    }
+
+    if (matchesKey(normalized, Key.right)) {
+      if (this.getText().length === 0 && this.onRightArrowEmpty) {
+        if (this.onRightArrowEmpty()) return;
+        // fall through: on an empty buffer pi-tui's cursor-right is a no-op
       }
     }
 

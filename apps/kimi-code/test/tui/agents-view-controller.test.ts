@@ -1311,6 +1311,78 @@ describe('AgentsViewController — arrow keys open the selected session', () => 
   });
 });
 
+describe('AgentsViewController — → on an empty composer attaches (B8)', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) {
+      // maxRetries: a fire-and-forget persistState can still be mid-write
+      // (ENOTEMPTY on rmdir) when the test body returns.
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
+    dir = undefined;
+  });
+
+  const BACKSPACE = String.fromCodePoint(127);
+
+  it('→ on an empty, focused composer attaches to the selected row — same path as Enter', async () => {
+    const onOpenSession = vi.fn();
+    const b = await boot([summary('s1')], { onOpenSession });
+    dir = b.homeDir;
+    b.component().handleInput(DOWN); // select row s1
+    b.component().handleInput('d'); // focus the composer
+    b.component().handleInput(BACKSPACE); // back to empty, still focused
+    expect(b.view().dispatch.editor.getText()).toBe('');
+    expect(b.view().dispatchFocused).toBe(true);
+
+    b.component().handleInput(RIGHT);
+
+    expect(onOpenSession).toHaveBeenCalledWith('s1');
+  });
+
+  it('→ with text in the composer keeps normal cursor behavior — no attach', async () => {
+    const onOpenSession = vi.fn();
+    const b = await boot([summary('s1')], { onOpenSession });
+    dir = b.homeDir;
+    b.component().handleInput(DOWN); // select row s1
+    for (const ch of 'fix') b.component().handleInput(ch);
+    expect(b.view().dispatch.editor.getText()).toBe('fix');
+
+    b.component().handleInput(RIGHT);
+
+    expect(onOpenSession).not.toHaveBeenCalled();
+    expect(b.view().dispatch.editor.getText()).toBe('fix');
+  });
+
+  it('→ on an empty, focused composer with nothing selected is a no-op', async () => {
+    const onOpenSession = vi.fn();
+    const b = await boot([summary('s1')], { onOpenSession });
+    dir = b.homeDir;
+    // Never navigated with ↑/↓ — view.selectedId is still undefined even
+    // though the list visually highlights its first item.
+    b.component().handleInput('d');
+    b.component().handleInput(BACKSPACE);
+
+    b.component().handleInput(RIGHT);
+
+    expect(onOpenSession).not.toHaveBeenCalled();
+  });
+
+  it('→ on an empty composer during a reply declines — the reply panel keeps its own empty-Enter attach path', async () => {
+    const onOpenSession = vi.fn();
+    const b = await boot([summary('s1')], { onOpenSession });
+    dir = b.homeDir;
+    b.component().handleInput(DOWN); // select row s1
+    b.component().handleInput(SPACE); // open the reply panel on s1
+    expect(b.view().replyTargetId).toBe('s1');
+    expect(b.view().dispatch.editor.getText()).toBe('');
+
+    b.component().handleInput(RIGHT);
+
+    expect(onOpenSession).not.toHaveBeenCalled();
+    expect(b.view().replyTargetId).toBe('s1');
+  });
+});
+
 describe('AgentsViewController — open', () => {
   let dir: string | undefined;
   afterEach(async () => {
