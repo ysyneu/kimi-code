@@ -12,11 +12,12 @@
  *
  * Deliberate wire-transport semantics:
  * - `closeSession` is a LOCAL DETACH ONLY (unsubscribe + drop the registered
- *   handlers + drop the bridge's dedupe/queued state) — no HTTP call, the
- *   server-side session stays alive and resumable, and a later reattach
- *   re-presents interactions that are still pending. The wire has no
- *   per-connection session-close verb, and the daemon owns the session
- *   lifetime.
+ *   handlers + drop the bridge's dedupe/queued state + drop any armed-but-
+ *   unsent permission override) — no HTTP call, the server-side session
+ *   stays alive and resumable, and a later reattach re-presents interactions
+ *   that are still pending. The wire has no per-connection session-close
+ *   verb, and the daemon owns the session lifetime. `deleteSession` drops
+ *   the same permission override.
  * - `deleteSession` maps to `:archive` (the wire's only session-removal verb).
  * - Turns and state reads map onto the prompts / status / messages REST
  *   surface: `steer` is submit-then-`prompts:steer`, `cancel` is `:abort`,
@@ -439,19 +440,23 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
 
   /**
    * Local detach ONLY — unsubscribe the event cursor, drop the registered
-   * interaction handlers, and forget the bridge's dedupe/queued state so a
-   * later reattach re-presents still-pending interactions. No HTTP call: the
-   * server-side session keeps running and stays resumable. This is the wire
-   * transport's core ownership rule.
+   * interaction handlers, forget the bridge's dedupe/queued state so a
+   * later reattach re-presents still-pending interactions, and drop any
+   * armed-but-unsent permission override (I9: it must not silently ride a
+   * prompt/steer sent after a reattach). No HTTP call: the server-side
+   * session keeps running and stays resumable. This is the wire transport's
+   * core ownership rule.
    */
   override async closeSession(input: SessionIdRpcInput): Promise<void> {
     await this.supervisor.unsubscribe(input.sessionId);
     this.clearSessionHandlers(input.sessionId);
     this.bridge.forgetSession(input.sessionId);
+    this.pendingPermissions.delete(input.sessionId);
   }
 
   override async deleteSession(input: SessionIdRpcInput): Promise<void> {
     await this.http.sessionAction(input.sessionId, 'archive');
+    this.pendingPermissions.delete(input.sessionId);
   }
 
   override async renameSession(input: RenameSessionInput): Promise<void> {

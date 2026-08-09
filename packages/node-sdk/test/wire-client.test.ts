@@ -988,6 +988,32 @@ describe('SDKRpcClientWire degrade surface', () => {
     await rpc.close();
   });
 
+  it('I9: closeSession (local detach) clears a deferred permission override — it does not silently ride a later reattach', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const { bodies, spy } = stubSubmitPrompt();
+    await rpc.setPermission({ sessionId: 's1', mode: 'yolo' });
+    await rpc.closeSession({ sessionId: 's1' });
+    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'after reattach' }] });
+    expect(bodies[0]?.permission_mode).toBeUndefined();
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('I9: deleteSession clears a deferred permission override too', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const { bodies, spy } = stubSubmitPrompt();
+    const sessionActionSpy = vi
+      .spyOn(WireHttpClient.prototype, 'sessionAction')
+      .mockResolvedValue(undefined);
+    await rpc.setPermission({ sessionId: 's1', mode: 'yolo' });
+    await rpc.deleteSession({ sessionId: 's1' });
+    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'after delete' }] });
+    expect(bodies[0]?.permission_mode).toBeUndefined();
+    sessionActionSpy.mockRestore();
+    spy.mockRestore();
+    await rpc.close();
+  });
+
   it('passes model/profile through on prompt and steer bodies', async () => {
     const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
     const { bodies, spy } = stubSubmitPrompt();
