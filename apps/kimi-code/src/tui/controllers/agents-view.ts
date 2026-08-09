@@ -38,6 +38,17 @@ export interface AgentsViewHost {
   setAgentsView(value: AgentsViewState | undefined): void;
   /** Header label for the connected kap-server: "embedded" or host:port. */
   agentsViewServerLabel(): string;
+  /**
+   * I6: true when closing the agents-view process leaves its sessions
+   * running server-side — false only in embedded mode, where quitting the
+   * CLI also ends the embedded server and interrupts whatever was in
+   * flight. Read once per `buildProps` call, same "read once, no I/O on
+   * the read path" footing as `agentsViewServerLabel`/`agentsViewWorkDir`.
+   * Drives the two mode-aware roster strings (Ctrl+C armed footer,
+   * empty-skeleton Working-band description) — the exit-confirm modal's
+   * own copy is already correct and untouched by this.
+   */
+  agentsViewSessionsSurviveExit(): boolean;
   /** Dispatch target: every session created from the view opens in this cwd. */
   agentsViewWorkDir(): string;
   /**
@@ -1328,6 +1339,7 @@ export class AgentsViewController {
       originId: view.originSessionId,
       attachedIds: this.attachedSessionIds,
       serverLabel: this.host.agentsViewServerLabel(),
+      sessionsSurviveExit: this.host.agentsViewSessionsSurviveExit(),
       modelLabel: this.host.agentsViewModelLabel(),
       confirmDeleteId: view.confirmDeleteId,
       armedDeleteId: view.armedDeleteId,

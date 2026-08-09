@@ -321,6 +321,9 @@ async function boot(
      *  path. A real directory is needed for `@`-mention autocomplete tests —
      *  `FileMentionProvider` falls back to a real filesystem scan. */
     workDir?: string;
+    /** I6: `host.agentsViewSessionsSurviveExit()`; defaults to `true` (the
+     *  non-embedded, common case). Set `false` to simulate embedded mode. */
+    sessionsSurviveExit?: boolean;
   } = {},
 ): Promise<Boot> {
   const homeDir = await mkdtemp(join(tmpdir(), 'agents-view-controller-'));
@@ -361,6 +364,7 @@ async function boot(
       state.agentsView = value;
     },
     agentsViewServerLabel: () => 'test-server',
+    agentsViewSessionsSurviveExit: () => opts.sessionsSurviveExit ?? true,
     agentsViewWorkDir: () => opts.workDir ?? '/home/user/project',
     agentsViewGroupMode: opts.agentsViewGroupMode ?? (() => opts.groupMode ?? 'state'),
     saveAgentsViewGroupMode:

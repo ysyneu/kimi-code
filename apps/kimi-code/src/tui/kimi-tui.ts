@@ -1634,6 +1634,16 @@ export class KimiTUI {
     return this.agentsViewServerLabelOverride ?? 'embedded';
   }
 
+  /**
+   * I6: true when closing the agents-view process leaves its sessions
+   * running server-side. `agentsViewExitGuard` is wired only in embedded
+   * mode — a separately-attached kap-server survives the CLI exiting, so
+   * every other mode's sessions genuinely keep running.
+   */
+  agentsViewSessionsSurviveExit(): boolean {
+    return this.agentsViewExitGuard === undefined;
+  }
+
   /** Dispatch cwd for sessions created from the agents view. */
   agentsViewWorkDir(): string {
     return this.state.appState.workDir;

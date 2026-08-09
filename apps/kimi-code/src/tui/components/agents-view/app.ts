@@ -146,6 +146,14 @@ export interface AgentsViewProps {
    *  by the header chrome (the header layout has no server-label slot),
    *  but kept on the props contract for the host wiring that supplies it. */
   readonly serverLabel: string;
+  /**
+   * I6: true when closing the agents-view process leaves its sessions
+   * running server-side — false only in embedded mode. Drives the Ctrl+C
+   * armed footer's keep-running note and the empty-skeleton Working-band
+   * description so neither promises a survival the current server mode
+   * doesn't back up.
+   */
+  readonly sessionsSurviveExit: boolean;
   /** Header label for the model new sessions dispatch with by default. */
   readonly modelLabel: string;
   /** Ctrl+X first-press target awaiting a second Ctrl+X — GROUP HEADERS
@@ -277,18 +285,29 @@ const MORE_ITEM_ID = 'more:completed';
  * the same headers the real bands would use once rows exist. No Pinned
  * entry: a zero-row roster can never have a pinned session either, so that
  * band never appears even outside the skeleton.
+ *
+ * I6: the Working band's description promises sessions "keep running even
+ * if you close the terminal" — true only when `sessionsSurviveExit`
+ * (`props.sessionsSurviveExit`); embedded mode drops that tail since
+ * quitting the CLI ends the embedded server and interrupts them instead.
  */
-const EMPTY_STATE_SKELETON: readonly { readonly label: string; readonly description: string }[] = [
-  {
-    label: GROUP_LABELS.awaiting,
-    description: 'Sessions that have a question or need your decision land here',
-  },
-  {
-    label: GROUP_LABELS.working,
-    description: 'Sessions Kimi is actively working on — they keep running even if you close the terminal',
-  },
-  { label: GROUP_LABELS.completed, description: 'Finished sessions wait here for you to review' },
-];
+function emptyStateSkeleton(
+  sessionsSurviveExit: boolean,
+): readonly { readonly label: string; readonly description: string }[] {
+  return [
+    {
+      label: GROUP_LABELS.awaiting,
+      description: 'Sessions that have a question or need your decision land here',
+    },
+    {
+      label: GROUP_LABELS.working,
+      description: sessionsSurviveExit
+        ? 'Sessions Kimi is actively working on — they keep running even if you close the terminal'
+        : 'Sessions Kimi is actively working on',
+    },
+    { label: GROUP_LABELS.completed, description: 'Finished sessions wait here for you to review' },
+  ];
+}
 
 /** B10: directory mode's own empty-roster line — no headers, just this. */
 const EMPTY_DIRECTORY_MESSAGE = 'no sessions yet';
@@ -820,7 +839,7 @@ export class AgentsViewApp extends Container implements Focusable {
       return [fitExactly(currentTheme.fg('textMuted', EMPTY_DIRECTORY_MESSAGE), width)];
     }
     const lines: string[] = [];
-    for (const band of EMPTY_STATE_SKELETON) {
+    for (const band of emptyStateSkeleton(this.props.sessionsSurviveExit)) {
       lines.push(renderGroupHeader(band.label, undefined, false, width));
       lines.push(renderSkeletonDescription(band.description, width));
     }
@@ -922,9 +941,14 @@ export class AgentsViewApp extends Container implements Focusable {
       // signal on screen while it's live. The keep-running count (B4) is
       // both buckets with a turn actually in flight or waiting on the user
       // (awaiting + working) — completed/idle rows never count.
+      //
+      // I6: "will keep running" is a survival promise only true when
+      // `sessionsSurviveExit` — embedded mode's sessions actually die with
+      // the CLI, so that mode gets a neutral "still running" instead.
       const keepRunning = this.props.counts.awaiting + this.props.counts.working;
-      const runningNote =
-        keepRunning > 0 ? ` · ${String(keepRunning)} agent${keepRunning === 1 ? '' : 's'} will keep running` : '';
+      const agentNoun = `agent${keepRunning === 1 ? '' : 's'}`;
+      const runningVerb = this.props.sessionsSurviveExit ? 'will keep running' : 'still running';
+      const runningNote = keepRunning > 0 ? ` · ${String(keepRunning)} ${agentNoun} ${runningVerb}` : '';
       left = compose(currentTheme.boldFg('warning', CTRL_C_ARM_HINT + runningNote));
     } else if (this.draftFor(this.props.renameDraft?.sessionId ?? this.rename?.id ?? '') !== undefined) {
       left = compose(hint('enter', 'to save'), hint('esc', 'to cancel'));

@@ -99,6 +99,7 @@ function makeProps(overrides: Partial<AgentsViewProps> = {}): AgentsViewProps {
     originId: undefined,
     attachedIds: new Set(),
     serverLabel: 'embedded',
+    sessionsSurviveExit: true,
     modelLabel: 'kimi-k2',
     confirmDeleteId: undefined,
     armedDeleteId: undefined,
@@ -531,6 +532,25 @@ describe('AgentsViewApp — empty-fleet skeleton (B10)', () => {
     expect(out).toContain('Finished sessions wait here for you to review');
     // No Pinned band — a zero-row roster can never have a pinned session.
     expect(out).not.toContain('Pinned');
+  });
+
+  // I6: embedded mode's sessions do NOT survive quitting — the Working
+  // band's description must not promise otherwise.
+  it('I6: embedded mode drops the survival tail from the Working band description', () => {
+    const out = render(
+      makeApp({ groups: [], emptyGroupsDisplay: 'skeleton', sessionsSurviveExit: false }),
+    );
+    expect(out).toContain('Sessions Kimi is actively working on');
+    expect(out).not.toContain('they keep running even if you close the terminal');
+  });
+
+  it('I6: non-embedded mode keeps the full survival description', () => {
+    const out = render(
+      makeApp({ groups: [], emptyGroupsDisplay: 'skeleton', sessionsSurviveExit: true }),
+    );
+    expect(out).toContain(
+      'Sessions Kimi is actively working on — they keep running even if you close the terminal',
+    );
   });
 
   it('the skeleton headers are non-interactive: ↑/↓/Enter/Ctrl+X are all no-ops', () => {
@@ -1175,6 +1195,31 @@ describe('AgentsViewApp — Ctrl+C reports to the controller (R4 parity, fix rou
     expect(out).toContain('Press Ctrl-C again to exit');
     expect(out).not.toContain('Press Ctrl+C again to exit');
     expect(out).toContain('3 agents will keep running');
+  });
+
+  // I6: "will keep running" is a survival promise the exit-confirm modal
+  // (embedded mode) directly contradicts on the very next screen — the
+  // armed footer must not make that promise in the mode where it's false.
+  it('I6: embedded mode ("still running", no survival promise)', () => {
+    const app = makeApp({
+      pendingExitArmed: true,
+      counts: { awaiting: 0, working: 3, completed: 0 },
+      sessionsSurviveExit: false,
+    });
+    const out = render(app);
+    expect(out).toContain('3 agents still running');
+    expect(out).not.toContain('will keep running');
+  });
+
+  it('I6: non-embedded mode keeps the survival promise ("will keep running")', () => {
+    const app = makeApp({
+      pendingExitArmed: true,
+      counts: { awaiting: 0, working: 3, completed: 0 },
+      sessionsSurviveExit: true,
+    });
+    const out = render(app);
+    expect(out).toContain('3 agents will keep running');
+    expect(out).not.toContain('still running');
   });
 
   it('omits the running-agent suffix when nothing is working or awaiting input', () => {
