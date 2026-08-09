@@ -303,6 +303,48 @@ describe('renderRosterRow — status glyph (busy / unseen / seen)', () => {
   });
 });
 
+describe('renderRosterRow — delete arm (B1)', () => {
+  function glyphAt(line: string): string {
+    return line.slice(2, 3);
+  }
+
+  it("deleteArm 'arming' replaces the summary with the arm text, leaving the glyph untouched", () => {
+    const line = strip(
+      renderRosterRow(row({ lastAssistantText: 'the answer is 42' }), false, false, 120, undefined, 'arming'),
+    );
+    expect(line).toContain('ctrl+x again to delete');
+    expect(line).not.toContain('the answer is 42');
+    // Idle row, no sendState — glyph is still the plain bullet, unaffected
+    // by the arm (only the summary column changes, see rows.ts's doc).
+    expect(glyphAt(line)).toBe('∙');
+  });
+
+  it("deleteArm 'stopped' replaces the summary with the stopped+arm text and leaves the busy spinner glyph alone", () => {
+    const line = strip(
+      renderRosterRow(row({ busy: true, lastAssistantText: 'epoch 3/10' }), false, false, 120, undefined, 'stopped'),
+    );
+    expect(line).toContain('stopped · ctrl+x again to delete');
+    expect(line).not.toContain('epoch 3/10');
+    // The glyph is NOT part of the arm override — still whatever busy says.
+    expect(spinnerFrames()).toContain(glyphAt(line));
+  });
+
+  it('deleteArm wins over a stale sendState "failed" summary/color when a row somehow carries both', () => {
+    const line = strip(
+      renderRosterRow(row({ lastAssistantText: 'the answer is 42' }), false, false, 120, 'failed', 'arming'),
+    );
+    expect(line).toContain('ctrl+x again to delete');
+    expect(line).not.toContain('reply failed');
+  });
+
+  it('no deleteArm leaves the row exactly as sendState/plain rendering already did', () => {
+    const armed = strip(renderRosterRow(row({ lastAssistantText: 'hi' }), false, false, 120, undefined, 'arming'));
+    const plain = strip(renderRosterRow(row({ lastAssistantText: 'hi' }), false, false, 120));
+    expect(armed).not.toBe(plain);
+    expect(plain).toContain('hi');
+  });
+});
+
 describe('renderRosterRow — selected vs isOrigin (independent styling flags)', () => {
   // The roster bolds the title on `isOrigin` ("the session you came from"),
   // never on cursor `selected` — the two used to be conflated onto

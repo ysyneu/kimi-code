@@ -633,3 +633,54 @@ describe('AgentsRoster — allRows', () => {
     expect(roster.allRows()).toEqual([]);
   });
 });
+
+describe('AgentsRoster — withFrozenRow (B1 delete-arm position freeze)', () => {
+  it("patches the row's busy/pendingInteraction/updatedAt for the duration of fn, restoring them after", () => {
+    const roster = new AgentsRoster(new Set());
+    roster.setAllRows([wireRow('a', { busy: true, updated_at: '2026-07-30T02:00:00.000Z' })]);
+    let seenDuring: { busy: boolean; updatedAt: number } | undefined;
+
+    roster.withFrozenRow('a', { busy: false, pendingInteraction: 'none', updatedAt: 500 }, () => {
+      seenDuring = { busy: roster.get('a')!.busy, updatedAt: roster.get('a')!.updatedAt };
+    });
+
+    expect(seenDuring).toEqual({ busy: false, updatedAt: 500 });
+    // Restored to the LIVE values once fn returns.
+    const after = roster.get('a')!;
+    expect(after.busy).toBe(true);
+    expect(after.updatedAt).toBe(Date.parse('2026-07-30T02:00:00.000Z'));
+  });
+
+  it("keeping the row's classification frozen busy=true stops its sole 'working' group from disappearing when fn reclassifies it idle", () => {
+    // Mirrors the real scenario: a busy row's optimistic stop already
+    // flipped `busy` false on the live row (would-fail-without-fix — see
+    // the assertion inside the callback below and the group check after).
+    const roster = new AgentsRoster(new Set());
+    roster.setAllRows([wireRow('a', { busy: false })]);
+    expect(groupIds(roster)).toEqual(['completed']); // no freeze yet: idle -> completed
+
+    const groupsDuring = roster.withFrozenRow(
+      'a',
+      { busy: true, pendingInteraction: 'none', updatedAt: roster.get('a')!.updatedAt },
+      () => roster.groups(),
+    );
+    expect(groupsDuring.map((g) => g.id)).toEqual(['working']);
+    expect(groupsDuring[0]?.rows.map((r) => r.id)).toEqual(['a']);
+
+    // Restored after — the live idle classification returns.
+    expect(groupIds(roster)).toEqual(['completed']);
+  });
+
+  it('returns fn()\'s result unchanged, and is a plain passthrough (still calls fn) for an id no longer in the roster', () => {
+    const roster = new AgentsRoster(new Set());
+    roster.setAllRows([wireRow('a')]);
+    roster.remove('a');
+    let called = false;
+    const result = roster.withFrozenRow('a', { busy: true, pendingInteraction: 'none', updatedAt: 1 }, () => {
+      called = true;
+      return 'sentinel';
+    });
+    expect(called).toBe(true);
+    expect(result).toBe('sentinel');
+  });
+});

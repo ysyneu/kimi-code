@@ -29,7 +29,7 @@ import {
 } from '@/tui/controllers/agents-view-dispatch';
 import type { AgentsGroupMode } from '@/tui/controllers/agents-view-groups';
 import { currentTheme } from '@/tui/theme';
-import { EXIT_CONFIRM_WINDOW_MS } from '#/tui/constant/kimi-tui';
+import { DELETE_ARM_WINDOW_MS, EXIT_CONFIRM_WINDOW_MS } from '#/tui/constant/kimi-tui';
 
 const ANSI_SGR = /\[[0-9;]*m/g;
 function strip(text: string): string {
@@ -128,6 +128,9 @@ interface FakeHarness {
   listSessions: ReturnType<typeof vi.fn>;
   resumeSession: ReturnType<typeof vi.fn>;
   deleteSession: ReturnType<typeof vi.fn>;
+  /** B1: the roster's Ctrl+X arm calls this (not `deleteSession`) to stop a
+   *  BUSY row's turn without archiving it. */
+  cancelSession: ReturnType<typeof vi.fn>;
   renameSession: ReturnType<typeof vi.fn>;
   // Explicitly Promise-returning — see `wirePrompt`'s own comment below: A2's
   // placeholder tests feed this `mockImplementationOnce` a
@@ -202,6 +205,7 @@ function makeHarness(
   const listSessions = vi.fn(async () => summaries);
   const resumeSession = vi.fn(async () => session as unknown as Session);
   const deleteSession = vi.fn(async () => {});
+  const cancelSession = vi.fn(async () => {});
   const renameSession = vi.fn(async () => {});
   const createSession = vi.fn(async () => createdSession as unknown as Session);
   const harness = {
@@ -209,6 +213,7 @@ function makeHarness(
     listSessions,
     resumeSession,
     deleteSession,
+    cancelSession,
     renameSession,
     createSession,
     wireRpc: () => wireRpc,
@@ -224,6 +229,7 @@ function makeHarness(
     listSessions,
     resumeSession,
     deleteSession,
+    cancelSession,
     renameSession,
     createSession,
     session,
@@ -586,16 +592,16 @@ describe('AgentsViewController — Ctrl+C two-stage exit confirm (fix round 1)',
     }
   });
 
-  it('a pending delete confirm still absorbs a confirming second Ctrl+C as a cancel, matching onQuit', async () => {
+  it('a pending row delete arm (B1) still absorbs a confirming second Ctrl+C as a cancel, matching onQuit', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
     b.component().handleInput(DOWN); // onto row s1
-    b.component().handleInput(CTRL_X); // arm delete-confirm on the selected row
-    expect(b.view().confirmDeleteId).toBe('s1');
+    b.component().handleInput(CTRL_X); // arms the row for delete
+    expect(b.view().armedDeleteId).toBe('s1');
     b.component().handleInput(CTRL_C); // arms the exit hint
     b.component().handleInput(CTRL_C); // confirming press
     expect(b.controller.isOpen).toBe(true);
-    expect(b.view().confirmDeleteId).toBeUndefined();
+    expect(b.view().armedDeleteId).toBeUndefined();
   });
 });
 
@@ -694,49 +700,6 @@ describe('AgentsViewController — delete', () => {
     dir = undefined;
   });
 
-  it('Ctrl+X twice archives the session and removes the row', async () => {
-    const b = await boot([summary('s1'), summary('s2')]);
-    dir = b.homeDir;
-    b.component().handleInput(DOWN); // onto row s1
-    b.component().handleInput(CTRL_X);
-    expect(b.view().confirmDeleteId).toBe('s1');
-    expect(b.render()).toContain('Archive session "s1 title"?');
-    b.component().handleInput(CTRL_X);
-    await flush();
-    expect(b.fake.deleteSession).toHaveBeenCalledWith('s1');
-    expect(b.view().confirmDeleteId).toBeUndefined();
-    expect(b.render()).not.toContain('s1 title');
-    expect(b.render()).toContain('s2 title');
-    // Archiving also drops the session from the persisted view registry.
-    await waitForViewState(b.homeDir, { pins: new Set(), sessions: new Set(['s2']) });
-  });
-
-  it('Esc during delete-confirm cancels the confirm instead of quitting', async () => {
-    const b = await boot([summary('s1')]);
-    dir = b.homeDir;
-    b.component().handleInput(DOWN);
-    b.component().handleInput(CTRL_X);
-    expect(b.view().confirmDeleteId).toBe('s1');
-    b.component().handleInput(ESC);
-    expect(b.controller.isOpen).toBe(true);
-    expect(b.view().confirmDeleteId).toBeUndefined();
-    expect(b.render()).not.toContain('Archive session');
-    expect(b.fake.deleteSession).not.toHaveBeenCalled();
-  });
-
-  it('any other action clears a pending delete confirm', async () => {
-    const b = await boot([summary('s1')]);
-    dir = b.homeDir;
-    b.component().handleInput(DOWN);
-    b.component().handleInput(CTRL_X);
-    expect(b.view().confirmDeleteId).toBe('s1');
-    b.component().handleInput(CTRL_T); // pin instead
-    await flush();
-    expect(b.view().confirmDeleteId).toBeUndefined();
-    expect(b.fake.deleteSession).not.toHaveBeenCalled();
-    await waitForViewState(b.homeDir, { pins: new Set(['s1']), sessions: new Set(['s1']) });
-  });
-
   it('Ctrl+X on a group header archives every row in the group', async () => {
     const b = await boot([summary('s1'), summary('s2')]);
     dir = b.homeDir;
@@ -778,6 +741,187 @@ describe('AgentsViewController — delete', () => {
     expect(b.view().replyFailures.has('s2')).toBe(false);
     expect(b.view().replyAttempts.has('s2')).toBe(false);
     expect(b.view().replyBarriers.has('s2')).toBe(false);
+  });
+});
+
+describe('AgentsViewController — row delete arm (B1)', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
+    dir = undefined;
+  });
+
+  it('first Ctrl+X on an idle row arms in place — row summary shows the arm text, no dialog', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(CTRL_X);
+    expect(b.view().armedDeleteId).toBe('s1');
+    expect(b.view().confirmDeleteId).toBeUndefined();
+    expect(b.view().armedDeleteStopped).toBe(false);
+    expect(b.fake.cancelSession).not.toHaveBeenCalled();
+    const out = b.render();
+    expect(out).toContain('ctrl+x again to delete');
+    expect(out).not.toContain('Archive session');
+    expect(out).not.toContain('stopped');
+  });
+
+  it('first Ctrl+X on a BUSY row stops the turn immediately AND arms — summary reads "stopped · ..."', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.fake.emit({ type: 'event.session.work_changed', sessionId: 's1', busy: true, pending_interaction: 'none' });
+    b.component().handleInput(DOWN); // onto s1, now in Working
+    b.component().handleInput(CTRL_X);
+    expect(b.view().armedDeleteId).toBe('s1');
+    expect(b.view().armedDeleteStopped).toBe(true);
+    expect(b.fake.cancelSession).toHaveBeenCalledWith('s1');
+    expect(b.fake.deleteSession).not.toHaveBeenCalled();
+    expect(b.render()).toContain('stopped · ctrl+x again to delete');
+  });
+
+  it('second Ctrl+X while armed archives the session and removes the row', async () => {
+    const b = await boot([summary('s1'), summary('s2')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN); // onto s1
+    b.component().handleInput(CTRL_X);
+    expect(b.view().armedDeleteId).toBe('s1');
+    expect(b.render()).toContain('ctrl+x again to delete');
+    b.component().handleInput(CTRL_X);
+    await flush();
+    expect(b.fake.deleteSession).toHaveBeenCalledWith('s1');
+    expect(b.view().armedDeleteId).toBeUndefined();
+    expect(b.render()).not.toContain('s1 title');
+    expect(b.render()).toContain('s2 title');
+    // Archiving also drops the session from the persisted view registry.
+    await waitForViewState(b.homeDir, { pins: new Set(), sessions: new Set(['s2']) });
+  });
+
+  it('Esc while armed cancels the arm instead of quitting', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(CTRL_X);
+    expect(b.view().armedDeleteId).toBe('s1');
+    b.component().handleInput(ESC);
+    expect(b.controller.isOpen).toBe(true);
+    expect(b.view().armedDeleteId).toBeUndefined();
+    expect(b.render()).not.toContain('ctrl+x again to delete');
+    expect(b.fake.deleteSession).not.toHaveBeenCalled();
+  });
+
+  it('any other action (e.g. pin) clears a pending row arm, same as it does the group confirm', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(CTRL_X);
+    expect(b.view().armedDeleteId).toBe('s1');
+    b.component().handleInput(CTRL_T); // pin instead
+    await flush();
+    expect(b.view().armedDeleteId).toBeUndefined();
+    expect(b.fake.deleteSession).not.toHaveBeenCalled();
+    await waitForViewState(b.homeDir, { pins: new Set(['s1']), sessions: new Set(['s1']) });
+  });
+
+  it('navigating with ↓ while armed disarms first, then still moves the selection (would fail without the disarm-then-apply order)', async () => {
+    const b = await boot([summary('s1'), summary('s2')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN); // onto s1
+    b.component().handleInput(CTRL_X); // arm s1
+    expect(b.view().armedDeleteId).toBe('s1');
+    b.component().handleInput(DOWN); // navigate away, onto s2
+    expect(b.view().armedDeleteId).toBeUndefined();
+    expect(b.view().selectedId).toBe('s2');
+  });
+
+  it('the arm auto-expires after DELETE_ARM_WINDOW_MS with zero further input, clearing state AND forcing a repaint', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    vi.useFakeTimers();
+    try {
+      b.component().handleInput(DOWN);
+      b.component().handleInput(CTRL_X);
+      expect(b.view().armedDeleteId).toBe('s1');
+      b.ui.requestRender.mockClear();
+
+      // No handleInput, no other action between arming and here — mirrors
+      // the Ctrl+C exit-hint autonomous-repaint test above (same shape: a
+      // component-local timer with no pi-tui repaint wouldn't survive this).
+      vi.advanceTimersByTime(DELETE_ARM_WINDOW_MS + 1);
+
+      expect(b.view().armedDeleteId).toBeUndefined();
+      expect(b.ui.requestRender).toHaveBeenCalled();
+      expect(b.fake.deleteSession).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a still-dispatching A2 placeholder declines Ctrl+X instead of arming (isPendingDispatchId guard)', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    let resolveCreate: (() => void) | undefined;
+    b.fake.createSession.mockImplementationOnce(
+      () =>
+        new Promise((res) => {
+          resolveCreate = () => res(b.fake.createdSession as unknown as Session);
+        }),
+    );
+    b.view().dispatch.editor.onSubmit?.('fix the flaky test');
+    const placeholderId = b.view().selectedId!;
+    expect(placeholderId).not.toBe('s1');
+
+    b.component().handleInput(CTRL_X);
+    expect(b.view().armedDeleteId).toBeUndefined();
+    expect(b.showStatus).toHaveBeenCalledWith('Still dispatching — try again in a moment');
+    expect(b.fake.cancelSession).not.toHaveBeenCalled();
+
+    resolveCreate?.();
+    await flush();
+  });
+
+  it("an armed row's group/position freezes across a refresh reseed that would otherwise re-bucket it (would fail without the freeze)", async () => {
+    const b = await boot([summary('s1'), summary('s2')], {
+      wire: true,
+      rows: [wireRow('s1', { busy: true }), wireRow('s2', { busy: false })],
+    });
+    dir = b.homeDir;
+    await flush(); // the one-shot trust load settles
+    b.component().handleInput(DOWN); // onto s1 (Working)
+    expect(b.view().selectedId).toBe('s1');
+    b.component().handleInput(CTRL_X); // arms + optimistically stops
+    expect(b.view().armedDeleteId).toBe('s1');
+    expect(b.render()).toContain('Working');
+
+    // The stop actually lands server-side: the next reseed reflects s1 idle
+    // — WITHOUT the freeze this reclassifies it into Completed and the
+    // now-empty Working group disappears entirely.
+    b.fake.wireRows?.mockResolvedValueOnce([wireRow('s1', { busy: false }), wireRow('s2', { busy: false })]);
+    b.fake.emitConnection(true);
+    await flush();
+
+    expect(b.view().armedDeleteId).toBe('s1'); // still armed
+    const out = b.render();
+    expect(out).toContain('Working'); // frozen group membership survives the reseed
+    expect(out).toContain('s1 title');
+  });
+
+  it('a refresh reseed that REMOVES the armed row entirely clears the arm instead of freezing a hole', async () => {
+    const b = await boot([summary('s1')], { wire: true, rows: [wireRow('s1', { busy: true })] });
+    dir = b.homeDir;
+    await flush();
+    b.component().handleInput(DOWN);
+    b.component().handleInput(CTRL_X);
+    expect(b.view().armedDeleteId).toBe('s1');
+
+    // s1 was archived by another client during the drop.
+    b.fake.wireRows?.mockResolvedValueOnce([]);
+    b.fake.emitConnection(true);
+    await flush();
+
+    expect(b.view().armedDeleteId).toBeUndefined();
+    expect(b.view().roster.get('s1')).toBeUndefined();
   });
 });
 
@@ -2212,10 +2356,12 @@ describe('AgentsViewController — A2 optimistic dispatch placeholder', () => {
     expect(b.showStatus).toHaveBeenCalledWith('Still dispatching — try again in a moment');
 
     b.showStatus.mockClear();
-    b.component().handleInput(CTRL_X); // delete
+    b.component().handleInput(CTRL_X); // delete (B1: must decline, not arm)
     expect(b.view().confirmDeleteId).toBeUndefined();
+    expect(b.view().armedDeleteId).toBeUndefined();
     expect(b.showStatus).toHaveBeenCalledWith('Still dispatching — try again in a moment');
     expect(b.fake.deleteSession).not.toHaveBeenCalled();
+    expect(b.fake.cancelSession).not.toHaveBeenCalled();
 
     deferred.resolve();
     await flush();
@@ -2437,7 +2583,7 @@ describe('AgentsViewController — reply mode (space)', () => {
     expect(b.fake.wirePrompt).not.toHaveBeenCalled();
   });
 
-  it('Ctrl+X closes the panel and starts the existing delete-confirm flow for that row', async () => {
+  it('Ctrl+X closes the panel and starts the row delete arm (B1) for that row', async () => {
     const b = await boot([summary('s1')], { wire: true });
     dir = b.homeDir;
     b.component().handleInput(DOWN);
@@ -2445,7 +2591,7 @@ describe('AgentsViewController — reply mode (space)', () => {
     b.component().handleInput(CTRL_X);
     expect(b.view().replyTargetId).toBeUndefined();
     expect(b.view().dispatchFocused).toBe(false);
-    expect(b.view().confirmDeleteId).toBe('s1');
+    expect(b.view().armedDeleteId).toBe('s1');
     // Second Ctrl+X (list-focused now) confirms the delete, same as the
     // ordinary row flow.
     b.component().handleInput(CTRL_X);
@@ -2849,14 +2995,14 @@ describe('AgentsViewController — reply mode (space)', () => {
     expect(b.view().dispatch.editor.getText()).toBe(' ');
   });
 
-  it('space on a row clears a pending delete confirm', async () => {
+  it('space on a row clears a pending row delete arm (B1)', async () => {
     const b = await boot([summary('s1'), summary('s2')]);
     dir = b.homeDir;
     b.component().handleInput(DOWN); // s1
     b.component().handleInput(CTRL_X);
-    expect(b.view().confirmDeleteId).toBe('s1');
+    expect(b.view().armedDeleteId).toBe('s1');
     b.component().handleInput(SPACE);
-    expect(b.view().confirmDeleteId).toBeUndefined();
+    expect(b.view().armedDeleteId).toBeUndefined();
   });
 });
 
@@ -3645,14 +3791,14 @@ describe('AgentsViewController — grouping mode (Ctrl+S, A6)', () => {
     expect(b.view().flashMessage).toContain('disk full');
   });
 
-  it('any other action clears a pending delete confirm, same as every other action', async () => {
+  it('any other action clears a pending row delete arm (B1), same as every other action', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
     b.component().handleInput(DOWN);
     b.component().handleInput(CTRL_X);
-    expect(b.view().confirmDeleteId).toBe('s1');
+    expect(b.view().armedDeleteId).toBe('s1');
     b.component().handleInput(CTRL_S);
-    expect(b.view().confirmDeleteId).toBeUndefined();
+    expect(b.view().armedDeleteId).toBeUndefined();
   });
 
   it('the help grid advertises ctrl+s to switch views', async () => {

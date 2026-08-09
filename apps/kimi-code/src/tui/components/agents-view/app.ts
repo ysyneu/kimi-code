@@ -19,11 +19,21 @@
  * side effects and re-pushes props after every action.
  *
  * Behaviour notes for the controller:
- * - Delete confirm: while `confirmDeleteId` is set the component still
- *   routes keys normally (Ctrl+X confirms, everything else fires its usual
- *   callback); the controller must clear `confirmDeleteId` on ANY action
- *   callback it receives — including `onQuit` (Esc during confirm cancels
- *   the confirm instead of quitting).
+ * - Delete confirm (group headers only): while `confirmDeleteId` is set the
+ *   component still routes keys normally (Ctrl+X confirms, everything else
+ *   fires its usual callback); the controller must clear `confirmDeleteId`
+ *   on ANY action callback it receives — including `onQuit` (Esc during
+ *   confirm cancels the confirm instead of quitting).
+ * - Delete arm (B1, roster ROWS): the group-header dialog above doesn't
+ *   apply to rows — a row's first Ctrl+X instead arms it in place
+ *   (`armedDeleteId`/`armedDeleteStopped`; the row's own summary column
+ *   shows the arm, see `rows.ts`'s `RowDeleteArm`). Routes exactly like
+ *   `confirmDeleteId` otherwise: a second Ctrl+X while armed calls
+ *   `onDeleteConfirm` (same callback, keyed by id), Esc cancels the arm
+ *   instead of quitting, and the controller clears it on any other action
+ *   callback, on its own `DELETE_ARM_WINDOW_MS` auto-expire, and if a
+ *   roster refresh removes the armed row outright. Mutually exclusive with
+ *   `confirmDeleteId` — never both set at once.
  * - Rename cancel: Esc during rename submits the ORIGINAL title via
  *   `onRenameSubmit`; the controller treats an unchanged title as a cancel
  *   (clears `renameDraft`, skips the SDK call).
@@ -52,11 +62,11 @@
  *   the callback is a no-op signal for anything else, so the controller
  *   need not re-check `pinned` itself.
  * - Esc closes the innermost overlay (rename/dispatch-focused/help/delete
- *   confirm each already absorb it above the branch below); past that it
- *   calls `onQuit()`, full stop — same as the exit command path. It never
- *   re-attaches to `props.originId`: that field only drives the row's bold
- *   "came from" styling now (see its own doc comment), a cosmetic marker
- *   independent of Esc/quit.
+ *   confirm/delete arm each already absorb it above the branch below); past
+ *   that it calls `onQuit()`, full stop — same as the exit command path. It
+ *   never re-attaches to `props.originId`: that field only drives the row's
+ *   bold "came from" styling now (see its own doc comment), a cosmetic
+ *   marker independent of Esc/quit.
  * - Ctrl+C is a genuine two-stage confirm-to-exit, independent of Esc/origin:
  *   every press just reports `onCtrlC()` — the component makes no arm/quit
  *   decision itself and holds no timer. The controller owns the actual
@@ -86,7 +96,14 @@ import { currentTheme } from '#/tui/theme';
 import { printableChar, isPrintableChar } from '@/tui/utils/printable-key';
 
 import { renderReplyPanel } from './reply-panel';
-import { fitExactly, renderGroupHeader, renderMoreRow, renderRosterRow, withSelectedBg } from './rows';
+import {
+  fitExactly,
+  renderGroupHeader,
+  renderMoreRow,
+  renderRosterRow,
+  withSelectedBg,
+  type RowDeleteArm,
+} from './rows';
 
 export interface AgentsViewProps {
   readonly groups: readonly AgentsGroup[];
@@ -106,8 +123,24 @@ export interface AgentsViewProps {
   readonly serverLabel: string;
   /** Header label for the model new sessions dispatch with by default. */
   readonly modelLabel: string;
-  /** Ctrl+X first-press target awaiting a second Ctrl+X. */
+  /** Ctrl+X first-press target awaiting a second Ctrl+X — GROUP HEADERS
+   *  only (`group:<id>`). A row's own first Ctrl+X is `armedDeleteId`
+   *  below instead (B1); the two are mutually exclusive. */
   readonly confirmDeleteId: string | undefined;
+  /**
+   * B1: roster ROW id currently Ctrl+X-armed — the row's summary column
+   * shows the arm (`ctrl+x again to delete`) instead of a dialog; see
+   * `rows.ts`'s `RowDeleteArm` and the class docstring's own note. Mutually
+   * exclusive with `confirmDeleteId`.
+   */
+  readonly armedDeleteId: string | undefined;
+  /**
+   * True when `armedDeleteId`'s row was busy at arm time — its turn was
+   * stopped immediately alongside the arm, so the row's summary reads
+   * `stopped · ctrl+x again to delete` instead of just the arm text.
+   * Meaningless while `armedDeleteId` is undefined.
+   */
+  readonly armedDeleteStopped: boolean;
   readonly renameDraft: { readonly sessionId: string; readonly text: string } | undefined;
   readonly flashMessage: string | undefined;
   readonly dispatchFocused: boolean;
@@ -395,6 +428,15 @@ export class AgentsViewApp extends Container implements Focusable {
     if (matchesKey(data, Key.ctrl('x'))) {
       if (this.props.confirmDeleteId !== undefined) {
         this.props.onDeleteConfirm(this.props.confirmDeleteId);
+        return;
+      }
+      // B1: second Ctrl+X on an already-armed row — same confirm callback
+      // the group-header dialog above uses, just keyed by the armed row id
+      // instead of `confirmDeleteId`. Navigation/any other action disarms
+      // first (see the controller's `clearDeleteOverlays`), so by the time
+      // a second Ctrl+X can land here the selection is still on this row.
+      if (this.props.armedDeleteId !== undefined) {
+        this.props.onDeleteConfirm(this.props.armedDeleteId);
         return;
       }
       const item = this.deriveItems()[this.selectedIndex];
@@ -742,7 +784,9 @@ export class AgentsViewApp extends Container implements Focusable {
       : this.props.pendingReplyIds.has(row.id)
         ? 'sending'
         : undefined;
-    return renderRosterRow(row, selected, row.id === this.props.originId, width, sendState);
+    const deleteArm: RowDeleteArm | undefined =
+      this.props.armedDeleteId !== row.id ? undefined : this.props.armedDeleteStopped ? 'stopped' : 'arming';
+    return renderRosterRow(row, selected, row.id === this.props.originId, width, sendState, deleteArm);
   }
 
   private draftFor(id: string): string | undefined {
@@ -830,6 +874,12 @@ export class AgentsViewApp extends Container implements Focusable {
         hint('ctrl+x', 'to confirm'),
         dim('any other key cancels'),
       );
+    } else if (this.props.armedDeleteId !== undefined) {
+      // B1: the row itself already carries the arm text in its summary
+      // column (`ctrl+x again to delete` / `stopped · ...`, see
+      // `renderItem`'s `deleteArm`) — the footer just states the same two
+      // ways out, same register as every other hint row here.
+      left = compose(hint('ctrl+x', 'again to delete'), hint('esc', 'to keep'));
     } else {
       const item = this.deriveItems()[this.selectedIndex];
       if (item === undefined) {
@@ -863,21 +913,19 @@ export class AgentsViewApp extends Container implements Focusable {
     return [fitExactly(left, width)];
   }
 
+  /**
+   * `confirmDeleteId` is GROUP-header-only now (B1 moved row deletes to the
+   * inline arm — see the class docstring), so `id` is always `group:<id>`
+   * here; no row-shaped fallback needed.
+   */
   private deleteConfirmCopy(id: string): string {
-    if (id.startsWith('group:')) {
-      const groupId = id.slice('group:'.length);
-      const group = this.props.groups.find((g) => g.id === groupId);
-      const label = group?.label ?? groupId;
-      const busyCount = group?.rows.filter((r) => r.busy).length ?? 0;
-      return (
-        `Archive all sessions in "${label}"?` +
-        (busyCount > 0 ? ' Running turns will be cancelled first.' : '')
-      );
-    }
-    const row = this.findRow(id);
-    const title = row?.title ?? id;
-    const busy = row?.busy ?? false;
-    return `Archive session "${title}"?` + (busy ? ' Its running turn will be cancelled first.' : '');
+    const groupId = id.slice('group:'.length);
+    const group = this.props.groups.find((g) => g.id === groupId);
+    const label = group?.label ?? groupId;
+    const busyCount = group?.rows.filter((r) => r.busy).length ?? 0;
+    return (
+      `Archive all sessions in "${label}"?` + (busyCount > 0 ? ' Running turns will be cancelled first.' : '')
+    );
   }
 
   private adjustScroll(visibleRows: number, itemCount: number): void {

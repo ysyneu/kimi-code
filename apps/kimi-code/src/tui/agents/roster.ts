@@ -269,6 +269,46 @@ export class AgentsRoster {
     if (row !== undefined) row.trusted = trusted;
   }
 
+  /**
+   * Runs `fn` with `id`'s row temporarily patched to `frozen`'s
+   * classify-relevant fields (`busy`, `pendingInteraction`, `updatedAt` —
+   * exactly what `groupOf` and the recency sort above read), restoring the
+   * live values before returning either way. Used by the agents-view
+   * controller's Ctrl+X row arm (B1) to freeze an armed row's group/sort
+   * position across a live event or WS-reconnect reseed landing mid-arm:
+   * without this, a busy row's own optimistic stop (which flips `busy`
+   * false right under it) — or any other event — could bucket it into a
+   * different group or reorder it out from under the user's pending second
+   * Ctrl+X. Patching the SAME row object in place (rather than building a
+   * substitute) is what keeps this working for BOTH grouping strategies —
+   * `groups()` above and `buildDirectoryGroups`'s own `allRows()` snapshot —
+   * without either needing an override parameter of its own; it also means
+   * a group the row would otherwise be the sole occupant of never
+   * disappears from the list while frozen, since classification sees the
+   * frozen fields, not the live ones. A no-op passthrough (still calls
+   * `fn`) when `id` isn't a live row — already-removed is the controller's
+   * cue to clear the arm outright, not freeze a hole.
+   */
+  withFrozenRow<T>(
+    id: string,
+    frozen: { busy: boolean; pendingInteraction: AgentsRosterRow['pendingInteraction']; updatedAt: number },
+    fn: () => T,
+  ): T {
+    const row = this.rows.get(id);
+    if (row === undefined) return fn();
+    const live = { busy: row.busy, pendingInteraction: row.pendingInteraction, updatedAt: row.updatedAt };
+    row.busy = frozen.busy;
+    row.pendingInteraction = frozen.pendingInteraction;
+    row.updatedAt = frozen.updatedAt;
+    try {
+      return fn();
+    } finally {
+      row.busy = live.busy;
+      row.pendingInteraction = live.pendingInteraction;
+      row.updatedAt = live.updatedAt;
+    }
+  }
+
   groups(pageSize = DEFAULT_PAGE_SIZE): readonly AgentsGroup[] {
     const buckets: Record<AgentsGroupId, MutableRow[]> = {
       awaiting: [],

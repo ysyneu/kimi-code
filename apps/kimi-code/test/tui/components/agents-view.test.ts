@@ -99,6 +99,8 @@ function makeProps(overrides: Partial<AgentsViewProps> = {}): AgentsViewProps {
     serverLabel: 'embedded',
     modelLabel: 'kimi-k2',
     confirmDeleteId: undefined,
+    armedDeleteId: undefined,
+    armedDeleteStopped: false,
     renameDraft: undefined,
     flashMessage: undefined,
     dispatchFocused: false,
@@ -686,37 +688,108 @@ describe('AgentsViewApp — arrow keys open the selected session', () => {
   });
 });
 
-describe('AgentsViewApp — delete confirmation', () => {
-  const busyGroups = [group('working', [row('s1', { busy: true, title: 'train model' })])];
-  const idleGroups = [group('completed', [row('s2', { title: 'old task' })])];
-
+describe('AgentsViewApp — first Ctrl+X (row or group header)', () => {
   it('first Ctrl+X invokes onDeleteRequest on the selected row', () => {
     const onDeleteRequest = vi.fn();
+    const busyGroups = [group('working', [row('s1', { busy: true, title: 'train model' })])];
     const app = makeApp({ groups: busyGroups, selectedId: 's1', onDeleteRequest });
     app.handleInput('\u0018');
     expect(onDeleteRequest).toHaveBeenCalledWith('s1');
   });
 
-  it('confirm copy for a busy session warns the turn will be cancelled first', () => {
-    const out = render(makeApp({ groups: busyGroups, selectedId: 's1', confirmDeleteId: 's1' }));
-    expect(out).toContain('train model');
-    expect(out).toContain('cancelled first');
-  });
-
-  it('confirm copy for an idle session has no cancel warning', () => {
-    const out = render(makeApp({ groups: idleGroups, selectedId: 's2', confirmDeleteId: 's2' }));
-    expect(out).toContain('old task');
-    expect(out).not.toContain('cancelled first');
-  });
-
-  it('second Ctrl+X invokes onDeleteConfirm with the pending target', () => {
-    const onDeleteConfirm = vi.fn();
-    const app = makeApp({ groups: busyGroups, selectedId: 's1', confirmDeleteId: 's1', onDeleteConfirm });
+  it('first Ctrl+X invokes onDeleteRequest on the selected group header', () => {
+    const onDeleteRequest = vi.fn();
+    const busyGroups = [group('working', [row('s1', { busy: true })])];
+    const app = makeApp({ groups: busyGroups, selectedId: 'group:working', onDeleteRequest });
     app.handleInput('\u0018');
-    expect(onDeleteConfirm).toHaveBeenCalledWith('s1');
+    expect(onDeleteRequest).toHaveBeenCalledWith('group:working');
   });
 });
 
+describe('AgentsViewApp — group-header delete confirmation (B1 leaves this dialog unchanged)', () => {
+  const busyGroups = [group('working', [row('s1', { busy: true, title: 'train model' })])];
+  const idleGroups = [group('completed', [row('s2', { title: 'old task' })])];
+
+  it('confirm copy for a group with a busy row warns the turn will be cancelled first', () => {
+    const out = render(
+      makeApp({ groups: busyGroups, selectedId: 'group:working', confirmDeleteId: 'group:working' }),
+    );
+    expect(out).toContain('Working');
+    expect(out).toContain('cancelled first');
+  });
+
+  it('confirm copy for an idle-only group has no cancel warning', () => {
+    const out = render(
+      makeApp({ groups: idleGroups, selectedId: 'group:completed', confirmDeleteId: 'group:completed' }),
+    );
+    expect(out).toContain('Completed');
+    expect(out).not.toContain('cancelled first');
+  });
+
+  it('second Ctrl+X invokes onDeleteConfirm with the pending group id', () => {
+    const onDeleteConfirm = vi.fn();
+    const app = makeApp({
+      groups: busyGroups,
+      selectedId: 'group:working',
+      confirmDeleteId: 'group:working',
+      onDeleteConfirm,
+    });
+    app.handleInput('\u0018');
+    expect(onDeleteConfirm).toHaveBeenCalledWith('group:working');
+  });
+});
+
+describe('AgentsViewApp — row delete arm (B1)', () => {
+  // Title and summary bait are deliberately DIFFERENT strings — the arm
+  // only ever overrides the summary column (see `rows.ts`'s `deleteArm`
+  // doc), so a row's name/title must stay on screen while armed.
+  const groups = [
+    group('working', [row('s1', { busy: true, title: 'train model', lastAssistantText: 'epoch 3/10' })]),
+  ];
+
+  it('second Ctrl+X while armed invokes onDeleteConfirm with the armed row id', () => {
+    const onDeleteConfirm = vi.fn();
+    const app = makeApp({ groups, selectedId: 's1', armedDeleteId: 's1', onDeleteConfirm });
+    app.handleInput('\u0018');
+    expect(onDeleteConfirm).toHaveBeenCalledWith('s1');
+  });
+
+  it("the armed row's summary column reads 'ctrl+x again to delete' when it was idle at arm time", () => {
+    const idleGroups = [group('completed', [row('s2', { title: 'old task', lastAssistantText: 'done' })])];
+    const out = render(
+      makeApp({ groups: idleGroups, selectedId: 's2', armedDeleteId: 's2', armedDeleteStopped: false }),
+    );
+    expect(out).toContain('old task'); // name column untouched
+    expect(out).toContain('ctrl+x again to delete');
+    // The summary column is REPLACED — the row's own assistant-reply text is gone.
+    expect(out).not.toContain('done');
+    expect(out).not.toContain('stopped ·');
+  });
+
+  it("a busy armed row's summary column reads 'stopped · ctrl+x again to delete'", () => {
+    const out = render(makeApp({ groups, selectedId: 's1', armedDeleteId: 's1', armedDeleteStopped: true }));
+    expect(out).toContain('train model'); // name column untouched
+    expect(out).toContain('stopped · ctrl+x again to delete');
+    expect(out).not.toContain('epoch 3/10');
+  });
+
+  it('the footer shows the armed hint, not the plain row hint', () => {
+    const out = render(makeApp({ groups, selectedId: 's1', armedDeleteId: 's1', armedDeleteStopped: true }));
+    expect(out).toContain('ctrl+x again to delete');
+    expect(out).toContain('esc to keep');
+    expect(out).not.toContain('enter to open');
+  });
+
+  it('only the armed row itself shows the arm text — an unrelated row stays normal', () => {
+    const twoRows = [
+      group('working', [row('s1', { busy: true, title: 'train model', lastAssistantText: 'epoch 3/10' })]),
+      group('completed', [row('s2', { title: 'unrelated', lastAssistantText: 'unrelated summary' })]),
+    ];
+    const out = render(makeApp({ groups: twoRows, selectedId: 's1', armedDeleteId: 's1' }));
+    expect(out).toContain('unrelated summary');
+    expect(out).toContain('ctrl+x again to delete');
+  });
+});
 describe('AgentsViewApp — rename', () => {
   const groups = [group('completed', [row('s1', { title: 'abc' })])];
 
@@ -853,14 +926,29 @@ describe('AgentsViewApp — pin / help / quit', () => {
     expect(onOpen).not.toHaveBeenCalled();
   });
 
-  it('a delete confirm still absorbs Esc as a cancel first, even with an origin set', () => {
+  it('a group delete confirm still absorbs Esc as a cancel first, even with an origin set', () => {
     // The confirm is itself the innermost thing to dismiss — it must not be
     // skipped just because there's an origin to fall back to.
     const onQuit = vi.fn();
     const onOpen = vi.fn();
     const app = makeApp({
       groups: [group('completed', [row('s1')])],
-      confirmDeleteId: 's1',
+      confirmDeleteId: 'group:completed',
+      onQuit,
+      onOpen,
+      originId: 'ses-origin',
+    });
+    app.handleInput(ESC);
+    expect(onQuit).toHaveBeenCalledTimes(1);
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it('a row delete arm (B1) still absorbs Esc as a cancel first, even with an origin set', () => {
+    const onQuit = vi.fn();
+    const onOpen = vi.fn();
+    const app = makeApp({
+      groups: [group('completed', [row('s1')])],
+      armedDeleteId: 's1',
       onQuit,
       onOpen,
       originId: 'ses-origin',

@@ -4,7 +4,7 @@ import { parseIntegerEnv } from '@moonshot-ai/agent-core-v2';
 import type { Event, KimiHarness, Unsubscribe, WireSession } from '@moonshot-ai/kimi-code-sdk';
 import type { Component, Container, ProcessTerminal, TUI } from '@moonshot-ai/pi-tui';
 
-import { AgentsRoster, type AgentsGroup } from '../agents/roster';
+import { AgentsRoster, type AgentsGroup, type AgentsRosterRow } from '../agents/roster';
 import { loadAgentsViewState, saveAgentsViewState } from '../agents/roster-persistence';
 import { completeLeadingArg, type ArgCompletionSpec } from '../commands/complete-args';
 import { BUILTIN_SLASH_COMMANDS } from '../commands/registry';
@@ -12,7 +12,7 @@ import type { KimiSlashCommand } from '../commands/types';
 import { AgentsViewApp, type AgentsViewProps } from '../components/agents-view/app';
 import { rosterRowName } from '../components/agents-view/rows';
 import type { CustomEditor } from '../components/editor/custom-editor';
-import { EXIT_CONFIRM_WINDOW_MS } from '#/tui/constant/kimi-tui';
+import { DELETE_ARM_WINDOW_MS, EXIT_CONFIRM_WINDOW_MS } from '#/tui/constant/kimi-tui';
 import type { Theme } from '#/tui/theme';
 
 import {
@@ -215,7 +215,32 @@ export interface AgentsViewState {
    * changes on the way back. Drives the row-level `isOrigin` bold marker.
    */
   originSessionId: string | undefined;
+  /** Ctrl+X first-press target awaiting a second Ctrl+X — GROUP HEADERS
+   *  only now (B1 moved row deletes to the arm fields below); see
+   *  `AgentsViewProps.confirmDeleteId`'s own doc. */
   confirmDeleteId: string | undefined;
+  /** B1: roster ROW id currently Ctrl+X-armed — see `armDelete`/
+   *  `clearArmedDelete` and `AgentsViewProps.armedDeleteId`'s own doc.
+   *  Mutually exclusive with `confirmDeleteId`. */
+  armedDeleteId: string | undefined;
+  /** See `AgentsViewProps.armedDeleteStopped`'s own doc. */
+  armedDeleteStopped: boolean;
+  /** Auto-expire timer for the current arm (`DELETE_ARM_WINDOW_MS`);
+   *  cleared by `clearArmedDelete` (confirm, cancel, any other action, its
+   *  own firing) — same "controller owns the timer, only it can force a
+   *  repaint on silent expiry" shape as `pendingExitTimer` below. */
+  armedDeleteTimer: ReturnType<typeof setTimeout> | undefined;
+  /**
+   * The armed row's classify-relevant fields (`busy`, `pendingInteraction`,
+   * `updatedAt`) as of arm time — fed to `AgentsRoster.withFrozenRow` in
+   * `buildProps` so a live event or WS-reconnect reseed landing mid-arm
+   * can't bucket/reorder the row out from under the user (see that
+   * method's own doc for why freezing these three is what freezing
+   * "position" reduces to).
+   */
+  armedDeleteFreeze:
+    | { busy: boolean; pendingInteraction: AgentsRosterRow['pendingInteraction']; updatedAt: number }
+    | undefined;
   renameDraft: { sessionId: string; text: string } | undefined;
   flashMessage: string | undefined;
   flashTimer: NodeJS.Timeout | undefined;
@@ -418,8 +443,10 @@ export function dispatchSlashCommands(
  * the component stays SDK-free.
  *
  * Component contract obligations (see AgentsViewApp's docstring):
- * - While `confirmDeleteId` is set, ANY action callback — including `onQuit`
- *   (Esc during confirm) — clears the confirm instead of acting as a quit.
+ * - While `confirmDeleteId` (group headers) or `armedDeleteId` (B1, rows —
+ *   mutually exclusive with `confirmDeleteId`) is set, ANY action callback
+ *   — including `onQuit` (Esc during confirm/arm) — clears it instead of
+ *   acting as a quit; see `clearDeleteOverlays`.
  * - Esc during rename submits the ORIGINAL title; an unchanged title is a
  *   cancel and never reaches the SDK.
  */
@@ -505,6 +532,9 @@ export class AgentsViewController {
         selectedId: undefined,
         originSessionId: undefined,
         confirmDeleteId: undefined,
+        armedDeleteId: undefined,
+        armedDeleteStopped: false,
+        armedDeleteFreeze: undefined,
         renameDraft: undefined,
         flashMessage: undefined,
         pendingExitTimer: undefined,
@@ -588,6 +618,10 @@ export class AgentsViewController {
       selectedId: undefined,
       originSessionId: undefined,
       confirmDeleteId: undefined,
+      armedDeleteId: undefined,
+      armedDeleteStopped: false,
+      armedDeleteTimer: undefined,
+      armedDeleteFreeze: undefined,
       renameDraft: undefined,
       flashMessage: undefined,
       flashTimer: undefined,
@@ -631,6 +665,7 @@ export class AgentsViewController {
     if (view.flashTimer !== undefined) clearTimeout(view.flashTimer);
     if (view.busyTicker !== undefined) clearInterval(view.busyTicker);
     if (view.pendingExitTimer !== undefined) clearTimeout(view.pendingExitTimer);
+    if (view.armedDeleteTimer !== undefined) clearTimeout(view.armedDeleteTimer);
     this.host.setAttachBadge(undefined);
 
     state.ui.clear();
@@ -699,6 +734,10 @@ export class AgentsViewController {
       clearTimeout(view.pendingExitTimer);
       view.pendingExitTimer = undefined;
     }
+    // Same reasoning as the Ctrl+C hint above: a B1 row arm is screen-local
+    // too — detaching mid-arm must not leave its timer running against the
+    // invisible component, nor have it reappear armed on remount.
+    this.clearArmedDelete(view);
 
     state.ui.clear();
     for (const child of view.savedChildren) {
@@ -829,6 +868,14 @@ export class AgentsViewController {
     // selection behind.
     if (view.selectedId !== undefined && view.roster.get(view.selectedId) === undefined) {
       view.selectedId = undefined;
+    }
+    // B1: nor a dangling row arm — a refresh that REMOVES the armed row
+    // outright (e.g. archived from another client while armed here) has
+    // nothing left to freeze a position for; `withFrozenRow` would just
+    // silently no-op forever, leaving a stale timer ticking against a row
+    // that no longer exists.
+    if (view.armedDeleteId !== undefined && view.roster.get(view.armedDeleteId) === undefined) {
+      this.clearArmedDelete(view);
     }
     this.syncBusyTicker();
     this.pushProps();
@@ -1179,6 +1226,11 @@ export class AgentsViewController {
     selectedId: string | undefined;
     originSessionId: string | undefined;
     confirmDeleteId: string | undefined;
+    armedDeleteId: string | undefined;
+    armedDeleteStopped: boolean;
+    armedDeleteFreeze:
+      | { busy: boolean; pendingInteraction: AgentsRosterRow['pendingInteraction']; updatedAt: number }
+      | undefined;
     renameDraft: { sessionId: string; text: string } | undefined;
     flashMessage: string | undefined;
     pendingExitTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1186,12 +1238,23 @@ export class AgentsViewController {
     completedExpanded: boolean;
     groupMode: AgentsGroupMode;
   }): AgentsViewProps {
-    const groups = this.currentGroups(view, view.completedExpanded ? Number.MAX_SAFE_INTEGER : undefined).map(
-      (group): AgentsGroup => {
-        if (!view.collapsedGroups.has(group.id)) return group;
-        return { id: group.id, label: group.label, rows: [], collapsedCount: group.rows.length };
-      },
-    );
+    const pageSize = view.completedExpanded ? Number.MAX_SAFE_INTEGER : undefined;
+    // B1: an armed row's group/sort position freezes across whatever this
+    // particular buildProps call would otherwise recompute it to (a live
+    // event or WS-reconnect reseed landing mid-arm) — see `withFrozenRow`'s
+    // own doc for why patching the row in place, for the duration of this
+    // one `currentGroups` call, is what makes that hold for both grouping
+    // strategies without either needing its own override parameter.
+    const rawGroups =
+      view.armedDeleteId !== undefined && view.armedDeleteFreeze !== undefined
+        ? view.roster.withFrozenRow(view.armedDeleteId, view.armedDeleteFreeze, () =>
+            this.currentGroups(view, pageSize),
+          )
+        : this.currentGroups(view, pageSize);
+    const groups = rawGroups.map((group): AgentsGroup => {
+      if (!view.collapsedGroups.has(group.id)) return group;
+      return { id: group.id, label: group.label, rows: [], collapsedCount: group.rows.length };
+    });
     return {
       groups,
       counts: view.roster.counts(),
@@ -1200,6 +1263,8 @@ export class AgentsViewController {
       serverLabel: this.host.agentsViewServerLabel(),
       modelLabel: this.host.agentsViewModelLabel(),
       confirmDeleteId: view.confirmDeleteId,
+      armedDeleteId: view.armedDeleteId,
+      armedDeleteStopped: view.armedDeleteStopped,
       renameDraft: view.renameDraft,
       flashMessage: view.flashMessage,
       dispatchFocused: view.dispatchFocused,
@@ -1228,7 +1293,8 @@ export class AgentsViewController {
     this.host.state.ui.requestRender();
   }
 
-  /** Clears a pending delete confirm; returns true when one was pending. */
+  /** Clears a pending GROUP delete confirm; returns true when one was
+   *  pending. See `clearArmedDelete` for the B1 row-arm equivalent. */
   private clearConfirm(view: AgentsViewState): boolean {
     if (view.confirmDeleteId === undefined) return false;
     view.confirmDeleteId = undefined;
@@ -1236,16 +1302,90 @@ export class AgentsViewController {
   }
 
   /**
+   * B1: clears a pending ROW Ctrl+X arm (timer included) — the confirm, an
+   * Esc cancel, any other action callback, or the timer's own expiry all
+   * route through here (see `AgentsViewState.armedDeleteTimer`'s own doc
+   * for why the controller, not the component, owns it). Returns true when
+   * an arm was pending.
+   */
+  private clearArmedDelete(view: AgentsViewState): boolean {
+    if (view.armedDeleteId === undefined) return false;
+    if (view.armedDeleteTimer !== undefined) clearTimeout(view.armedDeleteTimer);
+    view.armedDeleteId = undefined;
+    view.armedDeleteStopped = false;
+    view.armedDeleteTimer = undefined;
+    view.armedDeleteFreeze = undefined;
+    return true;
+  }
+
+  /**
+   * Clears whichever delete overlay is currently active — the group-header
+   * confirm dialog OR a row's Ctrl+X arm (B1); the two are mutually
+   * exclusive, so at most one of `clearConfirm`/`clearArmedDelete` ever
+   * actually clears anything, but both run unconditionally rather than
+   * short-circuiting so neither can be left dangling by an assumption that
+   * turns out wrong. Returns true if either was cleared — the shared "any
+   * other action" signal every `buildCallbacks` entry and
+   * `quitOrCancelConfirm` use.
+   */
+  private clearDeleteOverlays(view: AgentsViewState): boolean {
+    const clearedConfirm = this.clearConfirm(view);
+    const clearedArm = this.clearArmedDelete(view);
+    return clearedConfirm || clearedArm;
+  }
+
+  /**
    * The shared "actually leave" path behind both `onQuit` and a confirming
-   * second Ctrl+C: a pending delete confirm still absorbs it as a cancel
-   * first (matches Ctrl+X's own confirm flow), otherwise closes the view.
+   * second Ctrl+C: a pending delete overlay (group confirm OR row arm)
+   * still absorbs it as a cancel first (matches Ctrl+X's own confirm/arm
+   * flow), otherwise closes the view.
    */
   private quitOrCancelConfirm(view: AgentsViewState): void {
-    if (this.clearConfirm(view)) {
+    if (this.clearDeleteOverlays(view)) {
       this.pushProps();
       return;
     }
     this.close();
+  }
+
+  /**
+   * B1: first Ctrl+X on a roster ROW — arms it in place instead of opening
+   * the group-header's confirm dialog. A BUSY row's turn is stopped
+   * immediately, optimistically (the summary already reads `stopped · ...`
+   * before the RPC settles — see `rows.ts`'s `RowDeleteArm`), reusing the
+   * same session-id-scoped cancel A3's attach-mode Ctrl+C already routes
+   * through (`KimiHarness.cancelSession`, no attach/local `Session` cache
+   * required — this row was very likely never attached in this process at
+   * all). Captures the row's current classify-relevant fields so
+   * `buildProps` can freeze its group/sort position for as long as the arm
+   * lasts (`AgentsRoster.withFrozenRow`), and starts the
+   * `DELETE_ARM_WINDOW_MS` auto-expire timer. Declines a still-dispatching
+   * A2 placeholder the same way every other row action does (checked by
+   * the caller, `onDeleteRequest`, before this is reached).
+   */
+  private armDelete(view: AgentsViewState, id: string): void {
+    const row = view.roster.get(id);
+    if (row === undefined) return;
+    if (view.armedDeleteTimer !== undefined) clearTimeout(view.armedDeleteTimer);
+    view.armedDeleteId = id;
+    view.armedDeleteStopped = row.busy;
+    view.armedDeleteFreeze = {
+      busy: row.busy,
+      pendingInteraction: row.pendingInteraction,
+      updatedAt: row.updatedAt,
+    };
+    view.armedDeleteTimer = setTimeout(() => {
+      const current = this.host.state.agentsView;
+      if (current === undefined || current.armedDeleteId !== id) return;
+      this.clearArmedDelete(current);
+      this.pushProps();
+    }, DELETE_ARM_WINDOW_MS);
+    if (row.busy) {
+      void this.host.harness.cancelSession(id).catch((error: unknown) => {
+        this.flash(`Failed to stop: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }
+    this.pushProps();
   }
 
   private buildCallbacks(): Pick<
@@ -1271,12 +1411,12 @@ export class AgentsViewController {
         const view = this.host.state.agentsView;
         if (view === undefined) return;
         view.selectedId = id === '' ? undefined : id;
-        if (this.clearConfirm(view)) this.pushProps();
+        if (this.clearDeleteOverlays(view)) this.pushProps();
       },
       onOpen: (id) => {
         const view = this.host.state.agentsView;
         if (view === undefined) return;
-        this.clearConfirm(view);
+        this.clearDeleteOverlays(view);
         if (id === 'more:completed') {
           view.completedExpanded = true;
           this.pushProps();
@@ -1317,20 +1457,31 @@ export class AgentsViewController {
           this.host.showStatus(DISPATCHING_HINT);
           return;
         }
-        view.confirmDeleteId = id;
-        this.pushProps();
+        // Group-header delete-all keeps the existing confirm-dialog flow —
+        // B1 only replaces the ROW path below with the inline arm.
+        if (id.startsWith('group:')) {
+          view.confirmDeleteId = id;
+          this.pushProps();
+          return;
+        }
+        this.armDelete(view, id);
       },
       onDeleteConfirm: (id) => {
+        // Shared by both delete overlays' second press: `id` is either the
+        // pending `confirmDeleteId` (group) or `armedDeleteId` (B1, row) —
+        // `AgentsViewApp.handleInput` only ever calls this with whichever
+        // one is actually set, so clearing both defensively is safe and
+        // keeps this callback from needing to know which one it was.
         const view = this.host.state.agentsView;
         if (view === undefined) return;
-        view.confirmDeleteId = undefined;
+        this.clearDeleteOverlays(view);
         this.pushProps();
         void this.handleDelete(id);
       },
       onRenameBegin: (id) => {
         const view = this.host.state.agentsView;
         if (view === undefined) return;
-        this.clearConfirm(view);
+        this.clearDeleteOverlays(view);
         if (isPendingDispatchId(id)) {
           this.host.showStatus(DISPATCHING_HINT);
           return;
@@ -1343,7 +1494,7 @@ export class AgentsViewController {
       onRenameSubmit: (id, text) => {
         const view = this.host.state.agentsView;
         if (view === undefined) return;
-        this.clearConfirm(view);
+        this.clearDeleteOverlays(view);
         view.renameDraft = undefined;
         // A2 placeholder: `onRenameBegin` already declines starting a rename
         // on one, but the component's OWN inline rename editor is a local
@@ -1366,7 +1517,7 @@ export class AgentsViewController {
       onPinToggle: (id) => {
         const view = this.host.state.agentsView;
         if (view === undefined) return;
-        this.clearConfirm(view);
+        this.clearDeleteOverlays(view);
         // A2 placeholder: pinning would persist the fabricated id into the
         // pins Set — it never survives the promotion to the real id.
         if (isPendingDispatchId(id)) {
@@ -1378,7 +1529,7 @@ export class AgentsViewController {
       onReplyRequest: (id) => {
         const view = this.host.state.agentsView;
         if (view === undefined) return;
-        this.clearConfirm(view);
+        this.clearDeleteOverlays(view);
         if (isPendingDispatchId(id)) {
           this.host.showStatus(DISPATCHING_HINT);
           return;
@@ -1410,7 +1561,7 @@ export class AgentsViewController {
       onReorderPinned: (id, delta) => {
         const view = this.host.state.agentsView;
         if (view === undefined) return;
-        this.clearConfirm(view);
+        this.clearDeleteOverlays(view);
         // Re-anchor selection onto the row BEFORE reordering + pushing props,
         // rather than trusting `view.selectedId` already matches `id` (the
         // caller only invokes this for the currently-selected row, but
@@ -1433,12 +1584,12 @@ export class AgentsViewController {
       onHelpToggle: () => {
         const view = this.host.state.agentsView;
         if (view === undefined) return;
-        if (this.clearConfirm(view)) this.pushProps();
+        if (this.clearDeleteOverlays(view)) this.pushProps();
       },
       onQuit: () => {
         const view = this.host.state.agentsView;
         if (view === undefined) return;
-        // Esc during delete-confirm cancels the confirm, not the view.
+        // Esc during a delete confirm or arm cancels it, not the view.
         this.quitOrCancelConfirm(view);
       },
       // Every Ctrl+C press reports here unconditionally — arm vs. quit is
@@ -1482,7 +1633,7 @@ export class AgentsViewController {
       onGroupModeToggle: () => {
         const view = this.host.state.agentsView;
         if (view === undefined) return;
-        this.clearConfirm(view);
+        this.clearDeleteOverlays(view);
         view.groupMode = view.groupMode === 'state' ? 'directory' : 'state';
         this.pushProps();
         void this.persistGroupMode(view, view.groupMode);

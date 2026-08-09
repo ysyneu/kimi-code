@@ -96,12 +96,23 @@ function pointer(selected: boolean): string {
   return currentTheme.fg(selected ? 'primary' : 'textDim', selected ? `${SELECT_POINTER} ` : '  ');
 }
 
-type StatusColor = 'success' | 'textMuted' | 'primary' | 'error';
+type StatusColor = 'success' | 'textMuted' | 'primary' | 'error' | 'warning';
 
 /** A row's reply send state: set only while its `space`-reply RPC is
  *  outstanding or has failed — orthogonal to `busy`/`unseen`, which track
  *  the agent's own turn state, not the send itself. */
 export type RowSendState = 'sending' | 'failed' | undefined;
+
+/**
+ * B1: a row's Ctrl+X delete-arm state — set only for the ONE row currently
+ * armed (first Ctrl+X pressed, awaiting a confirming second one or an
+ * auto-expire/Esc cancel). `'stopped'` is a busy row whose turn was
+ * stopped immediately, optimistically, alongside the arm (see the agents-
+ * view controller's own `armDelete`); `'arming'` is an idle row, no stop
+ * involved. Overrides the row's summary column and color — never the
+ * status glyph, which stays whatever `busy`/`unseen` already say.
+ */
+export type RowDeleteArm = 'arming' | 'stopped';
 
 /**
  * Busy rows show the ping-pong spinner. Idle rows carry an orthogonal
@@ -175,6 +186,11 @@ export function rosterRowName(row: AgentsRosterRow): string {
  * replaces the summary line with a persistent recovery hint — the row must
  * stay visibly wrong until the user reopens the reply panel (which restores
  * the lost text) or a later send for the same row succeeds.
+ *
+ * `deleteArm` (B1) overrides the summary line and its color the same way —
+ * but never the glyph, and it wins over `sendState`'s own summary/color
+ * override when a row somehow carries both (the arm is the more urgent,
+ * just-pressed interaction).
  */
 export function renderRosterRow(
   row: AgentsRosterRow,
@@ -182,6 +198,7 @@ export function renderRosterRow(
   isOrigin: boolean,
   width: number,
   sendState?: RowSendState,
+  deleteArm?: RowDeleteArm,
 ): string {
   const symbol = statusSymbol(row, sendState);
   const name = rosterRowName(row);
@@ -197,8 +214,16 @@ export function renderRosterRow(
   const metaWidth = metaText.length > 0 ? 1 + visibleWidth(metaText) : 0;
   const metaSegment = metaText.length > 0 ? currentTheme.fg('textMuted', ` ${metaText}`) : '';
 
-  const summary = sendState === 'failed' ? 'reply failed — space to retry' : summaryText(row, name);
-  const summaryColor = sendState === 'failed' ? 'error' : 'textMuted';
+  const summary =
+    deleteArm !== undefined
+      ? deleteArm === 'stopped'
+        ? 'stopped · ctrl+x again to delete'
+        : 'ctrl+x again to delete'
+      : sendState === 'failed'
+        ? 'reply failed — space to retry'
+        : summaryText(row, name);
+  const summaryColor: StatusColor =
+    deleteArm !== undefined ? 'warning' : sendState === 'failed' ? 'error' : 'textMuted';
   const summaryBudget = Math.max(0, width - prefixWidth - NAME_WIDTH - metaWidth);
   const summarySegment =
     summary.length > 0 && summaryBudget > 1
