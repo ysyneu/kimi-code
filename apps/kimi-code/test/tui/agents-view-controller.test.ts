@@ -4166,3 +4166,57 @@ describe('AgentsViewController — grouping mode (Ctrl+S, A6)', () => {
     b.controller.close();
   });
 });
+
+describe('AgentsViewController — empty-fleet skeleton (B10)', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
+    dir = undefined;
+  });
+
+  it('zero rows in state mode: every band header renders with its description line', async () => {
+    const b = await boot([]);
+    dir = b.homeDir;
+    expect(b.view().groupMode).toBe('state');
+    const out = b.render();
+    expect(out).toContain('Needs input');
+    expect(out).toContain('Sessions that have a question or need your decision land here');
+    expect(out).toContain('Working');
+    expect(out).toContain('Sessions Kimi is actively working on — they keep running even if you close the terminal');
+    expect(out).toContain('Completed');
+    expect(out).toContain('Finished sessions wait here for you to review');
+  });
+
+  it('zero rows in directory mode: a plain line, no band headers', async () => {
+    const b = await boot([], { groupMode: 'directory' });
+    dir = b.homeDir;
+    const out = b.render();
+    expect(out).toContain('no sessions yet');
+    expect(out).not.toContain('Needs input');
+    expect(out).not.toContain('Working');
+    expect(out).not.toContain('Completed');
+  });
+
+  it('one real row: descriptions are absent', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    const out = b.render();
+    expect(out).toContain('s1 title');
+    expect(out).not.toContain('Sessions that have a question or need your decision land here');
+    expect(out).not.toContain('Sessions Kimi is actively working on');
+    expect(out).not.toContain('Finished sessions wait here for you to review');
+  });
+
+  it('switching Ctrl+S from empty state mode to empty directory mode swaps the skeleton for the plain line', async () => {
+    const b = await boot([]);
+    dir = b.homeDir;
+    expect(b.render()).toContain('Needs input');
+    b.component().handleInput(CTRL_S);
+    expect(b.view().groupMode).toBe('directory');
+    const out = b.render();
+    expect(out).toContain('no sessions yet');
+    expect(out).not.toContain('Needs input');
+  });
+});

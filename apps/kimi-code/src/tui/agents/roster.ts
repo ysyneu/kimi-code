@@ -58,7 +58,9 @@ type MutableRow = { -readonly [K in keyof AgentsRosterRow]: AgentsRosterRow[K] }
 
 const GROUP_ORDER: readonly AgentsGroupId[] = ['pinned', 'awaiting', 'working', 'completed'];
 
-const GROUP_LABELS: Record<AgentsGroupId, string> = {
+/** Exported so the B10 empty-roster skeleton (`components/agents-view/app.ts`)
+ *  can reuse these exact strings instead of retyping them. */
+export const GROUP_LABELS: Record<AgentsGroupId, string> = {
   pinned: 'Pinned',
   awaiting: 'Needs input',
   working: 'Working',

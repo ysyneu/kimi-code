@@ -294,3 +294,14 @@ export function renderMoreRow(moreCount: number, selected: boolean, width: numbe
   const line = pointer(selected) + currentTheme.fg('textMuted', `… ${String(moreCount)} more`);
   return withSelectedBg(fitExactly(line, width), selected);
 }
+
+/**
+ * B10: a dim explanatory line under an empty-roster skeleton band header
+ * (see `AgentsViewApp`'s own empty-groups skeleton) — never selectable, so
+ * no pointer column; indented to the same 2 columns an unselected header's
+ * own `pointer(false)` reserves, keeping the text aligned under the label
+ * rather than the pointer.
+ */
+export function renderSkeletonDescription(text: string, width: number): string {
+  return fitExactly('  ' + currentTheme.fg('textDim', text), width);
+}

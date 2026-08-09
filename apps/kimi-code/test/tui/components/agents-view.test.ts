@@ -93,6 +93,7 @@ function makeDispatchEditor(): CustomEditor {
 function makeProps(overrides: Partial<AgentsViewProps> = {}): AgentsViewProps {
   return {
     groups: [],
+    emptyGroupsDisplay: 'plain',
     counts: { awaiting: 0, working: 0, completed: 0 },
     selectedId: undefined,
     originId: undefined,
@@ -325,9 +326,9 @@ describe('AgentsViewApp — full-screen rendering', () => {
     expect(out).toContain('the answer is 42');
   });
 
-  it('shows the empty-state copy when there are no groups', () => {
+  it('B10: shows the plain empty-state line when there are no groups (default emptyGroupsDisplay)', () => {
     const out = render(makeApp());
-    expect(out).toContain('No sessions');
+    expect(out).toContain('no sessions yet');
   });
 
   it('renders the dispatch editor as a rule-only frame with its `❯` prompt', () => {
@@ -516,6 +517,69 @@ describe('AgentsViewApp — collapsed group header shows its hidden count', () =
     // label — the very bug this test was written to catch.
     const headerIdx = lines.findIndex((l) => l.includes('Completed'));
     expect(lines[headerIdx + 1]?.trim()).not.toMatch(/^\d/);
+  });
+});
+
+describe('AgentsViewApp — empty-fleet skeleton (B10)', () => {
+  it('zero rows + emptyGroupsDisplay "skeleton" renders every state band header with its dim description line', () => {
+    const out = render(makeApp({ groups: [], emptyGroupsDisplay: 'skeleton' }));
+    expect(out).toContain('Needs input');
+    expect(out).toContain('Sessions that have a question or need your decision land here');
+    expect(out).toContain('Working');
+    expect(out).toContain('Sessions Kimi is actively working on — they keep running even if you close the terminal');
+    expect(out).toContain('Completed');
+    expect(out).toContain('Finished sessions wait here for you to review');
+    // No Pinned band — a zero-row roster can never have a pinned session.
+    expect(out).not.toContain('Pinned');
+  });
+
+  it('the skeleton headers are non-interactive: ↑/↓/Enter/Ctrl+X are all no-ops', () => {
+    const onSelect = vi.fn();
+    const onOpen = vi.fn();
+    const onDeleteRequest = vi.fn();
+    const app = makeApp({
+      groups: [],
+      emptyGroupsDisplay: 'skeleton',
+      onSelect,
+      onOpen,
+      onDeleteRequest,
+    });
+    app.handleInput('\u001B[B'); // down
+    app.handleInput('\u001B[A'); // up
+    app.handleInput('\r'); // enter
+    app.handleInput('\u0018'); // ctrl+x
+    expect(onSelect).not.toHaveBeenCalled();
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(onDeleteRequest).not.toHaveBeenCalled();
+  });
+
+  it('the footer degrades to the bare shortcuts hint — same as any other empty selection', () => {
+    const out = render(makeApp({ groups: [], emptyGroupsDisplay: 'skeleton' }));
+    const footerLine = out.split('\n').at(-1) ?? '';
+    expect(footerLine).toContain('for shortcuts');
+    expect(footerLine).not.toContain('to collapse');
+  });
+
+  it('zero rows + emptyGroupsDisplay "plain" renders a single dim line, no band headers', () => {
+    const out = render(makeApp({ groups: [], emptyGroupsDisplay: 'plain' }));
+    expect(out).toContain('no sessions yet');
+    expect(out).not.toContain('Needs input');
+    expect(out).not.toContain('Working');
+    expect(out).not.toContain('Completed');
+  });
+
+  it('once a real row exists, the descriptions never appear even though the band headers do', () => {
+    const out = render(
+      makeApp({
+        groups: [group('working', [row('s1', { title: 's1 title', busy: true })])],
+        emptyGroupsDisplay: 'skeleton',
+      }),
+    );
+    expect(out).toContain('Working');
+    expect(out).toContain('s1 title');
+    expect(out).not.toContain('Sessions that have a question or need your decision land here');
+    expect(out).not.toContain('Sessions Kimi is actively working on');
+    expect(out).not.toContain('Finished sessions wait here for you to review');
   });
 });
 

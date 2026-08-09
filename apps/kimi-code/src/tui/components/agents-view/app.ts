@@ -76,6 +76,12 @@
  *   controller (via `host`) has access to. `props.pendingExitArmed` is all
  *   this component reads back to decide whether the footer shows the
  *   two-stage hint.
+ * - Empty roster (B10): `props.groups` empty renders `renderEmptyGroups`
+ *   instead of blank chrome — `props.emptyGroupsDisplay` (the controller's
+ *   only mode-derived signal to this otherwise mode-unaware component)
+ *   picks between the STATE-mode band skeleton and directory mode's single
+ *   plain line. Purely cosmetic: never fed into `deriveItems`, so nothing
+ *   it paints is selectable or collapsible.
  */
 
 import {
@@ -87,7 +93,7 @@ import {
   type Focusable,
 } from '@moonshot-ai/pi-tui';
 
-import type { AgentsGroup, AgentsRosterRow } from '@/tui/agents/roster';
+import { GROUP_LABELS, type AgentsGroup, type AgentsRosterRow } from '@/tui/agents/roster';
 import type { CustomEditor } from '@/tui/components/editor/custom-editor';
 import { getVersion } from '#/cli/version';
 import { PRODUCT_NAME } from '#/constant/app';
@@ -100,12 +106,24 @@ import {
   renderGroupHeader,
   renderMoreRow,
   renderRosterRow,
+  renderSkeletonDescription,
   withSelectedBg,
   type RowDeleteArm,
 } from './rows';
 
 export interface AgentsViewProps {
   readonly groups: readonly AgentsGroup[];
+  /**
+   * B10: which "totally empty" (zero session rows anywhere — `groups` came
+   * back empty) rendering `renderList` uses when `groups` is empty.
+   * `'skeleton'` paints every state-mode band header with its dim
+   * explanatory line, none selectable/collapsible (they never enter
+   * `deriveItems`). `'plain'` paints a single dim "no sessions yet" line,
+   * no headers. Which one applies is entirely the controller's call (state
+   * vs. directory grouping mode) — this component only ever picks between
+   * the two pre-built renderings. Ignored whenever `groups` is non-empty.
+   */
+  readonly emptyGroupsDisplay: 'skeleton' | 'plain';
   readonly counts: { awaiting: number; working: number; completed: number };
   /** Selected item: a row id, `group:<id>`, or `more:completed`. */
   readonly selectedId: string | undefined;
@@ -251,6 +269,29 @@ function kimiVersion(): string {
 }
 
 const MORE_ITEM_ID = 'more:completed';
+
+/**
+ * B10: every state-mode band header + its dim explanatory line, painted by
+ * `renderEmptyGroups` when the roster has zero session rows anywhere in
+ * STATE mode. Labels reuse `GROUP_LABELS` verbatim so the skeleton reads as
+ * the same headers the real bands would use once rows exist. No Pinned
+ * entry: a zero-row roster can never have a pinned session either, so that
+ * band never appears even outside the skeleton.
+ */
+const EMPTY_STATE_SKELETON: readonly { readonly label: string; readonly description: string }[] = [
+  {
+    label: GROUP_LABELS.awaiting,
+    description: 'Sessions that have a question or need your decision land here',
+  },
+  {
+    label: GROUP_LABELS.working,
+    description: 'Sessions Kimi is actively working on — they keep running even if you close the terminal',
+  },
+  { label: GROUP_LABELS.completed, description: 'Finished sessions wait here for you to review' },
+];
+
+/** B10: directory mode's own empty-roster line — no headers, just this. */
+const EMPTY_DIRECTORY_MESSAGE = 'no sessions yet';
 
 type ViewItemKind = 'header' | 'row' | 'more' | 'spacer';
 
@@ -753,12 +794,7 @@ export class AgentsViewApp extends Container implements Focusable {
     const items = this.deriveItems();
     const lines: string[] = [];
     if (items.length === 0) {
-      lines.push(
-        fitExactly(
-          currentTheme.fg('textMuted', 'No sessions yet — type below to dispatch a new session.'),
-          width,
-        ),
-      );
+      lines.push(...this.renderEmptyGroups(width));
     } else {
       this.adjustScroll(height, items.length);
       const window = items.slice(this.listScroll, this.listScroll + height);
@@ -769,6 +805,26 @@ export class AgentsViewApp extends Container implements Focusable {
     }
     while (lines.length < height) lines.push(' '.repeat(width));
     return lines.slice(0, height);
+  }
+
+  /**
+   * B10: cosmetic-only chrome for a totally empty roster (`items.length ===
+   * 0`, i.e. `groups` came back empty from both grouping strategies).
+   * Decorative only — never fed into `deriveItems`, so nothing rendered
+   * here is selectable or collapsible; `selectedIndex`/`moveSelection` and
+   * the footer's own `item === undefined` fallback all behave exactly as
+   * they already do for an empty `groups` array.
+   */
+  private renderEmptyGroups(width: number): string[] {
+    if (this.props.emptyGroupsDisplay === 'plain') {
+      return [fitExactly(currentTheme.fg('textMuted', EMPTY_DIRECTORY_MESSAGE), width)];
+    }
+    const lines: string[] = [];
+    for (const band of EMPTY_STATE_SKELETON) {
+      lines.push(renderGroupHeader(band.label, undefined, false, width));
+      lines.push(renderSkeletonDescription(band.description, width));
+    }
+    return lines;
   }
 
   private renderItem(item: ViewItem, selected: boolean, width: number): string {

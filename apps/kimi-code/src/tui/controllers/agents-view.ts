@@ -1296,6 +1296,10 @@ export class AgentsViewController {
     });
     return {
       groups,
+      // B10: which empty-roster rendering `groups === []` gets — the
+      // component itself stays mode-unaware, this is the one pre-computed
+      // signal it reads to pick between the two.
+      emptyGroupsDisplay: view.groupMode === 'directory' ? 'plain' : 'skeleton',
       counts: view.roster.counts(),
       selectedId: view.selectedId,
       originId: view.originSessionId,
