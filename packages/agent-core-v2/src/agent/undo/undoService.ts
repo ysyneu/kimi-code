@@ -7,11 +7,12 @@
  * `eventBus`, `telemetry`, and `wire`. Bound at Agent scope.
  *
  * Also mirrors the main agent's most recent assistant reply into
- * `sessionMetadata.lastAssistantText` on every `turn.ended` (mirrors
- * `reconcileLastPrompt`'s backscan, on the response side instead of the undo
- * side) — the same L4-turn-facts-into-L6-sessionMetadata coordination this
- * domain already does for `lastPrompt`, just driven by the turn lifecycle
- * rather than by an undo.
+ * `sessionMetadata.lastAssistantText`, both on every `turn.ended` and after
+ * an undo (mirrors `reconcileLastPrompt`'s backscan, on the response side
+ * instead of the undo side) — the same L4-turn-facts-into-L6-sessionMetadata
+ * coordination this domain already does for `lastPrompt`, driven by both the
+ * turn lifecycle and the undo itself (an undo can cut off the anchor turn's
+ * reply, same as it can cut off its prompt).
  */
 
 import { Disposable, type IDisposable } from '#/_base/di/lifecycle';
@@ -123,6 +124,11 @@ export class AgentConversationUndoService
       await this.reconcileParticipants();
       await this.flushAfterCommit('state reconciliation');
       await this.reconcileLastPromptSafely();
+      // I10: `context.undo` can cut off the anchor turn's assistant reply
+      // too — without this, `lastAssistantText` (and everything it feeds:
+      // the roster summary, the reply-panel preview) keeps showing text
+      // that undo already removed from history, until some later turn ends.
+      await this.reconcileLastAssistantTextSafely();
       this.telemetry.track2('conversation_undo', { count: turns });
       this.eventBus.publish({ type: 'context.undone', turns });
       return turns;

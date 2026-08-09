@@ -445,6 +445,34 @@ describe('AgentConversationUndoService', () => {
     await expect(metadata.read()).resolves.toMatchObject({ lastPrompt: undefined });
   });
 
+  it('I10: clears lastAssistantText when undo removes the only reply', async () => {
+    setup();
+    const metadata = ctx.get(ISessionMetadata);
+    await metadata.ready;
+    await metadata.update({ lastAssistantText: 'a1' });
+    ctx.appendTurnExchange('u1', 'a1');
+
+    await ctx.get(IAgentConversationUndoService).undo(1);
+
+    await expect(metadata.read()).resolves.toMatchObject({ lastAssistantText: undefined });
+  });
+
+  it("I10: reconciles lastAssistantText to the surviving turn's reply after undoing the newest turn", async () => {
+    setup();
+    const metadata = ctx.get(ISessionMetadata);
+    await metadata.ready;
+    ctx.appendTurnExchange('u1', 'a1');
+    ctx.appendTurnExchange('u2', 'a2');
+    // Stale value undo must overwrite — appendTurnExchange bypasses the
+    // turn.ended path that would normally have set this, same as the
+    // lastPrompt test above seeds its own stale value.
+    await metadata.update({ lastAssistantText: 'a2' });
+
+    await ctx.get(IAgentConversationUndoService).undo(1);
+
+    await expect(metadata.read()).resolves.toMatchObject({ lastAssistantText: 'a1' });
+  });
+
   it('mirrors the last assistant reply into lastAssistantText on turn.ended', async () => {
     setup();
     const metadata = ctx.get(ISessionMetadata);
