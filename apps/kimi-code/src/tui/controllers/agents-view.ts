@@ -1807,6 +1807,12 @@ export class AgentsViewController {
         await this.host.harness.deleteSession(sessionId);
         view.roster.remove(sessionId);
         view.viewSessions.delete(sessionId);
+        // M1: `AgentsRoster.remove` drops only the row — pins/seenAt are
+        // separate persisted Sets/Maps the controller owns (see their own
+        // AgentsViewState doc comments) and are never pruned on their own,
+        // so a deleted id would otherwise linger in them forever.
+        view.pins.delete(sessionId);
+        view.seenAt.delete(sessionId);
         view.pendingReplyIds.delete(sessionId);
         view.replyFailures.delete(sessionId);
         view.replyAttempts.delete(sessionId);

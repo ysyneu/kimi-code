@@ -789,6 +789,30 @@ describe('AgentsViewController — delete', () => {
     expect(b.view().replyAttempts.has('s2')).toBe(false);
     expect(b.view().replyBarriers.has('s2')).toBe(false);
   });
+
+  it('M1: deleting a pinned row prunes it from pins and seenAt too, not just viewSessions', async () => {
+    const b = await boot([summary('s1'), summary('s2')]);
+    dir = b.homeDir;
+    // Pin s1 first so its id lives in `pins`, and mark it seen so it lives
+    // in `seenAt` too — both are separate persisted Sets/Maps `AgentsRoster
+    // .remove` never touches.
+    b.view().roster.setPinned('s1', true);
+    b.view().seenAt.set('s1', Date.now());
+    expect(b.view().pins.has('s1')).toBe(true);
+    expect(b.view().seenAt.has('s1')).toBe(true);
+
+    // Select s1 (now in the Pinned group, sorted first) and archive it.
+    b.component().handleInput(DOWN);
+    expect(b.view().selectedId).toBe('s1');
+    b.component().handleInput(CTRL_X);
+    b.component().handleInput(CTRL_X);
+    await flush();
+
+    expect(b.view().pins.has('s1')).toBe(false);
+    expect(b.view().seenAt.has('s1')).toBe(false);
+    // The persisted file carries no trace of the id either.
+    await waitForViewState(b.homeDir, { pins: new Set(), sessions: new Set(['s2']) });
+  });
 });
 
 describe('AgentsViewController — row delete arm (B1)', () => {
