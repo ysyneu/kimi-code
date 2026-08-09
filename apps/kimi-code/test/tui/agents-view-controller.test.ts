@@ -2552,13 +2552,13 @@ describe('AgentsViewController — reply mode (space)', () => {
     // straight through — the wire-row seeding path used elsewhere in this
     // file only forwards `id`/`title` by default (see `makeHarness`), which
     // would lose the very fields this test is about.
-    const b = await boot([summary('s1', { lastAssistantText: 'the answer is 42', updatedAt: Date.now() })]);
+    const b = await boot([summary('s1', { lastAssistantText: 'the answer is 42', updatedAt: Date.now() - 5_000 })]);
     dir = b.homeDir;
     b.component().handleInput(DOWN);
     b.component().handleInput(SPACE);
     const out = b.render();
     expect(out).toContain('the answer is 42');
-    expect(out).toContain('just now');
+    expect(out).toContain('5s');
   });
 
   it('the panel falls back to the initial prompt when no assistant output exists yet', async () => {

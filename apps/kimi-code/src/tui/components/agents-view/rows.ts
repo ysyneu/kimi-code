@@ -80,16 +80,22 @@ function singleLine(text: string): string {
   return text.replaceAll(/\s+/g, ' ').trim();
 }
 
+/**
+ * Compact relative time, right-flush in the row's meta zone: largest unit
+ * whose value is ≥1, floor division, no suffix (`45s` / `4m` / `2h` / `2d` —
+ * never `ago`/`just now`). Under 1 second still reads `0s` rather than
+ * disappearing.
+ */
 export function formatRelativeTime(ts: number): string {
   if (!Number.isFinite(ts) || ts <= 0) return '';
   const diffSec = Math.floor(Math.max(0, Date.now() - ts) / 1000);
-  if (diffSec < 60) return 'just now';
+  if (diffSec < 60) return `${String(diffSec)}s`;
   const minutes = Math.floor(diffSec / 60);
-  if (minutes < 60) return `${String(minutes)}m ago`;
+  if (minutes < 60) return `${String(minutes)}m`;
   const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${String(hours)}h ago`;
+  if (hours < 24) return `${String(hours)}h`;
   const days = Math.floor(hours / 24);
-  return `${String(days)}d ago`;
+  return `${String(days)}d`;
 }
 
 function pointer(selected: boolean): string {

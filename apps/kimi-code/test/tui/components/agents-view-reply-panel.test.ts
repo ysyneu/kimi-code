@@ -128,13 +128,17 @@ describe('renderReplyPanel', () => {
   });
 
   it('includes the preview text and a relative-age line, in that order', () => {
+    // A fixed 5s-ago offset, not `Date.now()` itself — see the equivalent
+    // rows.ts test's own note on the compact format's exact-second flake risk.
     const out = strip(
-      renderReplyPanel(row({ lastAssistantText: 'the answer is 42', updatedAt: Date.now() }), makeEditor(), 100).join(
-        '\n',
-      ),
+      renderReplyPanel(
+        row({ lastAssistantText: 'the answer is 42', updatedAt: Date.now() - 5_000 }),
+        makeEditor(),
+        100,
+      ).join('\n'),
     );
     const previewIdx = out.indexOf('the answer is 42');
-    const ageIdx = out.indexOf('just now');
+    const ageIdx = out.indexOf('5s');
     expect(previewIdx).toBeGreaterThan(-1);
     expect(ageIdx).toBeGreaterThan(previewIdx);
   });

@@ -73,13 +73,22 @@ function row(overrides: Partial<AgentsRosterRow> = {}): AgentsRosterRow {
 
 describe('renderRosterRow', () => {
   it('renders name, assistant summary, and time in order, with no cwd', () => {
+    // A fixed 5s-ago offset, not `Date.now()` itself — the compact format's
+    // sub-minute bucket is exact seconds, so timing the two `Date.now()`
+    // calls (row construction, then formatRelativeTime's own) to land in the
+    // same second would otherwise be a rare source of flake.
     const line = strip(
-      renderRosterRow(row({ lastAssistantText: 'the answer is 42', updatedAt: Date.now() }), false, false, 80),
+      renderRosterRow(
+        row({ lastAssistantText: 'the answer is 42', updatedAt: Date.now() - 5_000 }),
+        false,
+        false,
+        80,
+      ),
     );
 
     const nameIdx = line.indexOf('s1 title');
     const summaryIdx = line.indexOf('the answer is 42');
-    const timeIdx = line.indexOf('just now');
+    const timeIdx = line.indexOf('5s');
     expect(nameIdx).toBeGreaterThan(-1);
     expect(summaryIdx).toBeGreaterThan(nameIdx);
     expect(timeIdx).toBeGreaterThan(summaryIdx);
@@ -170,7 +179,7 @@ describe('renderRosterRow — summary truncates, meta never does', () => {
     const updatedAt = Date.now() - 5 * 60 * 1000;
     const line = strip(renderRosterRow(row({ lastAssistantText: longSummary, updatedAt }), false, false, 90));
     expect(line).toHaveLength(90);
-    expect(line.endsWith('5m ago')).toBe(true);
+    expect(line.endsWith('5m')).toBe(true);
     // The summary itself got cut with an ellipsis well before the line end.
     const summaryZone = line.slice(PREFIX_WIDTH + NAME_WIDTH);
     expect(summaryZone).toContain('…');
@@ -180,22 +189,22 @@ describe('renderRosterRow — summary truncates, meta never does', () => {
     const longSummary = 'hi nihao, 有什么可以帮你的吗? 比如修 bug、加功能、或者看看代码，直接说就行';
     const updatedAt = Date.now() - (9 * 60 * 1000 + 5_000); // comfortably inside the 9m bucket
     const line = strip(renderRosterRow(row({ lastAssistantText: longSummary, updatedAt }), false, false, 60));
-    expect(line.endsWith('9m ago')).toBe(true);
-    expect(line).not.toContain('ago …');
+    expect(line.endsWith('9m')).toBe(true);
+    expect(line).not.toContain('9m …');
   });
 
   it('a short summary still leaves the time flush against the last column', () => {
     const updatedAt = Date.now() - 60 * 1000;
     const line = strip(renderRosterRow(row({ lastAssistantText: 'ok', updatedAt }), false, false, 80));
     expect(line).toHaveLength(80);
-    expect(line.endsWith('1m ago')).toBe(true);
+    expect(line.endsWith('1m')).toBe(true);
   });
 
   it('an empty summary still right-flushes the time to the last column', () => {
     const updatedAt = Date.now() - 2 * 60 * 60 * 1000;
     const line = strip(renderRosterRow(row({ updatedAt }), false, false, 70));
     expect(line).toHaveLength(70);
-    expect(line.endsWith('2h ago')).toBe(true);
+    expect(line.endsWith('2h')).toBe(true);
   });
 });
 
@@ -215,7 +224,7 @@ describe('renderRosterRow — untrusted badge in the meta zone', () => {
       ),
     );
     expect(line).toHaveLength(80);
-    expect(line.endsWith('untrusted · 4m ago')).toBe(true);
+    expect(line.endsWith('untrusted · 4m')).toBe(true);
   });
 
   it('omits the badge entirely when the row is trusted', () => {
@@ -225,12 +234,12 @@ describe('renderRosterRow — untrusted badge in the meta zone', () => {
 
   it('at a narrow width the badge yields first so the time still shows in full', () => {
     // 60 cols leaves only 14 columns after the fixed prefix (4) + name (42) —
-    // not enough for "untrusted · 4m ago" (19), but enough for "4m ago" (7)
-    // alone. The badge disappears; the time is never partially shown.
+    // not enough for "untrusted · 4m" (15), but enough for "4m" (3) alone.
+    // The badge disappears; the time is never partially shown.
     const updatedAt = Date.now() - 4 * 60 * 1000;
     const line = strip(renderRosterRow(row({ trusted: false, updatedAt }), false, false, 60));
     expect(line).not.toContain('untrusted');
-    expect(line.endsWith('4m ago')).toBe(true);
+    expect(line.endsWith('4m')).toBe(true);
   });
 
   it('below the width where even the time alone fits, it disappears whole — never a partial cut', () => {
@@ -477,11 +486,22 @@ describe('renderMoreRow', () => {
   });
 });
 
-describe('formatRelativeTime (sanity — consumed directly by the meta zone)', () => {
-  it('formats minutes/hours/days with no "ago"-less form and no fractional units', () => {
-    expect(formatRelativeTime(Date.now() - 30_000)).toBe('just now');
-    expect(formatRelativeTime(Date.now() - 5 * 60 * 1000)).toBe('5m ago');
-    expect(formatRelativeTime(Date.now() - 3 * 60 * 60 * 1000)).toBe('3h ago');
-    expect(formatRelativeTime(Date.now() - 2 * 24 * 60 * 60 * 1000)).toBe('2d ago');
+describe('formatRelativeTime — compact form, no suffix (B3)', () => {
+  it('picks the largest unit whose value is ≥1, floor division, at every bucket boundary', () => {
+    expect(formatRelativeTime(Date.now() - 59_000)).toBe('59s');
+    expect(formatRelativeTime(Date.now() - 60_000)).toBe('1m');
+    expect(formatRelativeTime(Date.now() - 59 * 60 * 1000)).toBe('59m');
+    expect(formatRelativeTime(Date.now() - 60 * 60 * 1000)).toBe('1h');
+    expect(formatRelativeTime(Date.now() - 23 * 60 * 60 * 1000)).toBe('23h');
+    expect(formatRelativeTime(Date.now() - 24 * 60 * 60 * 1000)).toBe('1d');
+  });
+
+  it('under 1 second still reads "0s" rather than disappearing', () => {
+    expect(formatRelativeTime(Date.now())).toBe('0s');
+  });
+
+  it('never carries the old "ago"/"just now" wording', () => {
+    expect(formatRelativeTime(Date.now() - 5 * 60 * 1000)).not.toContain('ago');
+    expect(formatRelativeTime(Date.now() - 30_000)).not.toBe('just now');
   });
 });
