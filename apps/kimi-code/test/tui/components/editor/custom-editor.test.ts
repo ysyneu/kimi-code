@@ -1,3 +1,7 @@
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import type {
   AutocompleteItem,
   AutocompleteProvider,
@@ -166,6 +170,52 @@ describe('CustomEditor onShiftEnterSubmit', () => {
     editor.handleInput(SHIFT_ENTER);
 
     expect(onShiftEnterSubmit).not.toHaveBeenCalled();
+  });
+
+  // Fix round 1 (review): unlike a plain Enter — which pi-tui's base
+  // `Editor.handleInput` special-cases while a dropdown is open, resolving
+  // the highlighted suggestion into the buffer first — the shift+enter
+  // interception above used to run unconditionally, so pressing it while an
+  // `@file` mention dropdown was open dispatched the raw, unexpanded
+  // `@partial` text as the literal prompt instead of the file path the user
+  // was about to select.
+  describe('vs. an open autocomplete dropdown', () => {
+    let dir: string | undefined;
+    afterEach(async () => {
+      if (dir !== undefined) {
+        await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+      }
+      dir = undefined;
+    });
+
+    it('resolves the highlighted suggestion into the buffer instead of dispatching the raw @partial text — fails without the isShowingAutocomplete() guard', async () => {
+      const workDir = await mkdtemp(join(tmpdir(), 'custom-editor-mention-'));
+      dir = workDir;
+      await writeFile(join(workDir, 'incident-notes.md'), '# notes');
+      const editor = makeEditor();
+      const onShiftEnterSubmit = vi.fn(() => true);
+      editor.onShiftEnterSubmit = onShiftEnterSubmit;
+      editor.setAutocompleteProvider(new FileMentionProvider([], workDir, null));
+
+      editor.handleInput('@');
+      // The scan + suggestion pipeline is async (debounce timer + a real
+      // fs.readdir) — same wait the file-mention-provider/custom-editor
+      // slash-completion tests above already use.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await flushAutocomplete();
+      expect(editor.isShowingAutocomplete()).toBe(true);
+
+      editor.handleInput(SHIFT_ENTER);
+
+      // Resolved into the buffer, not dispatched: the hook never saw the
+      // raw text, and the dropdown is gone — the same accept-before-acting
+      // step a plain Enter gets for free (`Editor.
+      // acceptHighlightedAutocomplete`, shared with `tui.select.confirm`).
+      expect(onShiftEnterSubmit).not.toHaveBeenCalled();
+      expect(editor.isShowingAutocomplete()).toBe(false);
+      expect(editor.getText()).toContain('incident-notes.md');
+      expect(editor.getText()).not.toBe('@');
+    });
   });
 });
 

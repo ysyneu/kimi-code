@@ -2086,6 +2086,73 @@ describe('AgentsViewController — A2 optimistic dispatch placeholder', () => {
     expect(b.view().viewSessions.has('new-session')).toBe(true);
     expect(b.fake.createdSession.prompt).toHaveBeenCalledWith('fix the flaky test');
   });
+
+  // Fix round 1 (review): B7's attach hop can detach the roster view before
+  // the first turn's own activateSkill/prompt call settles — a rejection
+  // reaching flash()'s pushProps() then silently no-ops (view.detached),
+  // unlike every other dispatch failure, which the roster view is still
+  // mounted to show.
+  it('B7: a first-turn failure after the attach hop reaches the host-level error surface, not the (now-unrenderable) roster flash', async () => {
+    let ctrl: AgentsViewController | undefined;
+    const b = await boot([summary('s1')], {
+      onOpenSession: (id) => ctrl?.detachForAttach(id),
+    });
+    ctrl = b.controller;
+    dir = b.homeDir;
+    b.fake.createdSession.prompt.mockRejectedValueOnce(new Error('model unavailable'));
+
+    b.view().dispatch.editor.onShiftEnterSubmit?.('fix the flaky test');
+    await flush();
+
+    // The attach hop already detached the roster view by the time
+    // prompt() rejected — pushProps() would have silently dropped a flash
+    // written to the (now-unmounted) view.
+    expect(b.view().detached).toBe(true);
+    expect(b.showError).toHaveBeenCalledWith(expect.stringContaining('model unavailable'));
+    expect(b.view().flashMessage).toBeUndefined();
+  });
+
+  // Fix round 1 (review): `refreshRoster`'s WS-reconnect reseed
+  // (`AgentsRoster.setAllRows`) fully clears the roster from the server's
+  // row list only — a client-only placeholder has no server-side row to
+  // survive that, and previously vanished until createSession resolved.
+  it('a WS reconnect mid-dispatch re-asserts the still-in-flight placeholder instead of wiping it', async () => {
+    const b = await boot([summary('s1')], { wire: true, rows: [wireRow('s1')] });
+    dir = b.homeDir;
+    await flush(); // the one-shot trust load settles
+    const deferred = deferCreateSession(b);
+
+    b.view().dispatch.editor.onSubmit?.('fix the flaky test');
+    const placeholderId = b.view().selectedId!;
+    expect(b.view().roster.get(placeholderId)).not.toBeUndefined();
+
+    // A reconnect lands WHILE createSession is still pending — its full
+    // roster reseed has no server-side row for the client-only placeholder.
+    b.fake.emitConnection(true);
+    await flush();
+
+    // The placeholder must survive the reseed: same busy/title, and the
+    // selection stayed on it (refreshRoster re-asserts placeholders BEFORE
+    // its own dangling-selection check).
+    const survivor = b.view().roster.get(placeholderId);
+    expect(survivor?.busy).toBe(true);
+    expect(survivor?.title).toBe('fix the flaky test');
+    expect(b.view().selectedId).toBe(placeholderId);
+
+    deferred.resolve();
+    await flush();
+
+    // Resolves normally afterward: promoted in place, no leftover
+    // placeholder, no double row.
+    expect(b.view().roster.get(placeholderId)).toBeUndefined();
+    expect(b.view().selectedId).toBe('new-session');
+    const rowCount = b
+      .view()
+      .roster.groups(Number.MAX_SAFE_INTEGER)
+      .flatMap((group) => group.rows)
+      .filter((row) => row.title === 'fix the flaky test').length;
+    expect(rowCount).toBe(1);
+  });
 });
 
 describe('AgentsViewController — reply mode (space)', () => {
