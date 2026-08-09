@@ -1815,17 +1815,20 @@ describe('AgentsViewDispatch — editor wiring', () => {
     expect(onError).toHaveBeenCalledWith('Too short — describe the task');
   });
 
-  it('B6: a known-but-unsuitable slash command goes to onError with the rejection toast, restores the composer text (pi-tui already cleared it pre-submit), and never reaches onSubmit', () => {
+  it('B6: a known-but-unsuitable slash command goes to onToast (not onError — M3) with the rejection toast, restores the composer text (pi-tui already cleared it pre-submit), and never reaches onSubmit', () => {
     const dispatch = makeDispatch();
     const onSubmit = vi.fn();
     const onError = vi.fn();
+    const onToast = vi.fn();
     dispatch.onSubmit = onSubmit;
     dispatch.onError = onError;
+    dispatch.onToast = onToast;
     // Mirrors real submitValue(): pi-tui clears the buffer before onSubmit fires.
     dispatch.editor.setText('');
     dispatch.editor.onSubmit?.('/yolo fix the flaky test');
     expect(onSubmit).not.toHaveBeenCalled();
-    expect(onError).toHaveBeenCalledWith(
+    expect(onError).not.toHaveBeenCalled();
+    expect(onToast).toHaveBeenCalledWith(
       "/yolo isn't available in agent view — attach to a session to run it",
     );
     expect(dispatch.editor.getText()).toBe('/yolo fix the flaky test');
@@ -2361,6 +2364,27 @@ describe('AgentsViewController — dispatch', () => {
     expect(b.fake.createSession).not.toHaveBeenCalled();
     expect(b.render()).toContain("/yolo isn't available in agent view — attach to a session to run it");
     expect(b.view().dispatch.editor.getText()).toBe('/yolo fix the flaky test');
+    b.controller.close(); // clear the pending flash timer
+  });
+
+  it('M3: the B6 toast leaves the composer focused with its text, so Enter keeps editing instead of attaching to the selected row', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    // Composer was focused (as it would be after routeToDispatch typed the
+    // command in) before the rejected submit — the bug this guards against
+    // only shows up starting from a focused composer.
+    b.view().dispatchFocused = true;
+    b.view().dispatch.editor.focused = true;
+    b.view().dispatch.editor.setText('');
+    b.view().dispatch.editor.onSubmit?.('/help');
+    await flush();
+    expect(b.render()).toContain("/help isn't available in agent view — attach to a session to run it");
+    expect(b.view().dispatch.editor.getText()).toBe('/help');
+    // The composer keeps focus — Enter on the row list (dispatchFocused ===
+    // false) is what attaches; staying focused is what routes Enter back
+    // into the editor instead (see `AgentsViewApp.handleInput`).
+    expect(b.view().dispatchFocused).toBe(true);
+    expect(b.view().dispatch.editor.focused).toBe(true);
     b.controller.close(); // clear the pending flash timer
   });
 

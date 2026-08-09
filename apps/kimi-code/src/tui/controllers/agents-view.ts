@@ -603,6 +603,14 @@ export class AgentsViewController {
       if (view !== undefined) this.closeReplyPanel(view);
       this.flash(message);
     };
+    // M3: the B6 "not runnable here" toast restores the composer's text
+    // (`AgentsViewDispatch.handleEditorSubmit`) so the user can edit it —
+    // closing the reply panel here (as `onError` does) would strand that
+    // text with focus on the list, where Enter attaches instead of editing.
+    // Just flash; leave focus and the restored text alone.
+    dispatch.onToast = (message) => {
+      this.flash(message);
+    };
     // `exit` / `/exit` submitted from the dispatch composer — dispatch mode
     // only, `AgentsViewDispatch` never fires this while `replying`. Same
     // close path as onQuit (Esc-Esc / `?` grid's `esc to quit`).

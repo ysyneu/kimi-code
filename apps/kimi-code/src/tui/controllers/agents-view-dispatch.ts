@@ -196,13 +196,20 @@ export function parseReplyInput(raw: string): DispatchParseResult {
 /**
  * Owns the dispatch CustomEditor: submits parse through `parseDispatchInput`
  * (or, while `replying` is set, the no-slash-detection `parseReplyInput`) and
- * fan out to `onSubmit` (parsed submission) or `onError` (rejection message).
+ * fans out to `onSubmit` (parsed submission), `onToast` (a known command
+ * that isn't runnable here — B6) or `onError` (a genuine parse failure).
  * The editor clears itself on submit (pi-tui behaviour), so every submission
  * starts from an empty box.
  */
 export class AgentsViewDispatch {
   readonly editor: CustomEditor;
   onSubmit: ((parsed: DispatchSubmission) => void) | undefined;
+  /** M3: fires for the B6 "known command, not runnable here" case. The
+   *  composer already has its text restored (`handleEditorSubmit` below) —
+   *  unlike `onError`, this must NOT close the reply panel or drop focus to
+   *  the list, or the restored text strands there with Enter attaching
+   *  instead of editing. */
+  onToast: ((message: string) => void) | undefined;
   onError: ((message: string) => void) | undefined;
   /** Fires instead of `onSubmit`/`onError` when the dispatch-mode composer
    *  is submitted with exactly `exit` or `/exit` — closes the view. Never
@@ -287,9 +294,11 @@ export class AgentsViewDispatch {
     if ('toast' in parsed) {
       // B6: known command, not runnable here — nothing dispatches, and
       // unlike a generic error the composer gets its (already-cleared-by-
-      // pi-tui) text back so the user can edit it.
+      // pi-tui) text back so the user can edit it. M3: routed through
+      // `onToast`, not `onError` — the caller must leave focus on the
+      // composer with the restored text, not drop it to the list.
       this.editor.setText(raw);
-      this.onError?.(parsed.toast);
+      this.onToast?.(parsed.toast);
       return;
     }
     if ('error' in parsed) {
