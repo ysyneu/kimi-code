@@ -45,6 +45,10 @@ describe('shortenWorkDirLabel', () => {
   it('leaves the path untouched when home is unknown (empty)', () => {
     expect(shortenWorkDirLabel('/home/alex/sample-repo', '')).toBe('/home/alex/sample-repo');
   });
+
+  it('collapses a workDir with exactly one trailing slash past home to ~, not ~/ (review round 1, Minor finding #4)', () => {
+    expect(shortenWorkDirLabel('/home/alex/', '/home/alex')).toBe('~');
+  });
 });
 
 describe('buildDirectoryGroups', () => {
@@ -110,7 +114,9 @@ describe('buildDirectoryGroups', () => {
       row('unpinned', { workDir: '/home/alex/projects/sample-repo' }),
     ];
     const groups = buildDirectoryGroups(rows, new Set(), HOME);
-    expect(groups[0]?.id).toBe('pinned');
+    // Not state mode's 'pinned' literal — see the id's own doc for why
+    // (collapsedGroups id-space disjointness, review round 1 finding #2).
+    expect(groups[0]?.id).toBe('directory-pinned');
     expect(groups[0]?.rows.map((r) => r.id).sort()).toEqual(['awaiting-pinned', 'busy-pinned', 'idle-pinned']);
     expect(groups.find((g) => g.id === 'dir:/home/alex/projects/sample-repo')?.rows.map((r) => r.id)).toEqual([
       'unpinned',

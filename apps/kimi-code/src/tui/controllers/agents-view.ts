@@ -236,10 +236,13 @@ export interface AgentsViewState {
   pendingExitTimer: ReturnType<typeof setTimeout> | undefined;
   /**
    * Group ids currently manually collapsed. State-mode ids (`AgentsGroupId`)
-   * and directory-mode ids (`dir:<workDir>` / `other`, `AgentsGroup.id`'s own
-   * doc) share this one `Set<string>` — a collapse from one mode simply never
-   * matches an id from the other, so switching modes naturally shows
-   * everything expanded again there without any explicit reset.
+   * and directory-mode ids (`dir:<workDir>` / `other` / `directory-pinned`,
+   * `AgentsGroup.id`'s own doc) share this one `Set<string>` — the two id
+   * spaces are kept deliberately disjoint (directory mode's Pinned group
+   * uses `directory-pinned`, not state mode's `pinned`, precisely so this
+   * holds), so a collapse from one mode never matches an id from the other:
+   * switching modes naturally shows everything expanded again there without
+   * any explicit reset.
    */
   collapsedGroups: Set<string>;
   completedExpanded: boolean;

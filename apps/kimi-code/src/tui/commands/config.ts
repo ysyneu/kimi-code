@@ -60,6 +60,11 @@ function currentTuiConfig(host: SlashCommandHost): TuiConfig {
     disablePasteBurst: host.state.appState.disablePasteBurst ?? DEFAULT_TUI_CONFIG.disablePasteBurst,
     notifications: host.state.appState.notifications,
     upgrade: host.state.appState.upgrade,
+    // Every field this helper omits gets silently reset to the schema
+    // default by the very next `/theme` / `/editor` / auto-update-toggle
+    // save (each spreads this snapshot into `saveTuiConfig`) — agentsView
+    // must be threaded through the same as every other persisted field.
+    agentsView: { groupMode: host.agentsViewGroupMode() },
   };
 }
 
@@ -845,6 +850,10 @@ type UpdatePreferenceHost = {
     >;
   };
   setAppState(patch: Pick<SlashCommandHost['state']['appState'], 'upgrade'>): void;
+  // Not read from `state.appState` (see `SlashCommandHost.agentsViewGroupMode`'s
+  // own doc) — required here too since this narrowed host is forced back to
+  // `SlashCommandHost` for the shared `currentTuiConfig()` call below.
+  agentsViewGroupMode: SlashCommandHost['agentsViewGroupMode'];
   showStatus(msg: string, color?: string): void;
   track: SlashCommandHost['track'];
 };

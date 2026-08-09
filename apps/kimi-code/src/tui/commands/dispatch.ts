@@ -5,6 +5,7 @@ import type { KimiHarness, Session } from '@moonshot-ai/kimi-code-sdk';
 import type { ColorToken, ThemeName } from '#/tui/theme';
 
 import { LLM_NOT_SET_MESSAGE } from '../constant/kimi-tui';
+import type { AgentsGroupMode } from '../controllers/agents-view-groups';
 import type { AuthFlowController } from '../controllers/auth-flow';
 import type { BtwPanelController } from '../controllers/btw-panel';
 import type { StreamingUIController } from '../controllers/streaming-ui';
@@ -107,6 +108,17 @@ export interface SlashCommandHost {
   deferUserMessages: boolean;
 
   setAppState(patch: Partial<AppState>): void;
+  /**
+   * Agents-view roster grouping mode (A6) — sync, in-memory read of the same
+   * preference `AgentsViewHost.agentsViewGroupMode()` exposes. Not part of
+   * `AppState`/`setAppState`: it's mutated only via `AgentsViewController`'s
+   * own Ctrl+S path (`saveAgentsViewGroupMode`), never through a slash
+   * command. Exists on this interface solely so `commands/config.ts`'s
+   * `currentTuiConfig()` can thread the current value through an unrelated
+   * `/theme` / `/editor` / auto-update-toggle save — omitting a field
+   * `saveTuiConfig` writes silently resets it to the schema default on disk.
+   */
+  agentsViewGroupMode(): AgentsGroupMode;
   resetLivePane(): void;
   showError(msg: string): void;
   showStatus(msg: string, color?: ColorToken): void;

@@ -3704,6 +3704,31 @@ describe('AgentsViewController — grouping mode (Ctrl+S, A6)', () => {
     expect(selectedLine(b.render())).toContain('s1 title');
   });
 
+  it("collapsing Pinned in one mode does not carry into the other mode's Pinned group (review round 1, Important finding #2 — ids must actually be namespaced, not just documented as disjoint)", async () => {
+    const b = await boot([summary('p1', { workDir: '/srv/repos/alpha-app' })]);
+    dir = b.homeDir;
+    b.view().roster.setPinned('p1', true);
+
+    // Collapse Pinned using state mode's real group id, then switch to
+    // directory mode: its Pinned group uses a different id
+    // (`directory-pinned`, not `pinned`) precisely so this never collapses
+    // it too.
+    b.view().collapsedGroups.add('pinned');
+    b.component().handleInput(CTRL_S); // -> directory mode
+    let out = b.render();
+    expect(out).toContain('Pinned');
+    expect(out).toContain('p1 title');
+
+    // And the reverse: collapse directory mode's Pinned, switch back to
+    // state mode — its Pinned group must still be expanded.
+    b.view().collapsedGroups.clear();
+    b.view().collapsedGroups.add('directory-pinned');
+    b.component().handleInput(CTRL_S); // -> state mode
+    out = b.render();
+    expect(out).toContain('Pinned');
+    expect(out).toContain('p1 title');
+  });
+
   it('Ctrl+X on a directory group header archives only that directory\'s rows (would fail without mode-aware group lookup)', async () => {
     const b = await boot([
       summary('a1', { workDir: '/srv/repos/alpha-app' }),

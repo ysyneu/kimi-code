@@ -26,10 +26,14 @@ export interface AgentsGroup {
   /**
    * State mode uses the closed `AgentsGroupId` enum; directory mode
    * (A6, `controllers/agents-view-groups.ts`) mints its own ids
-   * (`dir:<workDir>`, `other`) that this class knows nothing about — a plain
-   * `string` is the only type both grouping strategies can share. Consumers
-   * that only ever see state-mode groups (this file's own `GROUP_LABELS`/
-   * `GROUP_ORDER`) still key off the narrower `AgentsGroupId` internally.
+   * (`dir:<workDir>`, `other`, `directory-pinned`) that this class knows
+   * nothing about — a plain `string` is the only type both grouping
+   * strategies can share. Deliberately disjoint from `AgentsGroupId`'s own
+   * values (in particular `directory-pinned` vs. state mode's `pinned`) so
+   * the two id spaces never collide in a shared `Set<string>` like
+   * `AgentsViewState.collapsedGroups`. Consumers that only ever see
+   * state-mode groups (this file's own `GROUP_LABELS`/`GROUP_ORDER`) still
+   * key off the narrower `AgentsGroupId` internally.
    */
   readonly id: string;
   readonly label: string;

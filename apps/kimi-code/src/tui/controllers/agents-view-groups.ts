@@ -17,7 +17,16 @@ import type { AgentsGroup, AgentsRosterRow } from '../agents/roster';
 
 export type AgentsGroupMode = 'state' | 'directory';
 
-const PINNED_GROUP_ID = 'pinned';
+/**
+ * Deliberately NOT `'pinned'` — state mode's `AgentsGroupId` already uses
+ * that literal id (`roster.ts` `GROUP_ORDER`), and `AgentsViewState.
+ * collapsedGroups` is one `Set<string>` shared across both modes. Reusing
+ * `'pinned'` here would mean collapsing Pinned in state mode leaks into
+ * directory mode's Pinned group (and vice versa) on the very next Ctrl+S —
+ * this bare, differently-named sentinel keeps the two modes' id spaces
+ * actually disjoint, not just documented as disjoint.
+ */
+const PINNED_GROUP_ID = 'directory-pinned';
 const PINNED_GROUP_LABEL = 'Pinned';
 const OTHER_GROUP_ID = 'other';
 const OTHER_GROUP_LABEL = 'Other';
@@ -32,8 +41,13 @@ const OTHER_GROUP_LABEL = 'Other';
  * different real directories collapse to the same displayed label.
  */
 export function shortenWorkDirLabel(workDir: string, home: string = homedir()): string {
-  if (home.length > 0 && workDir === home) return '~';
-  if (home.length > 0 && workDir.startsWith(`${home}/`)) return `~${workDir.slice(home.length)}`;
+  if (home.length === 0) return workDir;
+  // A workDir with exactly one trailing slash past home (`${home}/`) is the
+  // same directory as `home` itself — without this, the prefix-strip branch
+  // below would collapse it to `'~/'` (an empty trailing segment) instead of
+  // `'~'`.
+  if (workDir === home || workDir === `${home}/`) return '~';
+  if (workDir.startsWith(`${home}/`)) return `~${workDir.slice(home.length)}`;
   return workDir;
 }
 
