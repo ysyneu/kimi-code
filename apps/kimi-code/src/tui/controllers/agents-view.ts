@@ -1047,43 +1047,71 @@ export class AgentsViewController {
       return;
     }
 
-    // Register BEFORE the first RPC call: the server's
-    // `event.session.created` echo only enters the roster when the id is
-    // already in the view's registry.
-    view.viewSessions.add(session.id);
-    void this.persistState(view);
-    if (placeholderId !== undefined) {
-      view.roster.remove(placeholderId);
-      view.pendingDispatchPlaceholders.delete(placeholderId);
-      view.roster.upsertLocalRow({
-        id: session.id,
-        title: submission.text,
-        workDir: this.host.agentsViewWorkDir(),
-        updatedAt: Date.now(),
-        busy: true,
-      });
-      if (view.selectedId === placeholderId) view.selectedId = session.id;
-    } else {
-      // The new row is pre-selected so the dispatch is visibly confirmed the
-      // moment it lands — the slash-command paths have no placeholder to
-      // promote, so this is the first time `selectedId` moves onto it.
-      view.selectedId = session.id;
-    }
-    this.pushProps();
-
-    if (options.attach === true) {
-      // Same "no attach seam" fallback `onOpen` already uses — B7 is the
-      // same attach contract, just reached via shift+Enter instead of a
-      // second Enter on the row.
-      if (this.host.onOpenSession !== undefined) {
-        view.roster.markSeen(session.id);
-        // B2: same attach-succeeded record `onOpen` writes.
-        this.attachedSessionIds.add(session.id);
-        void this.persistState(view);
-        this.host.onOpenSession(session.id);
+    // I7: `view` can be dead here — the only async continuation on this
+    // method without the staleness guard every other one in this file has
+    // (loadTrust, refreshRoster, handleReply, handleDelete, handleRename,
+    // persistState, …). Re-read live state and branch on how it relates to
+    // the captured `view` instead of assuming they still match. Never
+    // mutate or persist the dead `view` past this point.
+    const live = this.host.state.agentsView;
+    if (live === view) {
+      // Register BEFORE the first RPC call: the server's
+      // `event.session.created` echo only enters the roster when the id is
+      // already in the view's registry.
+      view.viewSessions.add(session.id);
+      void this.persistState(view);
+      if (placeholderId !== undefined) {
+        view.roster.remove(placeholderId);
+        view.pendingDispatchPlaceholders.delete(placeholderId);
+        view.roster.upsertLocalRow({
+          id: session.id,
+          title: submission.text,
+          workDir: this.host.agentsViewWorkDir(),
+          updatedAt: Date.now(),
+          busy: true,
+        });
+        if (view.selectedId === placeholderId) view.selectedId = session.id;
       } else {
-        this.notifyUser(view, 'Attach is not available from this host');
+        // The new row is pre-selected so the dispatch is visibly confirmed the
+        // moment it lands — the slash-command paths have no placeholder to
+        // promote, so this is the first time `selectedId` moves onto it.
+        view.selectedId = session.id;
       }
+      this.pushProps();
+
+      if (options.attach === true) {
+        // Same "no attach seam" fallback `onOpen` already uses — B7 is the
+        // same attach contract, just reached via shift+Enter instead of a
+        // second Enter on the row.
+        if (this.host.onOpenSession !== undefined) {
+          view.roster.markSeen(session.id);
+          // B2: same attach-succeeded record `onOpen` writes.
+          this.attachedSessionIds.add(session.id);
+          void this.persistState(view);
+          this.host.onOpenSession(session.id);
+        } else {
+          this.notifyUser(view, 'Attach is not available from this host');
+        }
+      }
+    } else if (live !== undefined) {
+      // The view was REBUILT while `createSession` was in flight (e.g. the
+      // user declined a quit-confirm and a fresh `AgentsViewState`
+      // remounted — see `KimiTUI.stop`) — `view` is dead. Register the id
+      // into the LIVE view's registry so the row appears on its next
+      // refresh; the dead view's placeholder reconcile is skipped (nothing
+      // renders it any more) and so is `options.attach` — the dispatch
+      // context (the screen the user pressed Enter/Shift+Enter from) is
+      // gone, so an unasked attach would be worse than none.
+      live.viewSessions.add(session.id);
+      void this.persistState(live);
+    } else {
+      // The view closed entirely while `createSession` was in flight —
+      // there is no live `AgentsViewState` to register the id into or to
+      // snapshot (persisting the dead view's own Sets here is exactly the
+      // clobber this guard exists to prevent). Persist just this one id
+      // through the same on-disk registry `persistState` writes, so the
+      // session isn't orphaned from the view's registry next time it opens.
+      void this.persistOrphanedSessionId(session.id);
     }
 
     try {
@@ -1857,6 +1885,33 @@ export class AgentsViewController {
         this.flash(
           `Failed to persist agents view state: ${error instanceof Error ? error.message : String(error)}`,
         );
+      }
+    });
+    return this.persistChain;
+  }
+
+  /**
+   * I7: registers a single session id into the on-disk registry directly —
+   * for a `handleDispatch` success landing after the view has closed
+   * entirely, where there is no live `AgentsViewState` left to snapshot and
+   * writing a dead view's own (possibly stale) `pins`/`seenAt` would risk
+   * clobbering whatever is actually on disk. Reads the CURRENT file, adds
+   * `id` to its session set, writes it back — same {@link persistChain}
+   * serialization {@link persistState} uses, so the two can never race or
+   * land out of order. Best-effort: there is no view left to flash a
+   * failure against.
+   */
+  private persistOrphanedSessionId(id: string): Promise<void> {
+    this.persistChain = this.persistChain.then(async () => {
+      try {
+        const current = await loadAgentsViewState(this.host.harness.homeDir);
+        await saveAgentsViewState(this.host.harness.homeDir, {
+          pins: current.pins,
+          sessions: new Set([...current.sessions, id]),
+          seenAt: current.seenAt,
+        });
+      } catch {
+        // Nothing left to flash against — see the doc comment above.
       }
     });
     return this.persistChain;

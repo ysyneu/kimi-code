@@ -2732,6 +2732,123 @@ describe('AgentsViewController — A2 optimistic dispatch placeholder', () => {
   });
 });
 
+// ── I7: handleDispatch's success continuation, after createSession
+// resolves, is the only async continuation in this controller without the
+// stale-view guard every other one has. A view swap (quit-declined remount)
+// or full close can land between the dispatch and the resolve. ──
+
+describe("AgentsViewController — handleDispatch's success path survives a view swap mid-flight (I7)", () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
+    dir = undefined;
+  });
+
+  function deferCreateSession(b: Boot): { resolve: () => void } {
+    let resolve: (() => void) | undefined;
+    b.fake.createSession.mockImplementationOnce(
+      () =>
+        new Promise((res) => {
+          resolve = () => res(b.fake.createdSession as unknown as Session);
+        }),
+    );
+    return { resolve: () => resolve?.() };
+  }
+
+  it('a view rebuilt mid-dispatch (quit declined) gets the id registered into the LIVE registry, never the dead one — and the dead write can no longer clobber it', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    const deferred = deferCreateSession(b);
+    const deadView = b.view();
+
+    b.view().dispatch.editor.onSubmit?.('fix the flaky test');
+    expect(deadView.selectedId).toBeDefined(); // the A2 placeholder, on the dead view
+
+    // Simulate "Esc during the pending dispatch → quit declined → fresh
+    // view remounted": close() + show() swaps in a brand-new
+    // AgentsViewState with a different identity — the same shape
+    // KimiTUI.stop()'s decline path produces.
+    b.controller.close();
+    await b.controller.show();
+    const liveView = b.view();
+    expect(liveView).not.toBe(deadView);
+
+    // The live view does something of its own BEFORE the dead dispatch
+    // resolves — its persistState write lands on disk first. Without the
+    // guard, the dead view's own later (unconditional) persistState call
+    // would overwrite this with the dead view's stale, pin-less snapshot —
+    // the exact clobber the finding documents.
+    b.component().handleInput(DOWN); // onto s1
+    b.component().handleInput(CTRL_T); // pin s1 on the LIVE view
+    await waitForViewState(b.homeDir, { pins: new Set(['s1']), sessions: new Set(['s1']) });
+
+    deferred.resolve();
+    await flush();
+
+    // Registered into the LIVE view's registry, not the dead one.
+    expect(liveView.viewSessions.has('new-session')).toBe(true);
+    expect(deadView.viewSessions.has('new-session')).toBe(false);
+    // The dead view's placeholder reconcile never ran — its own local
+    // (fabricated) selection is untouched, never promoted to the real id.
+    expect(deadView.selectedId).not.toBe('new-session');
+    // The pin survives: the dead view's write never landed, so there was
+    // nothing to clobber it with.
+    await waitForViewState(b.homeDir, {
+      pins: new Set(['s1']),
+      sessions: new Set(['s1', 'new-session']),
+    });
+  });
+
+  it('a view rebuilt mid-dispatch skips the B7 auto-attach — the dispatch context is gone', async () => {
+    const onOpenSession = vi.fn();
+    const b = await boot([summary('s1')], { onOpenSession });
+    dir = b.homeDir;
+    const deferred = deferCreateSession(b);
+    const deadView = b.view();
+
+    b.view().dispatch.editor.onShiftEnterSubmit?.('fix the flaky test');
+    expect(deadView.selectedId).toBeDefined();
+
+    b.controller.close();
+    await b.controller.show();
+    const liveView = b.view();
+
+    deferred.resolve();
+    await flush();
+
+    expect(onOpenSession).not.toHaveBeenCalled();
+    expect(liveView.viewSessions.has('new-session')).toBe(true);
+  });
+
+  it('the view closed entirely before resolve persists the id to disk without touching the dead view or writing its stale snapshot', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    const deferred = deferCreateSession(b);
+    const deadView = b.view();
+
+    b.view().dispatch.editor.onSubmit?.('fix the flaky test');
+    expect(deadView.selectedId).toBeDefined();
+
+    // The view closes entirely (no remount) — e.g. the exit-confirm dialog
+    // is accepted instead of declined.
+    b.controller.close();
+    expect(b.controller.isOpen).toBe(false);
+
+    deferred.resolve();
+    await flush();
+
+    // Never re-derived from the dead view's own (placeholder-era) Sets —
+    // just this one id, added to whatever is actually on disk.
+    await waitForViewState(b.homeDir, {
+      pins: new Set(),
+      sessions: new Set(['s1', 'new-session']),
+    });
+    expect(deadView.viewSessions.has('new-session')).toBe(false);
+  });
+});
+
 describe('AgentsViewController — reply mode (space)', () => {
   let dir: string | undefined;
   afterEach(async () => {
