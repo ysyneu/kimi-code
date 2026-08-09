@@ -106,7 +106,7 @@ describe('FooterComponent — background task / agent badges', () => {
 });
 
 
-// ── Attach-mode badge `← N agents · M awaiting input` ──
+// ── Attach-mode badge `← N working · M awaiting input` ──
 
 describe('FooterComponent — attach agents badge', () => {
   it('is hidden while both counts are zero', () => {
@@ -115,39 +115,41 @@ describe('FooterComponent — attach agents badge', () => {
     expect(out).not.toContain('←');
   });
 
-  it('renders only the agents segment when awaiting is zero', () => {
+  it('renders only the working segment when awaiting is zero', () => {
     const footer = new FooterComponent(baseState());
     footer.setAttachCounts({ agents: 2, awaiting: 0 });
     const out = strip(footer.render(120)[0]!);
-    expect(out).toContain('[← 2 agents]');
+    expect(out).toContain('[← 2 working]');
     expect(out).not.toContain('awaiting input');
   });
 
-  it('renders only the awaiting segment when agents is zero', () => {
+  it('renders only the awaiting segment when the working count is zero', () => {
     const footer = new FooterComponent(baseState());
     footer.setAttachCounts({ agents: 0, awaiting: 1 });
     const out = strip(footer.render(120)[0]!);
     expect(out).toContain('[← 1 awaiting input]');
-    expect(out).not.toMatch(/← \d+ agents?/);
+    expect(out).not.toMatch(/← \d+ working/);
   });
 
   it('renders both segments joined by · when both are non-zero', () => {
     const footer = new FooterComponent(baseState());
     footer.setAttachCounts({ agents: 2, awaiting: 1 });
     const out = strip(footer.render(120)[0]!);
-    expect(out).toContain('[← 2 agents · 1 awaiting input]');
+    expect(out).toContain('[← 2 working · 1 awaiting input]');
   });
 
-  it('singularizes the agent noun', () => {
+  it('M6: "working" matches the roster header\'s term for the same bucket — no "agent(s)" noun', () => {
     const footer = new FooterComponent(baseState());
     footer.setAttachCounts({ agents: 1, awaiting: 0 });
-    expect(strip(footer.render(120)[0]!)).toContain('[← 1 agent]');
+    const out = strip(footer.render(120)[0]!);
+    expect(out).toContain('[← 1 working]');
+    expect(out).not.toContain('agent');
   });
 
   it('updates live and hides again when counts return to zero', () => {
     const footer = new FooterComponent(baseState());
     footer.setAttachCounts({ agents: 1, awaiting: 2 });
-    expect(strip(footer.render(120)[0]!)).toContain('[← 1 agent · 2 awaiting input]');
+    expect(strip(footer.render(120)[0]!)).toContain('[← 1 working · 2 awaiting input]');
     footer.setAttachCounts({ agents: 0, awaiting: 0 });
     expect(strip(footer.render(120)[0]!)).not.toContain('←');
   });

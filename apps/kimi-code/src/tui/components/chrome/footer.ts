@@ -277,7 +277,7 @@ export class FooterComponent implements Component {
 
   /**
    * Sync the attach-mode badge with live roster counts. Each non-zero count
-   * adds its segment to `← N agents · M awaiting input`; both zero hides it.
+   * adds its segment to `← N working · M awaiting input`; both zero hides it.
    */
   setAttachCounts(counts: { agents: number; awaiting: number }): void {
     this.attachAgentsCount = Math.max(0, counts.agents);
@@ -432,8 +432,10 @@ export class FooterComponent implements Component {
     // other badges have no relation to.
     const attachSegments: string[] = [];
     if (this.attachAgentsCount > 0) {
-      const noun = this.attachAgentsCount === 1 ? 'agent' : 'agents';
-      attachSegments.push(`${String(this.attachAgentsCount)} ${noun}`);
+      // M6: the roster header calls this same bucket "working" (only busy
+      // rows, not every listed session) — match its term instead of the
+      // more sweeping-sounding "agents".
+      attachSegments.push(`${String(this.attachAgentsCount)} working`);
     }
     if (this.attachAwaitingCount > 0) {
       attachSegments.push(`${String(this.attachAwaitingCount)} awaiting input`);

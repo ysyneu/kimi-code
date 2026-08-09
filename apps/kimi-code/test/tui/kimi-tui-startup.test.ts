@@ -2859,7 +2859,7 @@ describe('KimiTUI agents-view attach', () => {
         pending_interaction: 'none',
       },
     } as Event);
-    expect(driver.state.footer.render(120)[0]).toContain('[← 1 agent]');
+    expect(driver.state.footer.render(120)[0]).toContain('[← 1 working]');
 
     expect(driver.returnToAgentsView()).toBe(true);
 
