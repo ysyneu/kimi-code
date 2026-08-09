@@ -894,7 +894,8 @@ describe('AgentsViewController — row delete arm (B1)', () => {
 
     b.component().handleInput(CTRL_X);
     expect(b.view().armedDeleteId).toBeUndefined();
-    expect(b.showStatus).toHaveBeenCalledWith('Still dispatching — try again in a moment');
+    expect(b.view().flashMessage).toBe('Still dispatching — try again in a moment');
+    expect(b.showStatus).not.toHaveBeenCalled();
     expect(b.fake.cancelSession).not.toHaveBeenCalled();
 
     resolveCreate?.();
@@ -1394,12 +1395,13 @@ describe('AgentsViewController — open', () => {
     dir = undefined;
   });
 
-  it('Enter on a row shows the attach placeholder', async () => {
+  it('Enter on a row with no attach seam flashes on the still-mounted view, not the (invisible) host surface', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
     b.component().handleInput(DOWN);
     b.component().handleInput(ENTER);
-    expect(b.showStatus).toHaveBeenCalledWith('Attach is not available from this host');
+    expect(b.view().flashMessage).toBe('Attach is not available from this host');
+    expect(b.showStatus).not.toHaveBeenCalled();
   });
 
   it('Enter on a row delegates to onOpenSession when the host provides one', async () => {
@@ -2513,17 +2515,16 @@ describe('AgentsViewController — A2 optimistic dispatch placeholder', () => {
 
     b.component().handleInput(ENTER); // attach
     expect(onOpenSession).not.toHaveBeenCalled();
-    expect(b.showStatus).toHaveBeenCalledWith('Still dispatching — try again in a moment');
+    expect(b.view().flashMessage).toBe('Still dispatching — try again in a moment');
+    expect(b.showStatus).not.toHaveBeenCalled();
 
-    b.showStatus.mockClear();
     b.component().handleInput(SPACE); // reply
     expect(b.view().replyTargetId).toBeUndefined();
-    expect(b.showStatus).toHaveBeenCalledWith('Still dispatching — try again in a moment');
+    expect(b.view().flashMessage).toBe('Still dispatching — try again in a moment');
 
-    b.showStatus.mockClear();
     b.component().handleInput(CTRL_R); // rename
     expect(b.view().renameDraft).toBeUndefined();
-    expect(b.showStatus).toHaveBeenCalledWith('Still dispatching — try again in a moment');
+    expect(b.view().flashMessage).toBe('Still dispatching — try again in a moment');
     // The component's own inline-rename toggle can still be entered locally
     // (it doesn't ask the controller first) — typing and submitting must
     // not reach `renameSession` with the fabricated id either.
@@ -2531,18 +2532,17 @@ describe('AgentsViewController — A2 optimistic dispatch placeholder', () => {
     b.component().handleInput(ENTER);
     expect(b.fake.renameSession).not.toHaveBeenCalled();
 
-    b.showStatus.mockClear();
     b.component().handleInput(CTRL_T); // pin
     expect(b.view().roster.get(placeholderId)?.pinned).toBe(false);
-    expect(b.showStatus).toHaveBeenCalledWith('Still dispatching — try again in a moment');
+    expect(b.view().flashMessage).toBe('Still dispatching — try again in a moment');
 
-    b.showStatus.mockClear();
     b.component().handleInput(CTRL_X); // delete (B1: must decline, not arm)
     expect(b.view().confirmDeleteId).toBeUndefined();
     expect(b.view().armedDeleteId).toBeUndefined();
-    expect(b.showStatus).toHaveBeenCalledWith('Still dispatching — try again in a moment');
+    expect(b.view().flashMessage).toBe('Still dispatching — try again in a moment');
     expect(b.fake.deleteSession).not.toHaveBeenCalled();
     expect(b.fake.cancelSession).not.toHaveBeenCalled();
+    expect(b.showStatus).not.toHaveBeenCalled();
 
     deferred.resolve();
     await flush();
@@ -2579,7 +2579,8 @@ describe('AgentsViewController — A2 optimistic dispatch placeholder', () => {
     b.view().dispatch.editor.onShiftEnterSubmit?.('fix the flaky test');
     await flush();
 
-    expect(b.showStatus).toHaveBeenCalledWith('Attach is not available from this host');
+    expect(b.view().flashMessage).toBe('Attach is not available from this host');
+    expect(b.showStatus).not.toHaveBeenCalled();
     // Dispatch itself still happened normally — only the attach hop declined.
     expect(b.view().viewSessions.has('new-session')).toBe(true);
     expect(b.fake.createdSession.prompt).toHaveBeenCalledWith('fix the flaky test');

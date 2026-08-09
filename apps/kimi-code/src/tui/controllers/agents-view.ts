@@ -1048,7 +1048,7 @@ export class AgentsViewController {
         void this.persistState(view);
         this.host.onOpenSession(session.id);
       } else {
-        this.host.showStatus('Attach is not available from this host');
+        this.notifyUser(view, 'Attach is not available from this host');
       }
     }
 
@@ -1468,7 +1468,7 @@ export class AgentsViewController {
     // A2 placeholder: has no real session behind it yet — attaching
     // would hand the host an id no session actually owns.
     if (isPendingDispatchId(id)) {
-      this.host.showStatus(DISPATCHING_HINT);
+      this.notifyUser(view, DISPATCHING_HINT);
       return;
     }
     if (this.host.onOpenSession !== undefined) {
@@ -1483,7 +1483,7 @@ export class AgentsViewController {
       void this.persistState(view);
       this.host.onOpenSession(id);
     } else {
-      this.host.showStatus('Attach is not available from this host');
+      this.notifyUser(view, 'Attach is not available from this host');
     }
   }
 
@@ -1522,7 +1522,7 @@ export class AgentsViewController {
         // `handleDispatch`'s own failure path for how a placeholder that
         // never becomes a real session is cleaned up instead.
         if (isPendingDispatchId(id)) {
-          this.host.showStatus(DISPATCHING_HINT);
+          this.notifyUser(view, DISPATCHING_HINT);
           return;
         }
         // Group-header delete-all keeps the existing confirm-dialog flow —
@@ -1551,7 +1551,7 @@ export class AgentsViewController {
         if (view === undefined) return;
         this.clearDeleteOverlays(view);
         if (isPendingDispatchId(id)) {
-          this.host.showStatus(DISPATCHING_HINT);
+          this.notifyUser(view, DISPATCHING_HINT);
           return;
         }
         const row = view.roster.get(id);
@@ -1589,7 +1589,7 @@ export class AgentsViewController {
         // A2 placeholder: pinning would persist the fabricated id into the
         // pins Set — it never survives the promotion to the real id.
         if (isPendingDispatchId(id)) {
-          this.host.showStatus(DISPATCHING_HINT);
+          this.notifyUser(view, DISPATCHING_HINT);
           return;
         }
         void this.handlePinToggle(id);
@@ -1599,7 +1599,7 @@ export class AgentsViewController {
         if (view === undefined) return;
         this.clearDeleteOverlays(view);
         if (isPendingDispatchId(id)) {
-          this.host.showStatus(DISPATCHING_HINT);
+          this.notifyUser(view, DISPATCHING_HINT);
           return;
         }
         const row = view.roster.get(id);
@@ -1881,6 +1881,34 @@ export class AgentsViewController {
       this.pushProps();
     }, durationMs);
     this.pushProps();
+  }
+
+  /**
+   * Routes a status/error message to whichever surface can actually show it
+   * right now. While the roster owns the screen (`view` is mounted, not
+   * detached) `host.showStatus`/`showError` render into a UI-tree child
+   * `show()`'s own `state.ui.clear()` already detached — nothing would
+   * appear until the view eventually closes and flushes it stale into the
+   * chat. `flash()` is the view's own visible channel, so this uses that
+   * instead. While detached (an attached session owns the screen) or not
+   * open at all, `flash()`'s `pushProps()` silently no-ops (or there is no
+   * view to push props to) — this falls back to `host.showStatus`/
+   * `showError`, the surface actually on screen. Same inverse rule
+   * `handleDispatch`'s own catch (around its `createSession` call) already
+   * applies for its dispatch-failure message. `view` is read live by
+   * callers rather than captured across an `await` — the one caller outside
+   * this class (`KimiTUI.attachAgentsViewSession`'s pre-`detachForAttach`
+   * resume failure) holds no `AgentsViewState` reference of its own and
+   * reads `this.state.agentsView` (the same object, via `AgentsViewHost`)
+   * fresh at the call site instead.
+   */
+  notifyUser(view: AgentsViewState | undefined, message: string, options: { error?: boolean } = {}): void {
+    if (view !== undefined && !view.detached) {
+      this.flash(message);
+      return;
+    }
+    if (options.error === true) this.host.showError(message);
+    else this.host.showStatus(message);
   }
 }
 

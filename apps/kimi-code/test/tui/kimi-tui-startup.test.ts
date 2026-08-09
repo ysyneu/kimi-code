@@ -2091,7 +2091,7 @@ describe('KimiTUI agents-view attach', () => {
     expect(view?.roster.counts().working).toBe(1);
   });
 
-  it('a failed attach leaves the view mounted and shows the error', async () => {
+  it('a failed attach leaves the view mounted and shows the error on its own visible flash, not the (detached) host surface', async () => {
     const session = makeAttachSession('ses-attached');
     const { harness } = makeAgentsHarness(session);
     const driver = await bootAgentsView(harness);
@@ -2101,9 +2101,13 @@ describe('KimiTUI agents-view attach', () => {
     driver.onOpenSession('ses-attached');
 
     await vi.waitFor(() => {
-      expect(showError).toHaveBeenCalled();
+      expect(driver.state.agentsView?.flashMessage).toBeDefined();
     });
-    expect(showError).toHaveBeenCalledWith(expect.stringContaining('server exploded'));
+    // detachForAttach never ran (the resume failed before it) — the view is
+    // still mounted, so host.showError (which renders into the UI-tree
+    // child the takeover already detached) must NOT be the surface used.
+    expect(showError).not.toHaveBeenCalled();
+    expect(driver.state.agentsView?.flashMessage).toContain('server exploded');
     expect(driver.state.agentsView?.detached).toBe(false);
     expect(driver.session).toBeUndefined();
     expect(driver.state.appState.sessionId).toBe('');

@@ -2149,7 +2149,12 @@ export class KimiTUI {
       });
     } catch (error) {
       const msg = formatErrorMessage(error);
-      this.showError(`Failed to attach session ${targetSessionId}: ${msg}`);
+      // The view is still mounted here (detachForAttach hasn't run yet) —
+      // this.showError would render into the UI-tree child `show()` already
+      // detached, so it must go through the controller's own visible
+      // channel instead (see AgentsViewController.notifyUser's doc).
+      const message = `Failed to attach session ${targetSessionId}: ${msg}`;
+      this.agentsViewController.notifyUser(this.state.agentsView, message, { error: true });
       return;
     }
     this.agentsViewController.detachForAttach(targetSessionId);
