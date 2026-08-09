@@ -1487,6 +1487,13 @@ export class AgentsViewController {
     if (view === undefined) return;
     const row = view.roster.get(id);
     if (row === undefined) return;
+    // Same re-anchor as `onReorderPinned` (agents-view.ts, shift+↑↓): `id` is
+    // always the component's currently-selected row (Ctrl+T only fires for
+    // `item.kind === 'row'`), and toggling pin RELOCATES it — into a new
+    // `Pinned` group, or out of one — exactly the kind of index-shifting
+    // move whose "selection follows" contract must not depend on
+    // `view.selectedId` already agreeing with the on-screen cursor.
+    view.selectedId = id;
     view.roster.setPinned(id, !row.pinned);
     this.pushProps();
     // The roster mutates the pins Set in place; persist the whole view state.

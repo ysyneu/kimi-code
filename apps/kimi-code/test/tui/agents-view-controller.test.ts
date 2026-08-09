@@ -789,6 +789,34 @@ describe('AgentsViewController — pin', () => {
     await waitForViewState(b.homeDir, { pins: new Set(), sessions: new Set(['s1']) });
     expect(b.render()).not.toContain('Pinned');
   });
+
+  it('re-anchors the marker onto the pinned row even when the controller selectedId was left stale by a concurrent push (would fail without the onPinToggle fix)', async () => {
+    // Mirrors the onReorderPinned race tests: Ctrl+T RELOCATES the row (into
+    // a brand-new `Pinned` group here), so it shares the exact same
+    // "targets via the component's live cursor, re-anchors via a
+    // `view.selectedId` the caller never asserted" gap reorder had.
+    const b = await boot([summary('s1'), summary('s2'), summary('s3')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN); // s1
+    b.component().handleInput(DOWN); // s2
+    expect(b.view().selectedId).toBe('s2');
+
+    // Corrupt the controller's copy, as a concurrent event would — the
+    // component's local cursor is untouched by this.
+    b.view().selectedId = undefined;
+
+    b.component().handleInput(CTRL_T); // pin s2 -> relocates into new "Pinned" group
+
+    await waitForViewState(b.homeDir, {
+      pins: new Set(['s2']),
+      sessions: new Set(['s1', 's2', 's3']),
+    });
+    // The fix: selection re-anchors onto s2 (the row that moved), both in
+    // controller state and on screen — not left undefined or stuck on
+    // whatever the stale index happened to land on.
+    expect(b.view().selectedId).toBe('s2');
+    expect(selectedLine(b.render())).toContain('s2 title');
+  });
 });
 
 describe('AgentsViewController — reorder pinned rows (shift+↑↓)', () => {
