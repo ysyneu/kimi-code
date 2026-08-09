@@ -131,6 +131,16 @@ interface CustomEditorOptions {
 export class CustomEditor extends Editor {
   public onEscape?: () => void;
   /**
+   * Fired when Esc closes the autocomplete dropdown (the slash/@-mention
+   * menu was open or a suggestion fetch was pending) — a case `onEscape`
+   * itself never sees, since pi-tui's own `hasAutocompleteActivity()` gate
+   * intercepts that Esc and cancels the dropdown before `onEscape` would
+   * fire. Used by the agents-view dispatch composer (B11) to clear the
+   * composer back to its placeholder in the same keypress that closes the
+   * menu.
+   */
+  public onEscapeAutocompleteCancel?: () => void;
+  /**
    * Fired for every input that is not a lone Escape. Used to disarm a pending
    * double-Esc so only two consecutive Escape presses trigger the shortcut.
    */
@@ -575,6 +585,7 @@ export class CustomEditor extends Editor {
     if (matchesKey(normalized, Key.escape)) {
       if (this.hasAutocompleteActivity()) {
         this.cancelAutocompleteActivity();
+        this.onEscapeAutocompleteCancel?.();
         return;
       }
       this.onEscape?.();

@@ -608,6 +608,18 @@ export class AgentsViewController {
       const view = this.host.state.agentsView;
       if (view !== undefined) this.closeReplyPanel(view);
     };
+    // B11: Esc closing the slash/@-mention dropdown never reaches `onEscape`
+    // above (pi-tui's own hasAutocompleteActivity() gate intercepts it
+    // first) — without this the menu closes but `/` and whatever else was
+    // typed keeps sitting in the composer. Scoped to the plain "new
+    // session" composer: reply mode has no slash-command surface
+    // (`parseReplyInput` never interprets `/`) and clearing an in-progress
+    // reply out from under the user is not this item's concern.
+    dispatch.editor.onEscapeAutocompleteCancel = () => {
+      const view = this.host.state.agentsView;
+      if (view !== undefined && view.replyTargetId !== undefined) return;
+      dispatch.editor.setText('');
+    };
     // B8: → on an EMPTY composer attaches to the selected row — the same
     // `handleOpen` Enter/→ on the row itself already calls, just reached
     // from inside the composer instead of the list. No selection (or a

@@ -3407,6 +3407,70 @@ describe('AgentsViewController — dispatch editor mount', () => {
   });
 });
 
+describe('AgentsViewController — Esc on the slash menu clears the composer (B11)', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) {
+      // maxRetries: a fire-and-forget persistState can still be mid-write
+      // (ENOTEMPTY on rmdir) when the test body returns.
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
+    dir = undefined;
+  });
+
+  /** Same wait shape the @-mention functional test uses: the autocomplete
+   *  fetch is debounced by a real timer, then resolves over a couple of
+   *  microtask turns. */
+  async function waitForAutocomplete(): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+
+  it('Esc while the slash menu is open closes it AND clears the composer to its placeholder, in one keypress', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    for (const ch of '/mo') b.component().handleInput(ch);
+    await waitForAutocomplete();
+    expect(b.view().dispatch.editor.isShowingAutocomplete()).toBe(true);
+    expect(b.view().dispatch.editor.getText()).toBe('/mo');
+
+    b.component().handleInput(ESC);
+
+    expect(b.view().dispatch.editor.isShowingAutocomplete()).toBe(false);
+    expect(b.view().dispatch.editor.getText()).toBe('');
+  });
+
+  it('Esc with composer text but no menu open keeps its current behavior (pin-down): unfocuses, text untouched', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    for (const ch of 'do stuff') b.component().handleInput(ch);
+    expect(b.view().dispatch.editor.isShowingAutocomplete()).toBe(false);
+
+    b.component().handleInput(ESC);
+
+    expect(b.view().dispatchFocused).toBe(false);
+    expect(b.view().dispatch.editor.getText()).toBe('do stuff');
+    expect(b.controller.isOpen).toBe(true);
+  });
+
+  it('a reply-panel composer declines: the menu closes but an in-progress reply is not wiped', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    b.component().handleInput(DOWN); // select row s1
+    b.component().handleInput(SPACE); // open the reply panel on s1
+    for (const ch of '/mo') b.component().handleInput(ch);
+    await waitForAutocomplete();
+    expect(b.view().dispatch.editor.isShowingAutocomplete()).toBe(true);
+
+    b.component().handleInput(ESC);
+
+    expect(b.view().dispatch.editor.isShowingAutocomplete()).toBe(false);
+    expect(b.view().replyTargetId).toBe('s1');
+    expect(b.view().dispatch.editor.getText()).toBe('/mo');
+  });
+});
+
 // ── Attach — component detach keeps the roster subscription alive ──
 
 describe('AgentsViewController — detach for attach', () => {
