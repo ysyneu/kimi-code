@@ -6065,6 +6065,42 @@ describe('transcript step and assistant folding', () => {
       }
     });
 
+    it('shows a spinner with the approximate elapsed suffix on the activity pane when attaching mid-turn with zero events delivered', async () => {
+      vi.useFakeTimers();
+      try {
+        const { driver } = await makeDriver();
+        expect(driver.state.appState.streamingPhase).toBe('idle');
+
+        const busySession = makeSession({
+          getStatus: vi.fn(async () => ({
+            model: 'k2',
+            thinkingEffort: 'off',
+            permission: 'manual',
+            planMode: false,
+            contextTokens: 0,
+            maxContextTokens: 100,
+            contextUsage: 0,
+            busy: true,
+          })),
+        });
+        vi.setSystemTime(5_000);
+
+        // Zero session events delivered (no turn.started, no delta, nothing)
+        // — the attach seam (syncRuntimeState's busy-seed) touches only
+        // streamingPhase/streamingStartTime/Approx, never livePane.mode, so
+        // this reproduces the exact "attach mid-turn, pane stays blank"
+        // report: nothing else runs here to mount the activity pane.
+        await (driver as unknown as KimiTUI).syncRuntimeState(busySession as never);
+
+        vi.setSystemTime(13_000);
+        vi.advanceTimersByTime(120);
+
+        expect(stripSgr(renderActivity(driver))).toContain('8s+');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it('never shows an elapsed suffix on the shell-command spinner right after a turn ends', async () => {
       const runShellCommand = vi.fn(async () => ({ stdout: '', stderr: '', isError: false }));
       const session = makeSession({ runShellCommand });

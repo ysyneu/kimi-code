@@ -3015,8 +3015,17 @@ export class KimiTUI {
     // until it finishes, signalling that input is busy / queued.
     if (streamingPhase === 'shell') return 'waiting';
 
+    // livePane.mode is the primary signal (it tracks tool calls and gets set
+    // together with streamingPhase by every LOCAL turn-start path — sending a
+    // prompt, a real turn.started/step.started — so it is never 'idle' while
+    // one of those phases is in flight). But attaching to a session whose
+    // turn is already running seeds ONLY streamingPhase (syncRuntimeState's
+    // busy-seed — see reconcileStreamingPhaseAfterAttach above); livePane.mode
+    // has no reason to know about that seam and stays at its 'idle' default.
+    // Without this fallback the pane renders nothing for the whole attached
+    // turn until some later event happens to touch livePane.mode.
     if (this.state.livePane.mode === 'idle') {
-      if (streamingPhase === 'thinking' || streamingPhase === 'composing') {
+      if (streamingPhase === 'waiting' || streamingPhase === 'thinking' || streamingPhase === 'composing') {
         return streamingPhase;
       }
     }
