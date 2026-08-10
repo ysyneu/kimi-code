@@ -1167,6 +1167,37 @@ export class AgentsViewController {
     } catch (error) {
       if (this.host.state.agentsView !== view) return;
       const message = `Dispatch failed: ${error instanceof Error ? error.message : String(error)}`;
+      if (submission.activation !== undefined) {
+        // I3: an activation validates before it can ever start a turn (the
+        // server route resolves/checks the skill first — item 1), so a
+        // failed activation on the session this call just created never
+        // leaves a real turn behind, only a permanently useless empty
+        // `(untitled)` row (matches the live bug's journal: exactly one
+        // `event.session.created` event, nothing else, ever). Delete it
+        // with the same primitive the roster's own delete uses, restoring
+        // this method's own "validate before mutate" invariant after the
+        // fact for the one path (skill activation) that can still fail
+        // post-create. A plain-prompt failure is different — the session
+        // is legitimately usable and the user may retry into it — so it is
+        // left alone; only this branch runs.
+        try {
+          await this.host.harness.deleteSession(session.id);
+        } catch {
+          // Best-effort: nothing more to do if the server call itself
+          // fails — the local cleanup below still drops the row so it
+          // doesn't linger regardless.
+        }
+        // The delete above is a fresh async gap — re-check staleness the
+        // same way every other continuation in this method does.
+        if (this.host.state.agentsView === view) {
+          view.roster.remove(session.id);
+          view.viewSessions.delete(session.id);
+          if (view.selectedId === session.id) view.selectedId = undefined;
+          void this.persistState(view);
+          this.pushProps();
+        }
+      }
+      if (this.host.state.agentsView !== view) return;
       // B7 can have already detached the roster view (options.attach above)
       // by the time this rejects — flash()'s pushProps() silently no-ops
       // while detached, so the failure needs the same host-level surface

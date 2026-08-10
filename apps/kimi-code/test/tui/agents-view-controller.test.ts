@@ -2373,6 +2373,52 @@ describe('AgentsViewController — dispatch', () => {
     b.controller.close(); // clear the pending flash timer
   });
 
+  // I3: a failed activation must not orphan the server-side session it was
+  // staged onto — `handleDispatch`'s own doc comment states the "validate
+  // before mutate" invariant, but the activation path creates first, then
+  // can still fail (item 1's real wire call), leaving a permanent empty
+  // `(untitled)` row. The cleanup path only fires for an ACTIVATION failure;
+  // see the next test for the plain-prompt case, which is left alone.
+  it('I3: an activation failure deletes the just-created session, drops it from the roster, and flashes an accurate error', async () => {
+    const b = await boot([summary('s1')], {
+      activatableCommands: {
+        commands: [],
+        skillCommandMap: new Map([['skill:reviewcode', 'reviewcode']]),
+        pluginCommandMap: new Map(),
+      },
+    });
+    dir = b.homeDir;
+    b.fake.createdSession.activateSkill.mockRejectedValueOnce(new Error('skill crashed'));
+
+    b.view().dispatch.editor.onSubmit?.('/skill:reviewcode check the auth module');
+    await flush();
+
+    expect(b.fake.createSession).toHaveBeenCalledWith({ workDir: '/home/user/project' });
+    expect(b.fake.deleteSession).toHaveBeenCalledWith('new-session');
+    // No row left behind — neither the registry nor the roster remembers it.
+    expect(b.view().viewSessions.has('new-session')).toBe(false);
+    expect(b.view().roster.get('new-session')).toBeUndefined();
+    expect(b.render()).toContain('Dispatch failed: skill crashed');
+    await waitForViewState(b.homeDir, { pins: new Set(), sessions: new Set(['s1']) });
+    b.controller.close(); // clear the pending flash timer
+  });
+
+  it('I3: a plain-prompt failure keeps the session — only an activation failure cleans up', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.fake.createdSession.prompt.mockRejectedValueOnce(new Error('model unavailable'));
+
+    b.view().dispatch.editor.onSubmit?.('fix the flaky test');
+    await flush();
+
+    expect(b.fake.createSession).toHaveBeenCalledWith({ workDir: '/home/user/project' });
+    expect(b.fake.deleteSession).not.toHaveBeenCalled();
+    expect(b.view().viewSessions.has('new-session')).toBe(true);
+    expect(b.view().roster.get('new-session')).not.toBeUndefined();
+    expect(b.render()).toContain('Dispatch failed: model unavailable');
+    b.controller.close(); // clear the pending flash timer
+  });
+
   it('a cold view (no prior attach) offers skill commands once the host warms them — the plugin section stays empty, undisturbed by the warm', async () => {
     const b = await boot([summary('s1')], {
       // Cold-start: nothing warmed yet — matches a fresh `kimi agents`
