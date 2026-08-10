@@ -13,6 +13,7 @@ import { pipeline } from 'node:stream/promises';
 
 import {
   IBootstrapService,
+  broadcastPermissionModeIfMainAgent,
   IAgentLifecycleService,
   IAgentPermissionModeService,
   IAgentProfileService,
@@ -134,6 +135,8 @@ async function resolvePromptFromSession(session: ISessionScopeHandle, agentId?: 
     throw new Error2('agent.not_found', `agent ${agentId} does not exist`);
   }
   return {
+    agentId: agent.id,
+    lifecycle: session.accessor.get(IAgentLifecycleService),
     prompt: agent.accessor.get(IAgentPromptService),
     auth: agent.accessor.get(IAuthSummaryService),
     profile: agent.accessor.get(IAgentProfileService),
@@ -293,7 +296,10 @@ export function registerPromptsRoutes(app: PromptRouteHost, core: Scope): void {
         if (req.body.model !== undefined) await resolved.profile.setModel(req.body.model);
         if (req.body.thinking !== undefined && !thinkingConsumed)
           resolved.profile.setThinking(req.body.thinking);
-        if (req.body.permission_mode !== undefined) resolved.permissionMode.setMode(req.body.permission_mode);
+        if (req.body.permission_mode !== undefined) {
+          resolved.permissionMode.setMode(req.body.permission_mode);
+          broadcastPermissionModeIfMainAgent(resolved.agentId, req.body.permission_mode, resolved.lifecycle);
+        }
         if (req.body.disabled_tools !== undefined) {
           // A session denylist before bind throws `profile.not_bound` — map it
           // onto 40001 like the profile-selection errors above.
