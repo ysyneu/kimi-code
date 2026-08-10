@@ -1296,7 +1296,11 @@ export class KimiTUI {
 
   sendNormalUserInput(text: string): void {
     if (this.btwPanelController.sendUserInput(text)) return;
-    if (this.state.appState.model.trim().length === 0) {
+    // While a session switch is deferring input the target session's model is
+    // not synced yet, so an empty model here means "not known", not "not
+    // configured" — refusing the message would turn an ordinary attach into a
+    // spurious login prompt. Let it queue; the switch releases it.
+    if (!this.deferUserMessages && this.state.appState.model.trim().length === 0) {
       this.showError(LLM_NOT_SET_MESSAGE);
       return;
     }
@@ -2219,6 +2223,14 @@ export class KimiTUI {
   }
 
   async switchToSession(session: Session, statusMessage: string): Promise<void> {
+    // The editor is already focused and accepting input while this runs (the
+    // roster focuses it before handing over), but the session's event listener
+    // is not registered until startSubscription() at the end of this method,
+    // and receiveEvent() has no buffering — a prompt sent inside that window
+    // loses every event it produces, including its own turn.ended, so the
+    // spinner wedges forever with no reply and no error. Queue instead: the
+    // message stays visible as queued and goes out once the listener is live.
+    this.deferUserMessages = true;
     this.resetSessionRuntime();
     await this.setSession(session);
     await this.syncRuntimeState(session);
@@ -2237,7 +2249,11 @@ export class KimiTUI {
       this.showError(`Failed to replay session history: ${msg}`);
     } finally {
       this.sessionEventHandler.startSubscription();
+      // Released only here, and in the same `finally` as the subscription, so
+      // a failed replay cannot leave the composer permanently deferring.
+      this.deferUserMessages = false;
     }
+    this.drainOneQueuedMessage();
     void this.reconcileStreamingPhaseAfterAttach(session);
     const resumeState = session.getResumeState();
     if (resumeState?.warning !== undefined) {

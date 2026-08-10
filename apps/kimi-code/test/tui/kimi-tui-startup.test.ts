@@ -1984,6 +1984,9 @@ describe('KimiTUI agents-view attach', () => {
     session: { id: string } | undefined;
     showStatus(msg: string, severity?: string): void;
     showError(msg: string): void;
+    handleUserInput(text: string): void;
+    setAppState(patch: Record<string, unknown>): void;
+    deferUserMessages: boolean;
   }
 
   const dirs: string[] = [];
@@ -2433,6 +2436,113 @@ describe('KimiTUI agents-view attach', () => {
     // moved the phase to 'waiting' again for the new turn — settled, not
     // left dangling.
     expect(driver.state.appState.streamingPhase).toBe('waiting');
+  });
+
+  it('queues a message typed during the attach switch and releases it once the listener is live', async () => {
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+    const showError = vi.spyOn(driver, 'showError').mockImplementation(() => {});
+
+    // Park the switch inside syncRuntimeState — the composer is focused and
+    // accepting input from the moment the view hands over, but the session's
+    // event listener is not registered until the end of switchToSession, and
+    // receiveEvent() has no buffering: a prompt sent in this window loses
+    // every event it produces, including its own turn.ended.
+    let releaseStatus!: () => void;
+    session.getStatus.mockImplementationOnce(
+      async () =>
+        new Promise((resolve) => {
+          releaseStatus = () =>
+            resolve({
+              model: 'k2',
+              thinkingEffort: 'off',
+              permission: 'manual',
+              planMode: false,
+              contextTokens: 0,
+              maxContextTokens: 100,
+              contextUsage: 0,
+              busy: false,
+            });
+        }),
+    );
+
+    // A model is already known here (the composer carries the last attach's
+    // value), so nothing else stops the send — this is the window in its pure
+    // form: a real prompt into a session with no listener.
+    driver.setAppState({ model: 'k2' });
+
+    driver.onOpenSession('ses-attached');
+    // setSession runs before syncRuntimeState, so a live `driver.session`
+    // means the composer is now talking to the target session while the
+    // listener is still unregistered — the window itself, observed without
+    // reference to how the fix implements the hold.
+    await vi.waitFor(() => {
+      expect(driver.session?.id).toBe('ses-attached');
+    });
+
+    driver.handleUserInput('typed mid-attach');
+
+    expect(session.prompt).not.toHaveBeenCalled();
+    expect(driver.state.queuedMessages).toHaveLength(1);
+    expect(showError).not.toHaveBeenCalled();
+
+    releaseStatus();
+    await vi.waitFor(() => {
+      expect(session.prompt).toHaveBeenCalledTimes(1);
+    });
+    expect(session.prompt).toHaveBeenCalledWith('typed mid-attach');
+    expect(driver.state.queuedMessages).toEqual([]);
+    expect(driver.deferUserMessages).toBe(false);
+  });
+
+  it('does not mistake an unsynced model for a missing login while the attach switch is deferring', async () => {
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+    const showError = vi.spyOn(driver, 'showError').mockImplementation(() => {});
+
+    // First attach of the run: no session has reported a model yet, so the
+    // composer's model is still empty when the switch begins.
+    expect(driver.state.appState.model).toBe('');
+
+    let releaseStatus!: () => void;
+    session.getStatus.mockImplementationOnce(
+      async () =>
+        new Promise((resolve) => {
+          releaseStatus = () =>
+            resolve({
+              model: 'k2',
+              thinkingEffort: 'off',
+              permission: 'manual',
+              planMode: false,
+              contextTokens: 0,
+              maxContextTokens: 100,
+              contextUsage: 0,
+              busy: false,
+            });
+        }),
+    );
+
+    driver.onOpenSession('ses-attached');
+    await vi.waitFor(() => {
+      expect(driver.session?.id).toBe('ses-attached');
+    });
+
+    driver.handleUserInput('typed before the model synced');
+
+    // An empty model mid-switch means "not known yet", not "not configured":
+    // the message waits for the switch instead of being dropped with a login
+    // prompt the user has no reason to act on.
+    expect(showError).not.toHaveBeenCalled();
+    expect(driver.state.queuedMessages).toHaveLength(1);
+
+    releaseStatus();
+    await vi.waitFor(() => {
+      expect(session.prompt).toHaveBeenCalledWith('typed before the model synced');
+    });
   });
 
   it('attach to a session whose turn already ended before the listener registered self-heals via the post-subscribe recheck (F2b)', async () => {
