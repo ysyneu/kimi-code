@@ -95,6 +95,10 @@ function pressNonEscape(editor: Harness['editor']): void {
   (handler as () => void)();
 }
 
+function setComposerText(editor: Harness['editor'], text: string): void {
+  (editor['getText'] as unknown as ReturnType<typeof vi.fn>).mockReturnValue(text);
+}
+
 describe('EditorKeyboardController double-Esc undo', () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -351,6 +355,62 @@ describe('EditorKeyboardController onLeftArrowEmpty', () => {
 
     expect(handler()).toBe(false);
     expect(returnToAgentsView).toHaveBeenCalledOnce();
+  });
+});
+
+
+// ── I4: Esc on an idle, empty composer returns to the roster the same way
+// ← does — a session attached from the roster otherwise advertises no way
+// back, and Esc means "back" everywhere else in that view. ──
+
+describe('EditorKeyboardController Esc returns to the roster (I4)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('idle + empty composer: delegates to returnToAgentsView and consumes Esc when it returns true', () => {
+    const { editor, returnToAgentsView, openUndoSelector } = createHarness();
+    returnToAgentsView.mockReturnValue(true);
+
+    pressEscape(editor);
+
+    expect(returnToAgentsView).toHaveBeenCalledOnce();
+    expect(openUndoSelector).not.toHaveBeenCalled();
+  });
+
+  it('idle + empty composer, but the host declines (false, e.g. the main REPL): the double-Esc undo shortcut still fires — zero regression outside agents mode', () => {
+    const { editor, returnToAgentsView, openUndoSelector } = createHarness();
+    returnToAgentsView.mockReturnValue(false);
+
+    pressEscape(editor);
+    expect(openUndoSelector).not.toHaveBeenCalled();
+    pressEscape(editor);
+
+    expect(returnToAgentsView).toHaveBeenCalledTimes(2);
+    expect(openUndoSelector).toHaveBeenCalledOnce();
+  });
+
+  it('idle + a non-empty composer never calls returnToAgentsView — only an empty composer qualifies, matching ← (onLeftArrowEmpty)', () => {
+    const { editor, returnToAgentsView } = createHarness();
+    setComposerText(editor, 'draft in progress');
+
+    pressEscape(editor);
+
+    expect(returnToAgentsView).not.toHaveBeenCalled();
+  });
+
+  it('mid-turn Esc keeps the existing interrupt semantics and never calls returnToAgentsView — the way back is a standing footer hint, not a change to what Esc does here', () => {
+    const { editor, host, returnToAgentsView } = createHarness({ streamingPhase: 'waiting' });
+
+    pressEscape(editor);
+
+    expect(returnToAgentsView).not.toHaveBeenCalled();
+    const session = host.session as unknown as { cancel: ReturnType<typeof vi.fn> };
+    expect(session.cancel).toHaveBeenCalled();
   });
 });
 

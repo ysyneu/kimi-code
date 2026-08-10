@@ -1790,9 +1790,16 @@ export class KimiTUI {
     return true;
   }
 
-  /** AgentsViewHost: attach-mode footer badge feed; undefined clears it. */
+  /**
+   * AgentsViewHost: attach-mode footer badge feed; `undefined` clears it.
+   * `counts` is only ever passed while attached FROM the roster (the agents
+   * view is detached, not closed) — `undefined` vs `{...}` (even all-zero)
+   * is itself the "attached from the roster" signal (I4), so it doubles as
+   * the flag behind the badge's standing return-affordance segment.
+   */
   setAttachBadge(counts: { agents: number; awaiting: number } | undefined): void {
     this.state.footer.setAttachCounts(counts ?? { agents: 0, awaiting: 0 });
+    this.state.footer.setAttachedFromRoster(counts !== undefined);
     this.state.ui.requestRender();
   }
 

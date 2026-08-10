@@ -209,7 +209,20 @@ export class EditorKeyboardController {
         return;
       }
       if (host.state.appState.streamingPhase !== 'idle') {
+        // I4: mid-turn Esc keeps today's interrupt semantics (chat parity) —
+        // the way back is surfaced instead as a standing footer hint (see
+        // `Footer.attachedFromRoster`), not by changing what Esc does here.
         this.cancelCurrentStream();
+        this.clearPendingUndoEsc();
+        return;
+      }
+      // I4: idle with an empty composer, attached FROM the roster — Esc means
+      // "back" everywhere else in this view, so it must not silently arm the
+      // double-Esc undo shortcut below instead; return to the roster the same
+      // way ← does. `returnToAgentsView()` already declines (false) outside
+      // agents mode or when there is no detached view to return to, so every
+      // other idle Esc case (including a non-empty composer) is untouched.
+      if (editor.getText().length === 0 && host.returnToAgentsView()) {
         this.clearPendingUndoEsc();
         return;
       }

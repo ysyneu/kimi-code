@@ -2868,15 +2868,18 @@ describe('KimiTUI agents-view attach', () => {
     const view = driver.state.agentsView;
     expect(view?.detached).toBe(true);
 
-    // The attached session's own work never enters the badge — it is on
-    // screen, not "other agents" news.
+    // The attached session's own work never enters the COUNTED segments —
+    // it is on screen, not "other agents" news. I4: the badge itself is
+    // still showing at this point — its standing return-to-agents hint is
+    // unconditional on being attached from the roster, regardless of any
+    // other session's counts.
     emit({
       type: 'event.session.work_changed',
       sessionId: 'ses-attached',
       busy: true,
       pending_interaction: 'none',
     } as Event);
-    expect(driver.state.footer.render(120)[0]).not.toContain('←');
+    expect(driver.state.footer.render(120)[0]).toContain('[← to return to agents]');
 
     // Another VIEW-OWNED session working DOES reach the badge while attached.
     // (A session created by another client is not in the registry — its
@@ -2892,7 +2895,7 @@ describe('KimiTUI agents-view attach', () => {
         pending_interaction: 'none',
       },
     } as Event);
-    expect(driver.state.footer.render(120)[0]).toContain('[← 1 working]');
+    expect(driver.state.footer.render(120)[0]).toContain('[← to return to agents · 1 working]');
 
     expect(driver.returnToAgentsView()).toBe(true);
 
@@ -2967,7 +2970,13 @@ describe('KimiTUI agents-view attach', () => {
       expect(driver.state.appState.sessionId).toBe('ses-attached');
     });
 
-    expect(driver.state.footer.render(120)[0]).not.toContain('←');
+    // I4: the standing return-to-agents hint still shows (attached from the
+    // roster) — the regression this test actually guards is that the
+    // attaching session's own awaiting-approval status never becomes a
+    // COUNTED "awaiting input" segment about itself.
+    const line1 = driver.state.footer.render(120)[0];
+    expect(line1).toContain('[← to return to agents]');
+    expect(line1).not.toContain('awaiting input');
   });
 });
 
