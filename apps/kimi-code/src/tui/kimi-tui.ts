@@ -1841,13 +1841,25 @@ export class KimiTUI {
   }
 
   setAppState(patch: Partial<AppState>): void {
-    if (!hasPatchChanges(this.state.appState, patch)) return;
+    // A transition to 'idle' is, structurally, the ONE place the turn-elapsed
+    // clock must clear. There are several call sites that end a turn (or a
+    // turn-like activity: a session switch, a failed send, a finished shell
+    // command, a standalone compaction) and every one of them goes through
+    // this method — so the clear is tied to the state change itself here,
+    // rather than something each call site has to separately remember. A
+    // caller that only asks for `streamingPhase: 'idle'` gets the clock reset
+    // for free; nothing upstream needs its own streamingStartTime/Approx.
+    const effectivePatch: Partial<AppState> =
+      patch.streamingPhase === 'idle'
+        ? { ...patch, streamingStartTime: 0, streamingStartApprox: false }
+        : patch;
+    if (!hasPatchChanges(this.state.appState, effectivePatch)) return;
     const additionalDirsChanged =
-      'additionalDirs' in patch &&
-      !sameStringArrays(this.state.appState.additionalDirs, patch.additionalDirs ?? []);
-    const busyChanged = 'streamingPhase' in patch || 'isCompacting' in patch;
-    Object.assign(this.state.appState, patch);
-    if ('planMode' in patch) this.updateEditorBorderHighlight();
+      'additionalDirs' in effectivePatch &&
+      !sameStringArrays(this.state.appState.additionalDirs, effectivePatch.additionalDirs ?? []);
+    const busyChanged = 'streamingPhase' in effectivePatch || 'isCompacting' in effectivePatch;
+    Object.assign(this.state.appState, effectivePatch);
+    if ('planMode' in effectivePatch) this.updateEditorBorderHighlight();
     this.state.footer.setState(this.state.appState);
     this.updateActivityPane();
     if (busyChanged) {

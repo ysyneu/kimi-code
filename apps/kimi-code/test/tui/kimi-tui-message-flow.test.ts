@@ -5880,6 +5880,35 @@ describe('transcript step and assistant folding', () => {
   });
 
   describe('turn elapsed clock', () => {
+    it('clears the elapsed clock from ANY transition to idle, not only finalizeTurn', async () => {
+      const { driver } = await makeDriver();
+      driver.state.appState.streamingStartTime = 12_345;
+      driver.state.appState.streamingStartApprox = true;
+
+      // setAppState is the single path every idle transition (finalizeTurn,
+      // resetSessionRuntime, a failed send, a finished shell command, a
+      // standalone compaction, ...) funnels through — the clear is a
+      // structural property of THIS call, not something each of those call
+      // sites has to separately remember.
+      (driver as unknown as KimiTUI).setAppState({ streamingPhase: 'idle' });
+
+      expect(driver.state.appState.streamingStartTime).toBe(0);
+      expect(driver.state.appState.streamingStartApprox).toBe(false);
+    });
+
+    it('clears a leaked elapsed clock via resetSessionRuntime (every session switch/attach)', async () => {
+      const { driver } = await makeDriver();
+      driver.state.appState.streamingPhase = 'waiting';
+      driver.state.appState.streamingStartTime = 12_345;
+      driver.state.appState.streamingStartApprox = true;
+
+      (driver as unknown as KimiTUI).resetSessionRuntime();
+
+      expect(driver.state.appState.streamingPhase).toBe('idle');
+      expect(driver.state.appState.streamingStartTime).toBe(0);
+      expect(driver.state.appState.streamingStartApprox).toBe(false);
+    });
+
     it('holds one elapsed-clock origin across phase changes within the same turn', async () => {
       vi.useFakeTimers();
       try {
@@ -6031,6 +6060,65 @@ describe('transcript step and assistant folding', () => {
         expect(driver.state.appState.streamingPhase).toBe('waiting');
         expect(driver.state.appState.streamingStartTime).toBe(5_000);
         expect(driver.state.appState.streamingStartApprox).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('never shows an elapsed suffix on the shell-command spinner right after a turn ends', async () => {
+      const runShellCommand = vi.fn(async () => ({ stdout: '', stderr: '', isError: false }));
+      const session = makeSession({ runShellCommand });
+      const { driver } = await makeDriver(session);
+      vi.useFakeTimers();
+      try {
+        // Run a real turn to completion — the `waiting`/`composing` activity
+        // pane spinner picks up an elapsed origin along the way.
+        vi.setSystemTime(1_000);
+        driver.sessionEventHandler.handleEvent(
+          { type: 'turn.started', agentId: 'main', sessionId: 'ses-1', turnId: 1 } as Event,
+          vi.fn(),
+        );
+        vi.setSystemTime(20_000);
+        driver.sessionEventHandler.handleEvent(
+          {
+            type: 'assistant.delta',
+            agentId: 'main',
+            sessionId: 'ses-1',
+            turnId: 1,
+            delta: 'hi',
+          } as Event,
+          vi.fn(),
+        );
+        vi.setSystemTime(25_000);
+        driver.sessionEventHandler.handleEvent(
+          {
+            type: 'turn.ended',
+            agentId: 'main',
+            sessionId: 'ses-1',
+            turnId: 1,
+            reason: 'completed',
+          } as Event,
+          vi.fn(),
+        );
+        expect(driver.state.appState.streamingPhase).toBe('idle');
+
+        // Immediately run a `!` shell command — it reuses the `waiting` moon
+        // spinner presentation (resolveActivityPaneMode maps `shell` onto it)
+        // but shares no timestamp with any turn.
+        vi.setSystemTime(26_000);
+        driver.state.appState.inputMode = 'bash';
+        driver.state.editor.inputMode = 'bash';
+        driver.handleUserInput('sleep 5');
+
+        expect(driver.state.appState.streamingPhase).toBe('shell');
+        const spinner = driver.state.activitySpinner?.instance;
+        expect(spinner).toBeDefined();
+        // renderInline() is the loader's own computed base text (frame +
+        // label + elapsed suffix, tip deliberately excluded — see MoonLoader)
+        // — the precise, deterministic surface the elapsed-suffix logic
+        // writes to. The activity pane's tip rotation is randomized content
+        // unrelated to this feature, so it is not asserted on here.
+        expect(stripSgr(spinner!.renderInline())).not.toMatch(/\d/);
       } finally {
         vi.useRealTimers();
       }
