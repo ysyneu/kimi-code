@@ -3,6 +3,7 @@ import { z } from 'zod';
 import {
   envelopeSchema,
   unwrapEnvelope,
+  wireActivateSkillResultSchema,
   wireGoalSnapshotSchema,
   wireMessageSchema,
   wirePromptSubmitResultSchema,
@@ -13,6 +14,7 @@ import {
   wireSkillSchema,
   wireSnapshotSchema,
   wireWorkspaceSchema,
+  type WireActivateSkillResult,
   type WireApprovalResponse,
   type WireGoalSnapshot,
   type WireMessage,
@@ -265,5 +267,19 @@ export class WireHttpClient {
       z.object({ skills: z.array(wireSkillSchema) }),
     );
     return data.skills;
+  }
+
+  /** Activate a skill in a session — REST analogue of the `/<skill>` slash command. */
+  activateSkill(
+    id: string,
+    skillName: string,
+    body: { args?: string },
+  ): Promise<WireActivateSkillResult> {
+    return this.request(
+      'POST',
+      `/sessions/${id}/skills/${skillName}:activate`,
+      body,
+      wireActivateSkillResultSchema,
+    );
   }
 }

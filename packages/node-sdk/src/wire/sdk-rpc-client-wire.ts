@@ -48,6 +48,7 @@ import { KimiAuthFacade } from '#/auth';
 import type { ApprovalHandler, QuestionHandler } from '#/events';
 import {
   SDKRpcClientBase,
+  type ActivateSkillRpcInput,
   type SessionIdRpcInput,
   type SessionPromptRpcInput,
   type SetSessionPermissionRpcInput,
@@ -557,6 +558,18 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
 
   override async getGoal(input: SessionIdRpcInput): Promise<GoalToolResult> {
     return { goal: await this.http.getSessionGoal(input.sessionId) };
+  }
+
+  /**
+   * Skill activation — REST analogue of the `/<skill>` slash command
+   * (`POST /sessions/{id}/skills/{name}:activate`). The base surface had no
+   * wire override for this method: every call fell through to `getRpc()`
+   * and threw `not_implemented` unconditionally, so skill dispatch from the
+   * agents view — which always talks over the wire — has never worked.
+   * `agent_id` is never sent, matching every other turn override above.
+   */
+  override async activateSkill(input: ActivateSkillRpcInput): Promise<void> {
+    await this.http.activateSkill(input.sessionId, input.name, { args: input.args });
   }
 
   // -----------------------------------------------------------------------

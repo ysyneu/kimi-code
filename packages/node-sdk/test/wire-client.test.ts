@@ -855,6 +855,37 @@ describe('SDKRpcClientWire turns and state', () => {
 });
 
 // ---------------------------------------------------------------------------
+// SDKRpcClientWire activateSkill — the base surface had no wire override for
+// this method: every call fell through to getRpc() and threw not_implemented
+// unconditionally, so skill dispatch from the agents view (which always
+// talks over the wire) has never worked live.
+// ---------------------------------------------------------------------------
+
+describe('SDKRpcClientWire activateSkill', () => {
+  it('activates a builtin skill over :activate and titles the session, on a freshly created cold session', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    // No resumeSession() beforehand — matches the roster dispatch path,
+    // which activates immediately after createSession.
+    await rpc.activateSkill({ sessionId: created.id, name: 'update-config', args: '--help' });
+    const listed = await rpc.listSessions({});
+    expect(listed.find((s) => s.id === created.id)?.title).toBe('/update-config --help');
+    await rpc.close();
+  });
+
+  it('rejects an unknown skill with the server envelope code', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    await expect(
+      rpc.activateSkill({ sessionId: created.id, name: 'does-not-exist' }),
+    ).rejects.toMatchObject({ code: 40415 });
+    await rpc.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // SDKRpcClientWire getGoal — the root fix for the attach crash: the wire
 // transport previously had no override, so every attach's
 // `Promise.all([getStatus(), getGoal()])` rejected with not_implemented.

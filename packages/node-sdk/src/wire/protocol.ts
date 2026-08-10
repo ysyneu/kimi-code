@@ -127,6 +127,12 @@ export const wireSkillSchema = z.object({
 });
 export type WireSkill = z.infer<typeof wireSkillSchema>;
 
+export const wireActivateSkillResultSchema = z.object({
+  activated: z.literal(true),
+  skill_name: z.string().min(1),
+});
+export type WireActivateSkillResult = z.infer<typeof wireActivateSkillResultSchema>;
+
 export const wireSessionStatusSchema = z.object({
   busy: z.boolean(),
   model: z.string().optional(),
