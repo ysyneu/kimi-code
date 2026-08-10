@@ -1,3 +1,6 @@
+import { Readable } from 'node:stream';
+import type { ReadableStream as WebReadableStream } from 'node:stream/web';
+
 import { z } from 'zod';
 
 import {
@@ -14,6 +17,8 @@ import {
   wireSessionWarningSchema,
   wireSkillSchema,
   wireSnapshotSchema,
+  wireStartBtwResultSchema,
+  wireTaskSchema,
   wireWorkspaceSchema,
   type WireActivateSkillResult,
   type WireApprovalResponse,
@@ -28,6 +33,9 @@ import {
   type WireSessionWarning,
   type WireSkill,
   type WireSnapshot,
+  type WireStartBtwResult,
+  type WireTask,
+  type WireTaskStatus,
   type WireWorkspace,
 } from './protocol';
 
@@ -58,7 +66,7 @@ export class WireHttpClient {
   constructor(private readonly options: WireHttpClientOptions) {}
 
   private async request<T>(
-    method: 'GET' | 'POST',
+    method: 'GET' | 'POST' | 'DELETE',
     path: string,
     body: unknown,
     dataSchema: z.ZodType<T>,
@@ -77,6 +85,9 @@ export class WireHttpClient {
     const init: RequestInit = { method, headers };
     if (body !== undefined) init.body = JSON.stringify(body);
     const res = await fetch(`${this.options.baseUrl}${API_PREFIX}${path}`, init);
+    // A 204 carries no body at all (e.g. the delete-provider route's success
+    // shape) — only valid when the caller's schema accepts `undefined`.
+    if (res.status === 204) return dataSchema.parse(undefined);
     const text = await res.text();
     let parsed: unknown;
     try {
@@ -312,6 +323,88 @@ export class WireHttpClient {
       `/sessions/${id}/profile`,
       { agent_config: { thinking: effort } },
       wireSessionSchema,
+    );
+  }
+
+  /** Delete a provider and its model aliases — `DELETE /providers/{provider_id}` (204, no body). */
+  deleteProvider(providerId: string): Promise<void> {
+    return this.request('DELETE', `/providers/${providerId}`, undefined, z.void());
+  }
+
+  /** List a session's background tasks, optionally filtered by status. */
+  async listTasks(id: string, query: { status?: WireTaskStatus } = {}): Promise<WireTask[]> {
+    const params = new URLSearchParams();
+    if (query.status !== undefined) params.set('status', query.status);
+    const suffix = params.size > 0 ? `?${params.toString()}` : '';
+    const data = await this.request(
+      'GET',
+      `/sessions/${id}/tasks${suffix}`,
+      undefined,
+      z.object({ items: z.array(wireTaskSchema) }),
+    );
+    return data.items;
+  }
+
+  /** Get a single background task by id, optionally with its buffered output. */
+  getTask(
+    id: string,
+    taskId: string,
+    query: { with_output?: boolean; output_bytes?: number } = {},
+  ): Promise<WireTask> {
+    const params = new URLSearchParams();
+    if (query.with_output !== undefined) params.set('with_output', String(query.with_output));
+    if (query.output_bytes !== undefined) params.set('output_bytes', String(query.output_bytes));
+    const suffix = params.size > 0 ? `?${params.toString()}` : '';
+    return this.request('GET', `/sessions/${id}/tasks/${taskId}${suffix}`, undefined, wireTaskSchema);
+  }
+
+  /** Stop (cancel) a background task — the literal `tasks/{task_id}:cancel` route. */
+  async cancelTask(id: string, taskId: string): Promise<void> {
+    await this.request('POST', `/sessions/${id}/tasks/${taskId}:cancel`, {}, z.unknown());
+  }
+
+  /** Start the session's side-channel "by the way" agent — the literal `sessions/{id}:btw` route. */
+  startBtw(id: string): Promise<WireStartBtwResult> {
+    return this.request('POST', `/sessions/${id}:btw`, {}, wireStartBtwResultSchema);
+  }
+
+  /**
+   * Session diagnostic archive — `POST /sessions/{id}/export`. Unlike every
+   * other route on this client, success streams a raw zip body with no JSON
+   * envelope — and every response on this server, success OR error, rides
+   * HTTP 200 (`reply.send(errEnvelope(...))` never sets a status), so the
+   * zip-vs-envelope branch has to read `content-type`, not `res.ok`.
+   */
+  async exportSession(id: string): Promise<NodeJS.ReadableStream> {
+    const headers: Record<string, string> = {
+      accept: 'application/zip, application/json',
+      authorization: `Bearer ${this.options.token}`,
+      'content-type': 'application/json',
+    };
+    const res = await fetch(`${this.options.baseUrl}${API_PREFIX}/sessions/${id}/export`, {
+      method: 'POST',
+      headers,
+      body: '{}',
+    });
+    if (res.headers.get('content-type')?.startsWith('application/zip') === true) {
+      if (res.body === null) {
+        throw new Error(`kap-server sent a zip response with no body for POST /sessions/${id}/export`);
+      }
+      return Readable.fromWeb(res.body as WebReadableStream<Uint8Array>);
+    }
+    const text = await res.text();
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new Error(
+        `kap-server returned non-JSON ${res.status} for POST /sessions/${id}/export: ${text.slice(0, 200)}`,
+      );
+    }
+    const envelope = envelopeSchema(z.unknown()).parse(parsed);
+    if (envelope.code !== 0) unwrapEnvelope(envelope);
+    throw new Error(
+      `kap-server returned an unexpected JSON success response for POST /sessions/${id}/export`,
     );
   }
 }

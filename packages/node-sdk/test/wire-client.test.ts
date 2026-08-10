@@ -1,8 +1,8 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { ErrorCodes } from '@moonshot-ai/agent-core';
+import { AGENT_WIRE_PROTOCOL_VERSION, ErrorCodes } from '@moonshot-ai/agent-core';
 import { ISessionMetadata, getLiveSessionById } from '@moonshot-ai/agent-core-v2';
 import {
   startServer,
@@ -13,7 +13,12 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { createKimiHarnessWire } from '#/index';
 import { WireHttpClient, type WirePromptSubmission } from '#/wire/http-client';
-import type { WireApprovalRequest, WireMessage, WireQuestionRequest } from '#/wire/protocol';
+import type {
+  WireApprovalRequest,
+  WireMessage,
+  WireQuestionRequest,
+  WireTask,
+} from '#/wire/protocol';
 import { collectReplayMessages } from '#/wire/resume-replay';
 import { InteractionBridge } from '#/wire/reverse-rpc';
 import { SDKRpcClientWire, toWireContent } from '#/wire/sdk-rpc-client-wire';
@@ -985,6 +990,269 @@ describe('SDKRpcClientWire getGoal', () => {
 });
 
 // ---------------------------------------------------------------------------
+// SDKRpcClientWire startBtw — no wire override existed; every call fell
+// through to getRpc() and threw not_implemented.
+// ---------------------------------------------------------------------------
+
+describe('SDKRpcClientWire startBtw', () => {
+  it('starts the btw agent over :btw and returns its agent id, without sending agent_id', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    // The btw side-channel needs an existing main agent to attach next to —
+    // a session with no prompt yet has none (server-v2 gap G10: the main
+    // agent is not created on session creation).
+    await rpc.prompt({ sessionId: created.id, input: [{ type: 'text', text: 'warm up main' }] });
+    // Call-through spy: asserts the exact call the live server accepted.
+    const spy = vi.spyOn(WireHttpClient.prototype, 'startBtw');
+    const agentId = await rpc.startBtw({ sessionId: created.id });
+    expect(agentId).toBeTruthy();
+    expect(spy).toHaveBeenCalledWith(created.id);
+    spy.mockRestore();
+    await rpc.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDKRpcClientWire background tasks — no wire override existed for any of
+// the three; every call fell through to getRpc() and threw not_implemented.
+// The kind-projection tests below mock WireHttpClient (kap-server's tasks
+// route has no primitive for spawning a real subagent/bash/question task
+// from a test), the same way the getGoal mock test above stands in for a
+// live active goal; the plumbing itself (URL/query construction, envelope
+// unwrap, error mapping) is exercised against the live server in
+// wire-rest.test.ts.
+// ---------------------------------------------------------------------------
+
+describe('SDKRpcClientWire background tasks', () => {
+  const SUBAGENT_TASK: WireTask = {
+    id: 'task_agent_1',
+    session_id: 's1',
+    kind: 'subagent',
+    description: 'investigate the failure',
+    status: 'running',
+    created_at: '2026-08-01T00:00:00.000Z',
+    started_at: '2026-08-01T00:00:01.000Z',
+  };
+  const BASH_TASK: WireTask = {
+    id: 'task_bash_1',
+    session_id: 's1',
+    kind: 'bash',
+    description: 'run the test suite',
+    status: 'completed',
+    command: 'npm test',
+    created_at: '2026-08-01T00:00:00.000Z',
+    completed_at: '2026-08-01T00:00:05.000Z',
+  };
+
+  it('projects only subagent-kind tasks into BackgroundTaskInfo, dropping bash/tool kinds', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = vi
+      .spyOn(WireHttpClient.prototype, 'listTasks')
+      .mockResolvedValue([SUBAGENT_TASK, BASH_TASK]);
+    const tasks = await rpc.listBackgroundTasks({ sessionId: 's1' });
+    expect(tasks).toEqual([
+      {
+        kind: 'agent',
+        taskId: 'task_agent_1',
+        description: 'investigate the failure',
+        status: 'running',
+        startedAt: Date.parse('2026-08-01T00:00:01.000Z'),
+        endedAt: null,
+        agentId: 'task_agent_1',
+      },
+    ]);
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('maps activeOnly to the route\'s running status filter', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = vi.spyOn(WireHttpClient.prototype, 'listTasks').mockResolvedValue([]);
+    await rpc.listBackgroundTasks({ sessionId: 's1', activeOnly: true });
+    expect(spy).toHaveBeenCalledWith('s1', { status: 'running' });
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('caps the mapped result client-side when limit is given (the route has no limit query param)', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const many = Array.from({ length: 3 }, (_, i) => ({ ...SUBAGENT_TASK, id: `task_${String(i)}` }));
+    const spy = vi.spyOn(WireHttpClient.prototype, 'listTasks').mockResolvedValue(many);
+    const tasks = await rpc.listBackgroundTasks({ sessionId: 's1', limit: 2 });
+    expect(tasks).toHaveLength(2);
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('maps a cancelled wire status onto v1\'s "killed" status', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = vi
+      .spyOn(WireHttpClient.prototype, 'listTasks')
+      .mockResolvedValue([{ ...SUBAGENT_TASK, status: 'cancelled' }]);
+    const tasks = await rpc.listBackgroundTasks({ sessionId: 's1' });
+    expect(tasks[0]?.status).toBe('killed');
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it("maps tail onto output_bytes and requests with_output, returning the task's output preview", async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = vi
+      .spyOn(WireHttpClient.prototype, 'getTask')
+      .mockResolvedValue({ ...SUBAGENT_TASK, output_preview: 'hello output' });
+    const output = await rpc.getBackgroundTaskOutput({
+      sessionId: 's1',
+      taskId: 'task_agent_1',
+      tail: 4096,
+    });
+    expect(output).toBe('hello output');
+    expect(spy).toHaveBeenCalledWith('s1', 'task_agent_1', { with_output: true, output_bytes: 4096 });
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('resolves an empty string when the task has no output yet', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = vi.spyOn(WireHttpClient.prototype, 'getTask').mockResolvedValue(SUBAGENT_TASK);
+    await expect(
+      rpc.getBackgroundTaskOutput({ sessionId: 's1', taskId: 'task_agent_1' }),
+    ).resolves.toBe('');
+    expect(spy).toHaveBeenCalledWith('s1', 'task_agent_1', {
+      with_output: true,
+      output_bytes: undefined,
+    });
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('stops a background task over the :cancel route, without forwarding reason (the route accepts no body)', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = vi.spyOn(WireHttpClient.prototype, 'cancelTask').mockResolvedValue(undefined);
+    await rpc.stopBackgroundTask({
+      sessionId: 's1',
+      taskId: 'task_agent_1',
+      reason: 'no longer needed',
+    });
+    expect(spy).toHaveBeenCalledWith('s1', 'task_agent_1');
+    spy.mockRestore();
+    await rpc.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDKRpcClientWire removeProvider — no wire override existed; every call
+// fell through to getRpc() and threw not_implemented.
+// ---------------------------------------------------------------------------
+
+describe('SDKRpcClientWire removeProvider', () => {
+  it('deletes the provider (204, no body) and re-reads the resulting config through getConfig', async () => {
+    const providerId = `wire-client-remove-${String(Date.now())}`;
+    const createRes = await fetch(`${base}/api/v1/providers`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        id: providerId,
+        type: 'openai',
+        api_key: 'stub',
+        base_url: 'http://127.0.0.1:9999',
+        models: [{ model: 'throwaway-model', max_context_size: 1000 }],
+      }),
+    });
+    expect(createRes.status).toBe(201);
+
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const deleteSpy = vi.spyOn(WireHttpClient.prototype, 'deleteProvider');
+    const getConfigSpy = vi.spyOn(WireHttpClient.prototype, 'getConfig');
+    const config = await rpc.removeProvider(providerId);
+    expect(deleteSpy).toHaveBeenCalledWith(providerId);
+    expect(getConfigSpy).toHaveBeenCalled();
+    expect(config.providers[providerId]).toBeUndefined();
+    // Untouched providers survive — this is a live re-read, not a stale echo.
+    expect(config.providers['stub']).toBeDefined();
+    deleteSpy.mockRestore();
+    getConfigSpy.mockRestore();
+    await rpc.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDKRpcClientWire exportSession — SHAPE MISMATCH: the route streams a zip
+// with no JSON envelope on success, so this downloads it to `outputPath`
+// instead of parsing a config-style response. No wire override existed
+// before; every call fell through to getRpc() and threw not_implemented.
+// ---------------------------------------------------------------------------
+
+describe('SDKRpcClientWire exportSession', () => {
+  it('downloads the streamed zip to outputPath and returns a best-effort manifest', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    // Real content on disk before exporting — a session directory with
+    // nothing written to it yet has no exportable files server-side.
+    await rpc.prompt({ sessionId: created.id, input: [{ type: 'text', text: 'export me' }] });
+
+    const outputPath = join(home, 'exports', 'debug.zip');
+    const result = await rpc.exportSession({
+      id: created.id,
+      outputPath,
+      version: '1.2.3-test',
+      installSource: 'npm-global',
+    });
+
+    expect(result.zipPath).toBe(outputPath);
+    const archive = await readFile(outputPath);
+    // zip local-file-header magic number — proves the stream landed intact.
+    expect(archive.subarray(0, 4)).toEqual(Buffer.from([0x50, 0x4b, 0x03, 0x04]));
+
+    // Deliberate degrades: never fabricated, matching the class's other
+    // wire-transport reads.
+    expect(result.entries).toEqual([]);
+    expect(result.sessionDir).toBe('');
+    expect(result.manifest).toMatchObject({
+      sessionId: created.id,
+      kimiCodeVersion: '1.2.3-test',
+      wireProtocolVersion: AGENT_WIRE_PROTOCOL_VERSION,
+      installSource: 'npm-global',
+      os: process.platform,
+      nodejsVersion: process.version,
+    });
+    await rpc.close();
+  });
+
+  it('defaults outputPath to kimi-debug-<shortId>-<timestamp>.zip under the cwd, mirroring v1', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    await rpc.prompt({ sessionId: created.id, input: [{ type: 'text', text: 'default path' }] });
+
+    const scratch = await mkdtemp(join(tmpdir(), 'kimi-export-default-'));
+    const originalCwd = process.cwd();
+    try {
+      process.chdir(scratch);
+      const result = await rpc.exportSession({ id: created.id, version: '1.0.0' });
+      expect(result.zipPath).toMatch(
+        new RegExp(`kimi-debug-${created.id.slice(0, 8)}-\\d{8}-\\d{6}\\.zip$`),
+      );
+      const info = await stat(result.zipPath);
+      expect(info.size).toBeGreaterThan(0);
+    } finally {
+      process.chdir(originalCwd);
+      await rm(scratch, { recursive: true, force: true });
+    }
+    await rpc.close();
+  });
+
+  it('rejects exporting an unknown session with the server envelope code', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await expect(
+      rpc.exportSession({ id: 'no-such-session', outputPath: join(home, 'never.zip'), version: '1.0.0' }),
+    ).rejects.toMatchObject({ code: 40401 });
+    await rpc.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // SDKRpcClientWire degrade surface: empty collections for surfaces kap-server
 // has no routes for, deferred
 // setPermission riding the next prompt/steer, and model/profile passthrough.
@@ -1159,11 +1427,12 @@ describe('SDKRpcClientWire degrade surface', () => {
 // running under this transport (`kimi agents` boots the whole KimiTUI app —
 // not just the roster — on a wire harness; see
 // apps/kimi-code/src/cli/sub/agents-run.ts), currently every method already
-// overridden above plus the four fixed by the config/model section. A wider
-// TUI-wide grep turns up further reached-but-unoverridden methods (e.g.
-// getPlan, createGoal, startBtw, setPluginEnabled, exportSession, …) that are
-// pre-existing gaps outside this round's scope, not something this guard
-// silently signs off on — they are simply not in SUPPORTED_METHODS yet.
+// overridden above plus the four fixed by the config/model section and the
+// six fixed by the tier-1 section below. A wider TUI-wide grep turns up
+// further reached-but-unoverridden methods (e.g. getPlan, createGoal,
+// setPluginEnabled, …) that are pre-existing gaps outside this round's
+// scope, not something this guard silently signs off on — they are simply
+// not in SUPPORTED_METHODS yet.
 // ---------------------------------------------------------------------------
 
 describe('SDKRpcClientWire wire-supported surface', () => {
@@ -1198,6 +1467,14 @@ describe('SDKRpcClientWire wire-supported surface', () => {
     'setConfig',
     'setModel',
     'setThinking',
+    // Fixed by this round's tier-1 section — six overrides against routes
+    // that already existed server-side (no server work involved):
+    'removeProvider',
+    'listBackgroundTasks',
+    'getBackgroundTaskOutput',
+    'stopBackgroundTask',
+    'startBtw',
+    'exportSession',
   ] as const;
 
   // Methods the TUI also reaches over the wire that this transport has

@@ -154,6 +154,40 @@ export const wireSessionWarningSchema = z.object({
 export type WireSessionWarning = z.infer<typeof wireSessionWarningSchema>;
 
 // ---------------------------------------------------------------------------
+// Background tasks
+//
+// Mirrors kap-server's `taskSchema` (protocol/task.ts) byte-for-byte: the
+// route projects agent-core's richer `AgentTaskInfo` (process/agent/question
+// kinds, six-way status) down onto this shape (bash/subagent/tool kinds,
+// four-way status), so `command`/`output_preview` are the only kind-specific
+// fields that survive onto the wire.
+// ---------------------------------------------------------------------------
+
+export const wireTaskKindSchema = z.enum(['subagent', 'bash', 'tool']);
+export type WireTaskKind = z.infer<typeof wireTaskKindSchema>;
+
+export const wireTaskStatusSchema = z.enum(['running', 'completed', 'failed', 'cancelled']);
+export type WireTaskStatus = z.infer<typeof wireTaskStatusSchema>;
+
+export const wireTaskSchema = z.object({
+  id: z.string().min(1),
+  session_id: z.string().min(1),
+  kind: wireTaskKindSchema,
+  description: z.string(),
+  status: wireTaskStatusSchema,
+  command: z.string().optional(),
+  created_at: isoDateTime,
+  started_at: isoDateTime.optional(),
+  completed_at: isoDateTime.optional(),
+  output_preview: z.string().optional(),
+  output_bytes: z.number().int().nonnegative().optional(),
+});
+export type WireTask = z.infer<typeof wireTaskSchema>;
+
+export const wireStartBtwResultSchema = z.object({ agent_id: z.string().min(1) });
+export type WireStartBtwResult = z.infer<typeof wireStartBtwResultSchema>;
+
+// ---------------------------------------------------------------------------
 // Config
 //
 // Mirrors kap-server's `configResponseSchema` / `patchConfigRequestSchema`

@@ -267,3 +267,91 @@ describe('WireHttpClient config and model routes', () => {
     expect((await http.getSessionStatus(created.id)).thinking_level).toBe('off');
   });
 });
+
+// R9 Q4b sibling: `removeProvider` / `listBackgroundTasks` /
+// `getBackgroundTaskOutput` / `stopBackgroundTask` / `startBtw` /
+// `exportSession` had no wire override — see the fix in
+// sdk-rpc-client-wire.ts for the full evidence trail.
+describe('WireHttpClient provider routes', () => {
+  it('deletes a provider (204, no body) and the config no longer lists it', async () => {
+    const providerId = `wire-http-delete-${String(Date.now())}`;
+    const createRes = await fetch(`http://127.0.0.1:${server.port}/api/v1/providers`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        id: providerId,
+        type: 'openai',
+        api_key: 'stub',
+        base_url: 'http://127.0.0.1:9999',
+        models: [{ model: 'throwaway-model', max_context_size: 1000 }],
+      }),
+    });
+    expect(createRes.status).toBe(201);
+    expect((await http.getConfig()).providers[providerId]).toBeDefined();
+
+    await expect(http.deleteProvider(providerId)).resolves.toBeUndefined();
+    expect((await http.getConfig()).providers[providerId]).toBeUndefined();
+  });
+
+  it('rejects deleting an unknown provider with the server envelope code', async () => {
+    await expect(http.deleteProvider('does-not-exist')).rejects.toMatchObject({ code: 40412 });
+  });
+});
+
+describe('WireHttpClient background task routes', () => {
+  it('lists no tasks for a fresh session, and 404s reading/cancelling an unknown task', async () => {
+    const created = await http.createSession({ metadata: { cwd } });
+    await expect(http.listTasks(created.id)).resolves.toEqual([]);
+    await expect(http.getTask(created.id, 'no-such-task')).rejects.toMatchObject({ code: 40406 });
+    await expect(http.cancelTask(created.id, 'no-such-task')).rejects.toMatchObject({
+      code: 40406,
+    });
+  });
+
+  it('filters by status through the query param', async () => {
+    const created = await http.createSession({ metadata: { cwd } });
+    await expect(http.listTasks(created.id, { status: 'running' })).resolves.toEqual([]);
+  });
+
+  it('404s listing/reading/cancelling tasks for an unknown session', async () => {
+    await expect(http.listTasks('no-such-session')).rejects.toMatchObject({ code: 40401 });
+    await expect(http.getTask('no-such-session', 't1')).rejects.toMatchObject({ code: 40401 });
+    await expect(http.cancelTask('no-such-session', 't1')).rejects.toMatchObject({ code: 40401 });
+  });
+});
+
+describe('WireHttpClient startBtw route', () => {
+  it('starts the side-channel btw agent and returns a real agent id', async () => {
+    const created = await http.createSession({ metadata: { cwd } });
+    // The btw side-channel needs an existing main agent to attach next to —
+    // a session with no prompt yet has none (server-v2 gap G10: the main
+    // agent is not created on session creation).
+    await http.submitPrompt(created.id, { content: [{ type: 'text', text: 'warm up main' }] });
+    const result = await http.startBtw(created.id);
+    expect(result.agent_id).toBeTruthy();
+  });
+
+  it('404s starting btw on an unknown session', async () => {
+    await expect(http.startBtw('no-such-session')).rejects.toMatchObject({ code: 40401 });
+  });
+});
+
+describe('WireHttpClient session export route', () => {
+  it('streams a real zip archive for a session with content on disk', async () => {
+    const created = await http.createSession({ metadata: { cwd } });
+    // A session directory with nothing written to it yet has no exportable
+    // files server-side — submit a prompt first so there is something to zip.
+    await http.submitPrompt(created.id, { content: [{ type: 'text', text: 'export me' }] });
+
+    const stream = await http.exportSession(created.id);
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream as AsyncIterable<Buffer>) chunks.push(chunk);
+    const archive = Buffer.concat(chunks);
+    // zip local-file-header magic number.
+    expect(archive.subarray(0, 4)).toEqual(Buffer.from([0x50, 0x4b, 0x03, 0x04]));
+  });
+
+  it('rejects exporting an unknown session with the server envelope code', async () => {
+    await expect(http.exportSession('no-such-session')).rejects.toMatchObject({ code: 40401 });
+  });
+});

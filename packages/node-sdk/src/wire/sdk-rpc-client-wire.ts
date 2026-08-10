@@ -36,10 +36,17 @@
  * - `sessionDir` is `''` everywhere: the server never exposes its on-disk
  *   layout over the wire.
  */
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { createWriteStream, readFileSync } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
+import { pipeline } from 'node:stream/promises';
 
-import { ErrorCodes, KimiError, noopTelemetryClient } from '@moonshot-ai/agent-core';
+import {
+  AGENT_WIRE_PROTOCOL_VERSION,
+  ErrorCodes,
+  KimiError,
+  noopTelemetryClient,
+} from '@moonshot-ai/agent-core';
 import type { AgentContextData } from '@moonshot-ai/agent-core';
 import { ensureKimiHome, resolveConfigPath, resolveKimiHome } from '@moonshot-ai/agent-core-v2';
 import { assertKimiHostIdentity } from '@moonshot-ai/kimi-code-oauth';
@@ -57,8 +64,12 @@ import {
   type SetSessionThinkingRpcInput,
 } from '#/rpc';
 import type {
+  AgentBackgroundTaskInfo,
+  BackgroundTaskInfo,
   CompactOptions,
   CreateSessionOptions,
+  ExportSessionInput,
+  ExportSessionResult,
   ForkSessionInput,
   GetConfigOptions,
   GoalToolResult,
@@ -96,6 +107,7 @@ import type {
   WireSessionUsage,
   WireSkill,
   WireSnapshot,
+  WireTask,
   WsEventFrame,
 } from './protocol';
 import {
@@ -308,6 +320,38 @@ function wireUsageToSessionUsage(usage: WireSessionUsage): SessionUsage {
     byModel: undefined,
     currentTurn: undefined,
   };
+}
+
+/**
+ * `WireTask` (subagent-kind only) → v1 `AgentBackgroundTaskInfo`. Mirrors
+ * resume-replay's `wireSubagentToBackgroundTaskInfo`: `bash` tasks map to
+ * v1's `process` kind, whose required `pid` this route's `Task` shape never
+ * carries, and `tool` tasks (kap-server's kind for question-driven flows)
+ * map to v1's `question` kind, whose required `questionCount` isn't on the
+ * wire either — both are dropped rather than fabricated.
+ */
+function wireTaskToBackgroundTaskInfo(task: WireTask): AgentBackgroundTaskInfo | undefined {
+  if (task.kind !== 'subagent') return undefined;
+  return {
+    kind: 'agent',
+    taskId: task.id,
+    description: task.description,
+    status: task.status === 'cancelled' ? 'killed' : task.status,
+    startedAt: Date.parse(task.started_at ?? task.created_at),
+    endedAt: task.completed_at !== undefined ? Date.parse(task.completed_at) : null,
+    agentId: task.id,
+  };
+}
+
+/**
+ * Mirrors v1's `defaultExportZipName` (agent-core's session-export.ts) so a
+ * caller who omits `outputPath` gets the same filename shape regardless of
+ * transport.
+ */
+function defaultDebugExportZipName(sessionId: string, now: Date): string {
+  const shortId = sessionId.slice(0, 8);
+  const timestamp = now.toISOString().replaceAll(/[-:]/g, '').replace(/T/, '-').slice(0, 15);
+  return `kimi-debug-${shortId}-${timestamp}.zip`;
 }
 
 export class SDKRpcClientWire extends SDKRpcClientBase {
@@ -539,6 +583,59 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
   }
 
   /**
+   * Session diagnostic archive. SHAPE MISMATCH, handled honestly: the base
+   * RPC writes a session directory to a local zip with a rich manifest
+   * (`outputPath` + diagnostics fields); the route
+   * (`POST /sessions/{id}/export`) instead streams a zip archive over HTTP
+   * with no manifest of its own reachable from the response. This downloads
+   * the stream to `outputPath` (defaulting to the same
+   * `kimi-debug-<shortId>-<timestamp>.zip` name v1 uses when the caller
+   * omits one) and returns the shape `exportSession`'s only real caller
+   * (`handleExportDebugZipCommand`, apps/kimi-code's session slash commands)
+   * actually reads — `zipPath` — with the rest honestly degraded:
+   *   - `entries` is always `[]`: the route answers a raw zip stream with no
+   *     entry manifest, and unzipping it just to list entries is out of
+   *     scope for a thin wire override.
+   *   - `sessionDir` is `''`, matching every other wire-transport read (the
+   *     server never exposes its on-disk layout over the wire).
+   *   - `manifest` is reconstructed from what THIS request/environment
+   *     actually knows (`sessionId`, the caller's `version` /
+   *     `installSource` / `shellEnv`, this process's `os` / `nodejsVersion`,
+   *     and the real `AGENT_WIRE_PROTOCOL_VERSION` constant) — never
+   *     fabricated. The fields that live inside the archive's OWN manifest
+   *     (`title`, `workspaceDir`, activity timestamps, log paths) are not
+   *     reachable without unzipping and are left `undefined`.
+   * The route's request body only accepts `web_log` / `desktop`, neither of
+   * which `ExportSessionInput` carries: `includeGlobalLog` / `version` /
+   * `installSource` / `shellEnv` cannot reach the server at all — it always
+   * bundles its own global log and stamps its own host identity version
+   * into the archive's real (in-zip) manifest regardless of what the caller
+   * passes here.
+   */
+  override async exportSession(input: ExportSessionInput): Promise<ExportSessionResult> {
+    const now = new Date();
+    const outputPath = input.outputPath ?? resolve(defaultDebugExportZipName(input.id, now));
+    const stream = await this.http.exportSession(input.id);
+    await mkdir(dirname(outputPath), { recursive: true });
+    await pipeline(stream, createWriteStream(outputPath));
+    return {
+      zipPath: outputPath,
+      entries: [],
+      sessionDir: '',
+      manifest: {
+        sessionId: input.id,
+        exportedAt: now.toISOString(),
+        kimiCodeVersion: input.version,
+        wireProtocolVersion: AGENT_WIRE_PROTOCOL_VERSION,
+        os: process.platform,
+        nodejsVersion: process.version,
+        installSource: input.installSource,
+        shellEnv: input.shellEnv,
+      },
+    };
+  }
+
+  /**
    * `forkId` / `turnIndex` have no wire equivalent (the server mints the id
    * and forks the whole session); only `title` / `metadata` cross.
    */
@@ -635,6 +732,65 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
   }
 
   /**
+   * Start the session's side-channel "by the way" agent, resolving to the
+   * started agent id — `POST /sessions/{id}:btw`. `agent_id` is never sent,
+   * matching every other turn override above.
+   */
+  override async startBtw(input: SessionIdRpcInput): Promise<string> {
+    return (await this.http.startBtw(input.sessionId)).agent_id;
+  }
+
+  /**
+   * Background tasks for the session's main agent — `GET
+   * /sessions/{id}/tasks`. Only `subagent`-kind tasks survive the wire
+   * projection into `BackgroundTaskInfo` — see `wireTaskToBackgroundTaskInfo`
+   * above for why `bash` / `tool` tasks are dropped instead of fabricated.
+   * `activeOnly` maps onto the route's `status` filter (`running` is the
+   * only non-terminal wire status); `limit` has no route query parameter,
+   * so it caps the mapped result client-side instead of being dropped.
+   */
+  override async listBackgroundTasks(
+    input: SessionIdRpcInput & { activeOnly?: boolean; limit?: number },
+  ): Promise<readonly BackgroundTaskInfo[]> {
+    const items = await this.http.listTasks(input.sessionId, {
+      status: input.activeOnly === true ? 'running' : undefined,
+    });
+    const mapped = items
+      .map(wireTaskToBackgroundTaskInfo)
+      .filter((info): info is AgentBackgroundTaskInfo => info !== undefined);
+    return input.limit === undefined ? mapped : mapped.slice(0, input.limit);
+  }
+
+  /**
+   * A background task's buffered output — `GET
+   * /sessions/{id}/tasks/{task_id}` with `with_output=true`. The base
+   * method's `tail` option (its only output-size input) maps onto the
+   * route's `output_bytes` query param; omitted, the route falls back to
+   * its own 32 KiB default instead of this client picking one.
+   */
+  override async getBackgroundTaskOutput(
+    input: SessionIdRpcInput & { taskId: string; tail?: number },
+  ): Promise<string> {
+    const task = await this.http.getTask(input.sessionId, input.taskId, {
+      with_output: true,
+      output_bytes: input.tail,
+    });
+    return task.output_preview ?? '';
+  }
+
+  /**
+   * Stop a background task — `POST /sessions/{id}/tasks/{task_id}:cancel`
+   * (its handler calls `stopByUser`, i.e. stop semantics despite the
+   * `:cancel` name). The route accepts no body, so `reason` cannot be
+   * forwarded to the server and is unused here.
+   */
+  override async stopBackgroundTask(
+    input: SessionIdRpcInput & { taskId: string; reason?: string },
+  ): Promise<void> {
+    await this.http.cancelTask(input.sessionId, input.taskId);
+  }
+
+  /**
    * Skill activation — REST analogue of the `/<skill>` slash command
    * (`POST /sessions/{id}/skills/{name}:activate`). The base surface had no
    * wire override for this method: every call fell through to `getRpc()`
@@ -684,6 +840,18 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
    */
   override async setThinking(input: SetSessionThinkingRpcInput): Promise<void> {
     await this.http.setThinking(input.sessionId, input.effort);
+  }
+
+  /**
+   * Delete a provider and read the resulting config —
+   * `DELETE /providers/{provider_id}` (kap-server's modelCatalog route). The
+   * route answers 204 with no body on success, so the resulting `KimiConfig`
+   * is read back through the same `getConfig` path used elsewhere on this
+   * transport rather than parsed off the delete response.
+   */
+  override async removeProvider(providerId: string): Promise<KimiConfig> {
+    await this.http.deleteProvider(providerId);
+    return wireConfigToKimiConfig(await this.http.getConfig());
   }
 
   // -----------------------------------------------------------------------
