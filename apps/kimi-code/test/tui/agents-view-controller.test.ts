@@ -148,7 +148,10 @@ interface FakeHarness {
     // Same reason as `createSession` above — the B7 attach test holds this
     // open to prove attach fires before the first prompt call settles.
     prompt: ReturnType<typeof vi.fn<(...args: unknown[]) => Promise<void>>>;
-    activateSkill: ReturnType<typeof vi.fn>;
+    // Same reason as `prompt` above — the fix-round-1 pin/reply regression
+    // test below feeds this `mockImplementationOnce` a `() => new Promise(...)`
+    // to hold the activation open by hand.
+    activateSkill: ReturnType<typeof vi.fn<(...args: unknown[]) => Promise<void>>>;
     activatePluginCommand: ReturnType<typeof vi.fn>;
   };
   // Explicitly Promise-returning (not the bare `ReturnType<typeof vi.fn>`
@@ -2416,6 +2419,74 @@ describe('AgentsViewController — dispatch', () => {
     expect(b.view().viewSessions.has('new-session')).toBe(true);
     expect(b.view().roster.get('new-session')).not.toBeUndefined();
     expect(b.render()).toContain('Dispatch failed: model unavailable');
+    b.controller.close(); // clear the pending flash timer
+  });
+
+  // Fix round 1: `createSession` resolving and the activation settling are
+  // two separate awaits — the real session id is registered into the roster
+  // (selectable, pinnable, reply-able) the instant the first one resolves,
+  // well before the second one can fail. A pin or reply staged in that
+  // window must not survive the activation-failure cleanup any more than it
+  // would survive an ordinary delete (mirrors the M1 test for handleDelete).
+  it('fix round 1: a pin/seen/reply staged in the window before the activation rejects is pruned too, not just the roster row', async () => {
+    const b = await boot([summary('s1')], {
+      activatableCommands: {
+        commands: [],
+        skillCommandMap: new Map([['skill:reviewcode', 'reviewcode']]),
+        pluginCommandMap: new Map(),
+      },
+    });
+    dir = b.homeDir;
+    let rejectActivate: (error: Error) => void = () => {};
+    b.fake.createdSession.activateSkill.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectActivate = reject;
+        }),
+    );
+
+    b.view().dispatch.editor.onSubmit?.('/skill:reviewcode check the auth module');
+    await flush();
+
+    // The id is registered — createSession resolved — while the activation
+    // call above is still pending. The server's created echo (which a real
+    // activation-in-flight session gets exactly like a plain one; see 'the
+    // created echo of a dispatched session lands as a selected working row'
+    // above) lands in that same window and makes the row selectable/pinnable.
+    expect(b.view().viewSessions.has('new-session')).toBe(true);
+    b.fake.emit({
+      type: 'event.session.created',
+      session: {
+        id: 'new-session',
+        title: '/skill:reviewcode check the auth module',
+        last_prompt: null,
+        metadata: { cwd: '/home/user/project' },
+        updated_at: new Date().toISOString(),
+        busy: true,
+        pending_interaction: 'none',
+      },
+    });
+    expect(b.view().roster.get('new-session')).not.toBeUndefined();
+    b.view().roster.setPinned('new-session', true);
+    b.view().seenAt.set('new-session', Date.now());
+    b.view().pendingReplyIds.add('new-session');
+    b.view().replyFailures.set('new-session', { text: 'earlier draft' });
+    b.view().replyAttempts.set('new-session', Promise.resolve());
+    b.view().replyBarriers.set('new-session', Promise.resolve());
+    expect(b.view().pins.has('new-session')).toBe(true);
+
+    rejectActivate(new Error('skill crashed'));
+    await flush();
+
+    expect(b.view().roster.get('new-session')).toBeUndefined();
+    expect(b.view().pins.has('new-session')).toBe(false);
+    expect(b.view().seenAt.has('new-session')).toBe(false);
+    expect(b.view().pendingReplyIds.has('new-session')).toBe(false);
+    expect(b.view().replyFailures.has('new-session')).toBe(false);
+    expect(b.view().replyAttempts.has('new-session')).toBe(false);
+    expect(b.view().replyBarriers.has('new-session')).toBe(false);
+    // The persisted file carries no trace of the id either.
+    await waitForViewState(b.homeDir, { pins: new Set(), sessions: new Set(['s1']) });
     b.controller.close(); // clear the pending flash timer
   });
 

@@ -1192,6 +1192,13 @@ export class AgentsViewController {
         if (this.host.state.agentsView === view) {
           view.roster.remove(session.id);
           view.viewSessions.delete(session.id);
+          // Fix round 1: the session is reachable (selectable, pinnable,
+          // reply-able) from the instant `createSession` above resolves —
+          // well before this activation call settles — so `forgetSession`
+          // is required here, not optional: a pin taken in that window
+          // would otherwise survive to the next launch. See its own doc
+          // comment for the full collection list.
+          this.forgetSession(view, session.id);
           if (view.selectedId === session.id) view.selectedId = undefined;
           void this.persistState(view);
           this.pushProps();
@@ -1860,6 +1867,28 @@ export class AgentsViewController {
     };
   }
 
+  /**
+   * M1/I3-follow-up: `AgentsRoster.remove` drops only the row — pins/seenAt
+   * and the reply bookkeeping are separate persisted Sets/Maps the
+   * controller owns (see their own `AgentsViewState` doc comments) and are
+   * never pruned on their own, so a discarded id would otherwise linger in
+   * them forever (a pin on it would even survive to the next launch via
+   * `persistState`). Shared by every path that permanently discards a
+   * session id — `handleDelete` and the activation-failure cleanup in
+   * `handleDispatch` — so this list can't drift between them again; it
+   * already had once. Callers still own their own roster/`viewSessions`
+   * removal, selection fix-up, `persistState`, and flash copy — this is the
+   * collection pruning only.
+   */
+  private forgetSession(view: AgentsViewState, id: string): void {
+    view.pins.delete(id);
+    view.seenAt.delete(id);
+    view.pendingReplyIds.delete(id);
+    view.replyFailures.delete(id);
+    view.replyAttempts.delete(id);
+    view.replyBarriers.delete(id);
+  }
+
   private async handleDelete(id: string): Promise<void> {
     const view = this.host.state.agentsView;
     if (view === undefined) return;
@@ -1884,16 +1913,7 @@ export class AgentsViewController {
         await this.host.harness.deleteSession(sessionId);
         view.roster.remove(sessionId);
         view.viewSessions.delete(sessionId);
-        // M1: `AgentsRoster.remove` drops only the row — pins/seenAt are
-        // separate persisted Sets/Maps the controller owns (see their own
-        // AgentsViewState doc comments) and are never pruned on their own,
-        // so a deleted id would otherwise linger in them forever.
-        view.pins.delete(sessionId);
-        view.seenAt.delete(sessionId);
-        view.pendingReplyIds.delete(sessionId);
-        view.replyFailures.delete(sessionId);
-        view.replyAttempts.delete(sessionId);
-        view.replyBarriers.delete(sessionId);
+        this.forgetSession(view, sessionId);
         removed += 1;
         if (view.selectedId === sessionId) view.selectedId = undefined;
       } catch {
