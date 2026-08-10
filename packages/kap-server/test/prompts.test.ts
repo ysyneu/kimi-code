@@ -6,6 +6,7 @@ import { deflateSync } from 'node:zlib';
 import {
   IAgentContextMemoryService,
   IAgentLifecycleService,
+  IAgentPermissionModeService,
   IAgentProfileService,
   IAgentToolPolicyService,
   closeSessionById,
@@ -693,6 +694,51 @@ describe('server-v2 /api/v1 prompts', () => {
     const main = lifecycle.get('main');
     expect(main).toBeDefined();
     expect(contextHasUserText(main!, 'side question')).toBe(false);
+  });
+
+  it('fans a permission_mode change on the main agent out to a live subagent', async () => {
+    const id = await createSession(home as string);
+    await createMainAgent(id);
+
+    // Fork the main agent into a side-channel child the way `/btw` does.
+    const session = getLiveSessionById(server!.core.accessor, id);
+    if (session === undefined) throw new Error(`session ${id} not found`);
+    const lifecycle = session.accessor.get(IAgentLifecycleService);
+    const child = await lifecycle.fork('main');
+    expect(child.accessor.get(IAgentPermissionModeService).mode).not.toBe('auto');
+
+    const submitted = await call<PromptItemWire>('POST', `/api/v1/sessions/${id}/prompts`, {
+      content: [{ type: 'text', text: 'go faster' }],
+      permission_mode: 'auto',
+    });
+    expect(submitted.body.code).toBe(0);
+
+    expect(child.accessor.get(IAgentPermissionModeService).mode).toBe('auto');
+  });
+
+  it('does not fan a permission_mode change on a subagent out to other agents', async () => {
+    const id = await createSession(home as string);
+    await createMainAgent(id);
+
+    const session = getLiveSessionById(server!.core.accessor, id);
+    if (session === undefined) throw new Error(`session ${id} not found`);
+    const lifecycle = session.accessor.get(IAgentLifecycleService);
+    const child = await lifecycle.fork('main');
+    const main = lifecycle.get('main');
+    expect(main).toBeDefined();
+    expect(main!.accessor.get(IAgentPermissionModeService).mode).not.toBe('auto');
+
+    const submitted = await call<PromptItemWire>('POST', `/api/v1/sessions/${id}/prompts`, {
+      content: [{ type: 'text', text: 'side question' }],
+      agent_id: child.id,
+      permission_mode: 'auto',
+    });
+    expect(submitted.body.code).toBe(0);
+
+    // The child's own mode changed (each site always sets its own target's
+    // mode) but the change must not have fanned out to the main agent.
+    expect(child.accessor.get(IAgentPermissionModeService).mode).toBe('auto');
+    expect(main!.accessor.get(IAgentPermissionModeService).mode).not.toBe('auto');
   });
 
   it('returns 40401 when agent_id names an unknown agent', async () => {

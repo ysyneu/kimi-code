@@ -63,3 +63,20 @@ export interface IAgentLifecycleService {
 
 export const IAgentLifecycleService: ServiceIdentifier<IAgentLifecycleService> =
   createDecorator<IAgentLifecycleService>('agentLifecycleService');
+
+/**
+ * A permission-mode change on the main agent is the session's ambient
+ * default and must reach every live agent; a change scoped to a subagent is
+ * private to it. The RPC and a prompt submission are the only two call sites
+ * that can change an agent's mode — both share this rule through here so
+ * they cannot drift apart.
+ */
+export function broadcastPermissionModeIfMainAgent(
+  agentId: string,
+  mode: PermissionMode,
+  lifecycle: IAgentLifecycleService,
+): void {
+  if (agentId === MAIN_AGENT_ID) {
+    lifecycle.broadcastPermissionMode(mode);
+  }
+}

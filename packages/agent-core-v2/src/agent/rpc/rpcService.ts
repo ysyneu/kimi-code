@@ -10,8 +10,8 @@ import { ErrorCodes, Error2 } from '#/errors';
 import { IAgentPermissionModeService } from '#/agent/permissionMode/permissionMode';
 import { IAgentScopeContext } from '#/agent/scopeContext/scopeContext';
 import {
+  broadcastPermissionModeIfMainAgent,
   IAgentLifecycleService,
-  MAIN_AGENT_ID,
 } from '#/session/agentLifecycle/agentLifecycle';
 import { IAgentCommandService } from '#/agent/command/agentCommand';
 import { expandCommandArguments } from '#/app/plugin/commands';
@@ -140,9 +140,7 @@ export class AgentRPCService implements IAgentRPCService {
     const wasYolo = this.permissionMode.mode === 'yolo';
     const wasAuto = this.permissionMode.mode === 'auto';
     this.permissionMode.setMode(payload.mode);
-    if (this.scopeContext.agentId === MAIN_AGENT_ID) {
-      this.agentLifecycle.broadcastPermissionMode(payload.mode);
-    }
+    broadcastPermissionModeIfMainAgent(this.scopeContext.agentId, payload.mode, this.agentLifecycle);
     const enabled = this.permissionMode.mode === 'yolo';
     if (enabled !== wasYolo) {
       this.telemetry.track2('yolo_toggle', { enabled });
