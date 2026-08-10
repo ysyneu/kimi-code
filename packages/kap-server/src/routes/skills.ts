@@ -73,6 +73,7 @@ import {
   BUILTIN_SKILLS,
   ErrorCodes,
   EXTRA_SKILL_DIRS_SECTION,
+  IAgentProfileService,
   IAgentSkillService,
   IBootstrapService,
   IConfigService,
@@ -105,7 +106,7 @@ import { z } from 'zod';
 import { errEnvelope, okEnvelope } from '../envelope';
 import { requestLog } from '../lib/requestLog';
 import { defineRoute } from '../middleware/defineRoute';
-import { ensureMainAgent } from '../transport/mainAgent';
+import { ensureMainAgent, ensureMainAgentBound } from '../transport/mainAgent';
 import { ErrorCode } from '../protocol/error-codes';
 import {
   activateSkillRequestSchema,
@@ -289,6 +290,11 @@ export function registerSkillsRoutes(app: SkillsRouteHost, core: Scope): void {
 
       try {
         const agent = await ensureMainAgent(resolved.handle);
+        // Activation starts a turn, so the agent must be runnable first — the
+        // same gate the prompt route runs. Without it a REST-created session
+        // activates onto an unbound agent and the turn dies immediately with
+        // `model.not_configured`.
+        await ensureMainAgentBound(agent.accessor.get(IAgentProfileService));
         await agent.accessor
           .get(IAgentSkillService)
           .activate({ name: parsed.id, args: req.body.args });
