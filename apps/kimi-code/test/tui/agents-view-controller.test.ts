@@ -6,6 +6,7 @@ import type { Event, KimiHarness, Session, SessionSummary, WireSession } from '@
 import { SDKRpcClientWire } from '@moonshot-ai/kimi-code-sdk';
 import type { Component, Container, ProcessTerminal, Terminal, TUI } from '@moonshot-ai/pi-tui';
 import chalk from 'chalk';
+import { Jimp } from 'jimp';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { loadAgentsViewState, saveAgentsViewState } from '@/tui/agents/roster-persistence';
@@ -30,7 +31,25 @@ import {
 } from '@/tui/controllers/agents-view-dispatch';
 import type { AgentsGroupMode } from '@/tui/controllers/agents-view-groups';
 import { currentTheme } from '@/tui/theme';
+import { ImageAttachmentStore } from '@/tui/utils/image-attachment-store';
 import { DELETE_ARM_WINDOW_MS, EXIT_CONFIRM_WINDOW_MS } from '#/tui/constant/kimi-tui';
+import { ClipboardMediaError } from '#/utils/clipboard/clipboard-image';
+
+// vitest hoists vi.mock/vi.hoisted above the imports above, so the mock still
+// applies to the clipboard-paste module the agents view's composer pastes
+// through (same mock shape as editor-keyboard-image-paste.test.ts's own).
+const { readClipboardMedia } = vi.hoisted(() => ({ readClipboardMedia: vi.fn() }));
+
+vi.mock('#/utils/clipboard/clipboard-image', async (importActual) => {
+  const actual = await importActual<typeof import('#/utils/clipboard/clipboard-image')>();
+  return { ...actual, readClipboardMedia };
+});
+
+async function solidPng(width: number, height: number): Promise<Uint8Array> {
+  return new Uint8Array(
+    await new Jimp({ width, height, color: 0x3366ccff }).getBuffer('image/png'),
+  );
+}
 
 const ANSI_SGR = /\[[0-9;]*m/g;
 function strip(text: string): string {
@@ -263,6 +282,8 @@ interface Boot {
   ui: FakeUI;
   showError: ReturnType<typeof vi.fn>;
   showStatus: ReturnType<typeof vi.fn>;
+  track: ReturnType<typeof vi.fn>;
+  imageStore: ImageAttachmentStore;
   setAttachBadge: ReturnType<typeof vi.fn>;
   /** Every mode `saveAgentsViewGroupMode` was called with, in call order —
    *  populated only by the default (non-overridden) implementation. */
@@ -355,14 +376,17 @@ async function boot(
   state.editorContainer = { children: [state.editor] } as unknown as Container;
   const showError = vi.fn();
   const showStatus = vi.fn();
+  const track = vi.fn();
   const setAttachBadge = vi.fn();
   const savedGroupModes: AgentsGroupMode[] = [];
+  const imageStore = new ImageAttachmentStore();
   let currentActivatable = opts.activatableCommands ?? EMPTY_ACTIVATABLE;
   const host: AgentsViewHost = {
     state,
     harness: fake.harness,
     showError,
     showStatus,
+    track,
     setAgentsView: (value) => {
       state.agentsView = value;
     },
@@ -391,7 +415,7 @@ async function boot(
     getCurrentSessionId: () => opts.currentSessionId ?? '',
     onOpenSession: opts.onOpenSession,
   };
-  const controller = new AgentsViewController(host);
+  const controller = new AgentsViewController(host, imageStore);
   // Pre-seed the view registry BEFORE show(): the roster only lists sessions
   // the view owns, so the persisted file must already name the boot sessions.
   await saveAgentsViewState(homeDir, {
@@ -408,6 +432,8 @@ async function boot(
     ui,
     showError,
     showStatus,
+    track,
+    imageStore,
     setAttachBadge,
     savedGroupModes,
     view: () => {
@@ -448,6 +474,7 @@ const CTRL_X = '\u0018';
 const CTRL_R = '\u0012';
 const CTRL_T = '\u0014';
 const CTRL_S = '\u0013';
+const CTRL_V = '\u0016';
 const DOWN = '\u001B[B';
 const LEFT = '\u001B[D';
 const RIGHT = '\u001B[C';
@@ -2253,6 +2280,75 @@ describe('AgentsViewDispatch — @ mention autocomplete (functional verification
   });
 });
 
+// Ctrl-V paste on the roster's dispatch/reply composer: same
+// `pasteClipboardImage` pipeline the main REPL editor pastes through
+// (`clipboard-paste.ts`), reused rather than reimplemented — see
+// `AgentsViewController.show`'s `dispatch.editor.onPasteImage` wiring. These
+// tests cover the paste HALF (placeholder + attachment); the submit-side
+// expansion half is covered under 'AgentsViewController — dispatch' and
+// 'AgentsViewController — reply mode (space)' below.
+describe('AgentsViewController — clipboard image paste (composer)', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir !== undefined) {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
+    dir = undefined;
+    readClipboardMedia.mockReset();
+  });
+
+  it('a paste inserts the [image #N] placeholder into the composer and stores the attachment', async () => {
+    const png = await solidPng(80, 80);
+    readClipboardMedia.mockResolvedValue({ kind: 'image', bytes: png, mimeType: 'image/png' });
+
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    const handled = await b.view().dispatch.editor.onPasteImage?.();
+
+    expect(handled).toBe(true);
+    expect(b.view().dispatch.editor.getText()).toContain('[image #1 (80×80)]');
+    const att = b.imageStore.get(1);
+    if (att?.kind !== 'image') throw new Error('expected image attachment');
+    expect(att.width).toBe(80);
+    expect(att.height).toBe(80);
+  });
+
+  it('a clipboard read failure reports through the roster flash, not host.showError (view mounted)', async () => {
+    readClipboardMedia.mockRejectedValue(new ClipboardMediaError('clipboard image too large'));
+
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    const handled = await b.view().dispatch.editor.onPasteImage?.();
+
+    expect(handled).toBe(true);
+    expect(b.render()).toContain('clipboard image too large');
+    expect(b.showError).not.toHaveBeenCalled();
+    b.controller.close(); // clear the pending flash timer
+  });
+
+  // Functional verification of the actual wiring (not just calling
+  // `onPasteImage` directly, as the tests above do): a real Ctrl-V
+  // keystroke on the focused composer reaches `CustomEditor.handleInput`'s
+  // own paste binding (`AgentsViewApp.handleInput` forwards every key to
+  // `dispatchEditor.handleInput` while `dispatchFocused` — see app.ts), which
+  // is what actually calls `onPasteImage`.
+  it('a real Ctrl-V keystroke on the focused composer triggers the paste binding end to end', async () => {
+    const BACKSPACE = String.fromCodePoint(127);
+    const png = await solidPng(80, 80);
+    readClipboardMedia.mockResolvedValue({ kind: 'image', bytes: png, mimeType: 'image/png' });
+
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput('d'); // focus the composer
+    b.component().handleInput(BACKSPACE); // back to empty, still focused
+    b.component().handleInput(CTRL_V);
+    await flush();
+
+    expect(b.view().dispatch.editor.getText()).toContain('[image #1 (80×80)]');
+    expect(b.imageStore.get(1)?.kind).toBe('image');
+  });
+});
+
 describe('AgentsViewController — dispatch', () => {
   let dir: string | undefined;
   afterEach(async () => {
@@ -2278,6 +2374,35 @@ describe('AgentsViewController — dispatch', () => {
     await waitForViewState(b.homeDir, {
       pins: new Set(),
       sessions: new Set(['s1', 'new-session']),
+    });
+  });
+
+  it('a submission carrying a resolved image placeholder sends an image_url part, not the bare string, to Session.prompt', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    const att = b.imageStore.addImage(new Uint8Array([0xaa, 0xbb]), 'image/png', 80, 80);
+    b.view().dispatch.editor.onSubmit?.(`look at ${att.placeholder}`);
+    await flush();
+    expect(b.fake.createdSession.prompt).toHaveBeenCalledWith([
+      { type: 'text', text: 'look at ' },
+      { type: 'image_url', imageUrl: { url: 'data:image/png;base64,qrs=' } },
+    ]);
+  });
+
+  it('the same placeholder submitted with /model rides the wire rpc as an image_url part, not text', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    const att = b.imageStore.addImage(new Uint8Array([0xaa, 0xbb]), 'image/png', 80, 80);
+    b.view().dispatch.editor.onSubmit?.(`/model kimi-k2 look at ${att.placeholder}`);
+    await flush();
+    expect(b.fake.wirePrompt).toHaveBeenCalledWith({
+      sessionId: 'new-session',
+      input: [
+        { type: 'text', text: 'look at ' },
+        { type: 'image_url', imageUrl: { url: 'data:image/png;base64,qrs=' } },
+      ],
+      model: 'kimi-k2',
+      profile: undefined,
     });
   });
 
@@ -3239,6 +3364,23 @@ describe('AgentsViewController — reply mode (space)', () => {
     expect(b.view().replyTargetId).toBeUndefined();
     expect(b.view().dispatchFocused).toBe(false);
     expect(b.view().dispatch.editor.placeholder).toBe('describe a task for a new session');
+  });
+
+  it('a reply carrying a resolved image placeholder sends an image_url part, not the bare string (same expansion as dispatch)', async () => {
+    const b = await boot([summary('s1')], { wire: true });
+    dir = b.homeDir;
+    const att = b.imageStore.addImage(new Uint8Array([0xaa, 0xbb]), 'image/png', 80, 80);
+    b.component().handleInput(DOWN);
+    b.component().handleInput(SPACE);
+    b.view().dispatch.editor.onSubmit?.(`look at ${att.placeholder}`);
+    await flush();
+    expect(b.fake.wirePrompt).toHaveBeenCalledWith({
+      sessionId: 's1',
+      input: [
+        { type: 'text', text: 'look at ' },
+        { type: 'image_url', imageUrl: { url: 'data:image/png;base64,qrs=' } },
+      ],
+    });
   });
 
   it('a reply shows a pending send state on the row until the RPC settles, then clears it — never the busy spinner', async () => {

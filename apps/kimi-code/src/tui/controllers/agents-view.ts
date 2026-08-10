@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { parseIntegerEnv } from '@moonshot-ai/agent-core-v2';
-import type { Event, KimiHarness, Unsubscribe, WireSession } from '@moonshot-ai/kimi-code-sdk';
+import type { Event, KimiHarness, PromptPart, Unsubscribe, WireSession } from '@moonshot-ai/kimi-code-sdk';
 import type { Component, Container, ProcessTerminal, TUI } from '@moonshot-ai/pi-tui';
 
 import { AgentsRoster, type AgentsGroup, type AgentsRosterRow } from '../agents/roster';
@@ -12,6 +12,13 @@ import type { KimiSlashCommand } from '../commands/types';
 import { AgentsViewApp, type AgentsViewProps } from '../components/agents-view/app';
 import { rosterRowName, SPINNER_FRAME_MS } from '../components/agents-view/rows';
 import type { CustomEditor } from '../components/editor/custom-editor';
+import { pasteClipboardImage } from '../media/clipboard-paste';
+import type { ImageAttachmentStore } from '../utils/image-attachment-store';
+import {
+  extractMediaAttachments,
+  rewriteMediaPlaceholders,
+  type MediaReferenceStyle,
+} from '../utils/image-placeholder';
 import { DELETE_ARM_WINDOW_MS, EXIT_CONFIRM_WINDOW_MS } from '#/tui/constant/kimi-tui';
 import type { Theme } from '#/tui/theme';
 
@@ -35,6 +42,10 @@ export interface AgentsViewHost {
   readonly harness: KimiHarness;
   showError(msg: string): void;
   showStatus(msg: string): void;
+  /** Telemetry — same signature as `EditorKeyboardHost.track`, so both
+   *  composers' clipboard-paste wiring (`pasteClipboardImage`) forward it
+   *  identically. */
+  track(event: string, properties?: Record<string, unknown>): void;
   setAgentsView(value: AgentsViewState | undefined): void;
   /** Header label for the connected kap-server: "embedded" or host:port. */
   agentsViewServerLabel(): string;
@@ -467,7 +478,17 @@ export function dispatchSlashCommands(
  *   cancel and never reaches the SDK.
  */
 export class AgentsViewController {
-  constructor(private readonly host: AgentsViewHost) {}
+  constructor(
+    private readonly host: AgentsViewHost,
+    /**
+     * Same store the main REPL editor pastes into (`KimiTUI`'s single
+     * per-process `ImageAttachmentStore`) — threaded through the
+     * constructor rather than `AgentsViewHost`, matching how
+     * `EditorKeyboardController` receives it, since `KimiTUI`'s own field is
+     * private. A pasted attachment's id is valid on either composer.
+     */
+    private readonly imageStore: ImageAttachmentStore,
+  ) {}
 
   /**
    * B2: session ids this TUI PROCESS has successfully attached to at least
@@ -696,6 +717,26 @@ export class AgentsViewController {
       if (dispatch.editor.getText().length > 0) dispatch.editor.setText('');
       this.triggerCtrlC(view);
     };
+    // Same clipboard → attachment → placeholder pipeline the main REPL
+    // editor pastes through (`clipboard-paste.ts`), reused rather than
+    // reimplemented: the placeholder lands in the SAME per-process
+    // `imageStore`, so `handleDispatch`/`handleReply` expand it identically
+    // to how `KimiTUI.sendNormalUserInput` expands a main-chat paste. No
+    // session is known yet here (dispatch targets a NEW session; reply
+    // targets one this process never resumed), so `sessionDir` is left
+    // unset — the pre-compression original falls back to the temp-dir path
+    // `pasteClipboardImage` already applies when a session dir is unknown.
+    // Errors route through `notifyUser`, not `host.showError` — same
+    // detached-UI-tree reasoning as `onBashModeAttempt` above.
+    dispatch.editor.onPasteImage = async () =>
+      pasteClipboardImage({
+        editor: dispatch.editor,
+        imageStore: this.imageStore,
+        harness: this.host.harness,
+        track: (event, properties) => this.host.track(event, properties),
+        notifyError: (message) => this.notifyUser(this.host.state.agentsView, message, { error: true }),
+        requestRender: () => this.host.state.ui.requestRender(),
+      });
 
     this.host.setAgentsView({
       component,
@@ -1029,6 +1070,34 @@ export class AgentsViewController {
   ): Promise<void> {
     const view = this.host.state.agentsView;
     if (view === undefined) return;
+
+    // Media placeholders resolve BEFORE createSession, same "validate before
+    // mutate" invariant the overrides-vs-transport check below applies: a
+    // pasted video whose cache copy fails (unwritable cache dir, vanished
+    // source) must not orphan a server-side session with no way to receive
+    // the now-lost media. An activation's args go through
+    // `rewriteMediaPlaceholders` (the plain-text channel `session.
+    // activateSkill`/`activatePluginCommand` read — same 'plain'/'tag' style
+    // split as `KimiTUI.sendSkillActivation`/`activatePluginCommand`); a
+    // plain prompt goes through `extractMediaAttachments`, matching
+    // `KimiTUI.sendNormalUserInput`. Mirrors that method's own catch: report
+    // and send nothing.
+    let promptParts: PromptPart[] | undefined;
+    let activationArgs = submission.activation?.args ?? '';
+    try {
+      if (submission.activation !== undefined) {
+        const style: MediaReferenceStyle = submission.activation.kind === 'skill' ? 'plain' : 'tag';
+        activationArgs = rewriteMediaPlaceholders(submission.activation.args, this.imageStore, style).text;
+      } else {
+        const extraction = extractMediaAttachments(submission.text, this.imageStore);
+        if (extraction.hasMedia) promptParts = extraction.parts;
+      }
+    } catch (error) {
+      const message = `Failed to prepare media attachment: ${error instanceof Error ? error.message : String(error)}`;
+      this.notifyUser(view, message, { error: true });
+      return;
+    }
+
     // Validate before mutate: `Session.prompt` carries no overrides — the
     // extended rpc-level prompt (`WirePromptRpcInput`) does, reached
     // through the harness's rpc with an instanceof narrowing (never `any`).
@@ -1146,23 +1215,23 @@ export class AgentsViewController {
       const { activation } = submission;
       if (activation !== undefined) {
         if (activation.kind === 'skill') {
-          await session.activateSkill(activation.skillName, activation.args);
+          await session.activateSkill(activation.skillName, activationArgs);
         } else {
           await session.activatePluginCommand(
             activation.pluginId,
             activation.commandName,
-            activation.args,
+            activationArgs,
           );
         }
       } else if (rpc !== undefined) {
         await rpc.prompt({
           sessionId: session.id,
-          input: [{ type: 'text', text: submission.text }],
+          input: promptParts ?? [{ type: 'text', text: submission.text }],
           model: submission.model,
           profile: submission.profile,
         });
       } else {
-        await session.prompt(submission.text);
+        await session.prompt(promptParts ?? submission.text);
       }
     } catch (error) {
       if (this.host.state.agentsView !== view) return;
@@ -1239,11 +1308,26 @@ export class AgentsViewController {
       this.flash('Reply failed: replying from the list requires the wire transport');
       return;
     }
+    // Same media-placeholder resolution as `handleDispatch`'s plain-prompt
+    // path (`extractMediaAttachments`, matching `KimiTUI.
+    // sendNormalUserInput`) — before any of this method's own state
+    // mutation, so a failed extraction (a pasted video's cache copy
+    // vanished/unwritable) reports and sends nothing instead of arming
+    // `pendingReplyIds` for a reply that was never going to go out.
+    let promptParts: PromptPart[] | undefined;
+    try {
+      const extraction = extractMediaAttachments(text, this.imageStore);
+      if (extraction.hasMedia) promptParts = extraction.parts;
+    } catch (error) {
+      const message = `Failed to prepare media attachment: ${error instanceof Error ? error.message : String(error)}`;
+      this.notifyUser(view, message, { error: true });
+      return;
+    }
     view.replyFailures.delete(targetId);
     view.pendingReplyIds.add(targetId);
     this.pushProps();
 
-    const attempt = rpc.prompt({ sessionId: targetId, input: [{ type: 'text', text }] });
+    const attempt = rpc.prompt({ sessionId: targetId, input: promptParts ?? [{ type: 'text', text }] });
     view.replyAttempts.set(targetId, attempt);
     // Keeps observing the RPC for as long as it actually takes, independent
     // of the bounded wait below — a legitimately slow server that succeeds
