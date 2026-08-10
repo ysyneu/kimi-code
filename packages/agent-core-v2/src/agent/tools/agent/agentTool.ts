@@ -273,6 +273,7 @@ export class SubagentTool implements ISubagentTool {
     let profileName: string;
     let displayModel: string | undefined;
     let promptText = args.prompt;
+    let scopeHandle: IAgentScopeHandle;
     if (isResume) {
       const target = this.lifecycle.get(resumeAgentId);
       if (target === undefined) {
@@ -281,6 +282,7 @@ export class SubagentTool implements ISubagentTool {
         });
       }
       await this.ensureOwnedIdleSubagent(resumeAgentId, target);
+      scopeHandle = target;
       agentId = target.id;
       const resumed = target.accessor.get(IAgentProfileService).data();
       profileName = resumed.profileName ?? RESUMED_LABEL;
@@ -333,7 +335,7 @@ export class SubagentTool implements ISubagentTool {
       } catch (error) {
         throw wrapSubagentModelError(error, binding.model, own.modelAlias);
       }
-      created.accessor.get(IAgentPermissionModeService).setMode(this.permissionMode.mode);
+      scopeHandle = created;
       created.accessor
         .get(IAgentUserToolService)
         .inheritUserTools(requester.accessor.get(IAgentUserToolService));
@@ -346,6 +348,11 @@ export class SubagentTool implements ISubagentTool {
         log: this.log,
       });
     }
+    // Applied after either branch so a resumed subagent picks up the
+    // caller's current mode too, not just a newly created one — resuming
+    // must not leave a subagent stuck on the mode it was originally spawned
+    // under, in either direction (loosened or tightened since).
+    scopeHandle.accessor.get(IAgentPermissionModeService).setMode(this.permissionMode.mode);
 
     const runInBackground = args.run_in_background === true;
     emitAgentRunSpawned(requester, agentId, {
