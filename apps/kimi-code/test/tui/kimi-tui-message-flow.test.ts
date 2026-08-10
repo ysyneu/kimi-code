@@ -5878,4 +5878,162 @@ describe('transcript step and assistant folding', () => {
     const lastAssistant = assistants.at(-1)!;
     expect(stripSgr(lastAssistant.render(120).join('\n'))).toContain(`msg-${cycles - 1}`);
   });
+
+  describe('turn elapsed clock', () => {
+    it('holds one elapsed-clock origin across phase changes within the same turn', async () => {
+      vi.useFakeTimers();
+      try {
+        const { driver } = await makeDriver();
+        vi.setSystemTime(1_000);
+
+        driver.sessionEventHandler.handleEvent(
+          { type: 'turn.started', agentId: 'main', sessionId: 'ses-1', turnId: 1 } as Event,
+          vi.fn(),
+        );
+        const turnStart = driver.state.appState.streamingStartTime;
+        expect(driver.state.appState.streamingPhase).toBe('waiting');
+        expect(driver.state.appState.streamingStartApprox).toBe(false);
+
+        vi.setSystemTime(3_000);
+        driver.sessionEventHandler.handleEvent(
+          {
+            type: 'thinking.delta',
+            agentId: 'main',
+            sessionId: 'ses-1',
+            turnId: 1,
+            delta: 'hm',
+          } as Event,
+          vi.fn(),
+        );
+        expect(driver.state.appState.streamingPhase).toBe('thinking');
+        expect(driver.state.appState.streamingStartTime).toBe(turnStart);
+
+        vi.setSystemTime(6_000);
+        driver.sessionEventHandler.handleEvent(
+          {
+            type: 'assistant.delta',
+            agentId: 'main',
+            sessionId: 'ses-1',
+            turnId: 1,
+            delta: 'hi',
+          } as Event,
+          vi.fn(),
+        );
+        expect(driver.state.appState.streamingPhase).toBe('composing');
+        expect(driver.state.appState.streamingStartTime).toBe(turnStart);
+
+        vi.setSystemTime(9_000);
+        driver.sessionEventHandler.handleEvent(
+          {
+            type: 'tool.call.started',
+            agentId: 'main',
+            sessionId: 'ses-1',
+            turnId: 1,
+            toolCallId: 'call_1',
+            name: 'Bash',
+            args: {},
+          } as Event,
+          vi.fn(),
+        );
+        // A phase change to a later step in the SAME turn — not a reset point.
+        expect(driver.state.appState.streamingStartTime).toBe(turnStart);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not reset the clock at a step boundary within the same turn', async () => {
+      vi.useFakeTimers();
+      try {
+        const { driver } = await makeDriver();
+        vi.setSystemTime(1_000);
+        driver.sessionEventHandler.handleEvent(
+          { type: 'turn.started', agentId: 'main', sessionId: 'ses-1', turnId: 1 } as Event,
+          vi.fn(),
+        );
+        const turnStart = driver.state.appState.streamingStartTime;
+
+        vi.setSystemTime(12_000);
+        driver.sessionEventHandler.handleEvent(
+          {
+            type: 'turn.step.started',
+            agentId: 'main',
+            sessionId: 'ses-1',
+            turnId: 1,
+            step: 1,
+          } as Event,
+          vi.fn(),
+        );
+
+        expect(driver.state.appState.streamingPhase).toBe('waiting');
+        expect(driver.state.appState.streamingStartTime).toBe(turnStart);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('clears the elapsed clock when the turn ends', async () => {
+      vi.useFakeTimers();
+      try {
+        const { driver } = await makeDriver();
+        vi.setSystemTime(1_000);
+        driver.sessionEventHandler.handleEvent(
+          { type: 'turn.started', agentId: 'main', sessionId: 'ses-1', turnId: 1 } as Event,
+          vi.fn(),
+        );
+        expect(driver.state.appState.streamingStartTime).toBeGreaterThan(0);
+
+        vi.setSystemTime(5_000);
+        driver.sessionEventHandler.handleEvent(
+          {
+            type: 'turn.ended',
+            agentId: 'main',
+            sessionId: 'ses-1',
+            turnId: 1,
+            reason: 'completed',
+          } as Event,
+          vi.fn(),
+        );
+
+        expect(driver.state.appState.streamingPhase).toBe('idle');
+        expect(driver.state.appState.streamingStartTime).toBe(0);
+        expect(driver.state.appState.streamingStartApprox).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('marks the elapsed clock approximate when attaching to an already-busy session', async () => {
+      vi.useFakeTimers();
+      try {
+        const { driver } = await makeDriver();
+        expect(driver.state.appState.streamingPhase).toBe('idle');
+
+        const busySession = makeSession({
+          getStatus: vi.fn(async () => ({
+            model: 'k2',
+            thinkingEffort: 'off',
+            permission: 'manual',
+            planMode: false,
+            contextTokens: 0,
+            maxContextTokens: 100,
+            contextUsage: 0,
+            busy: true,
+          })),
+        });
+        vi.setSystemTime(5_000);
+
+        // syncRuntimeState seeds streamingPhase/streamingStartTime from a
+        // getStatus() snapshot on attach — this client never saw the turn's
+        // real turn.started, so the clock must be marked approximate.
+        await (driver as unknown as KimiTUI).syncRuntimeState(busySession as never);
+
+        expect(driver.state.appState.streamingPhase).toBe('waiting');
+        expect(driver.state.appState.streamingStartTime).toBe(5_000);
+        expect(driver.state.appState.streamingStartApprox).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
 });
