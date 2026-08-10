@@ -423,12 +423,15 @@ const DISPATCHING_HINT = 'Still dispatching — try again in a moment';
  * The dispatch autocomplete whitelist: `/model` filtered out of
  * `BUILTIN_SLASH_COMMANDS` (its copy is not reinvented here, only its
  * argument completion is added), the dispatch-local `/agent` item, and every
- * skill + plugin command the main chat's own `/` menu would show — same
- * source, same entries, appended in the same order the main chat uses
- * (`[...builtins, ...skillCommands, ...pluginCommands]`, see `KimiTUI.
- * getSlashCommands`). `getModelCompletions`/`getActivatableCommands` are
- * getters rather than captured snapshots so the closures they feed always
- * see live data as of completion/menu-build time, not as of this call.
+ * skill the main chat's own `/` menu would show — same source, same entries.
+ * Plugin commands are deliberately dropped (item 2): there is no wire
+ * activation route for one, so advertising it would offer a command that
+ * always rejects on submit — `pluginCommandMap` is the signal that
+ * identifies which of `getActivatableCommands().commands` are plugin
+ * commands (skill/plugin entries carry no other discriminator).
+ * `getModelCompletions`/`getActivatableCommands` are getters rather than
+ * captured snapshots so the closures they feed always see live data as of
+ * completion/menu-build time, not as of this call.
  */
 export function dispatchSlashCommands(
   getModelCompletions: () => readonly ArgCompletionSpec[],
@@ -444,7 +447,9 @@ export function dispatchSlashCommands(
         }
       : command,
   );
-  return [...builtins, DISPATCH_AGENT_COMMAND, ...getActivatableCommands().commands];
+  const { commands, pluginCommandMap } = getActivatableCommands();
+  const activatable = commands.filter((command) => !pluginCommandMap.has(command.name));
+  return [...builtins, DISPATCH_AGENT_COMMAND, ...activatable];
 }
 
 /**

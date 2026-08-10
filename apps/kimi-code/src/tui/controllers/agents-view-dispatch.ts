@@ -7,11 +7,14 @@
  * in `./agents-view`); this module only accepts the final command array.
  * Model/profile selections are staged on the parsed submission and ride the
  * first prompt's submission body (the wire create route drops
- * per-session agent config, so createSession never sees them). Skill/plugin-
- * command selections stage a `DispatchActivation` instead — applied via
- * `session.activateSkill`/`activatePluginCommand` in place of the first
- * `prompt` call (see `AgentsViewController.handleDispatch`), since neither
- * is literal prompt text the model should see verbatim.
+ * per-session agent config, so createSession never sees them). A skill
+ * selection stages a `DispatchActivation` instead — applied via
+ * `session.activateSkill` in place of the first `prompt` call (see
+ * `AgentsViewController.handleDispatch`), since it isn't literal prompt text
+ * the model should see verbatim. A plugin command resolves the same lookup
+ * but has no wire activation route, so it never reaches `onSubmit` — it gets
+ * the same B6 rejection toast a not-runnable-here builtin gets (see
+ * `resolveDispatchActivation`'s call site below).
  */
 
 import type { TUI } from '@moonshot-ai/pi-tui';
@@ -28,10 +31,14 @@ import {
 /**
  * A staged skill or plugin-command activation: resolved at parse time from
  * the same command names / lookup rules the main chat's own dispatcher uses
- * (`commands/resolve.ts`'s `resolveSkillCommand` and plugin-map lookup),
- * applied on the first RPC call after `createSession()` — `session.
- * activateSkill`/`activatePluginCommand` instead of `session.prompt` — the
- * same "stage the choice, apply on first RPC" shape `/model`/`/agent` use.
+ * (`commands/resolve.ts`'s `resolveSkillCommand` and plugin-map lookup). A
+ * `skill` activation applies on the first RPC call after `createSession()` —
+ * `session.activateSkill` instead of `session.prompt` — the same "stage the
+ * choice, apply on first RPC" shape `/model`/`/agent` use. A `plugin-command`
+ * activation never reaches that stage: there is no wire activation route for
+ * it, so `parseDispatchInput` converts a resolved one straight into a B6
+ * rejection toast instead of returning it — the variant only exists as the
+ * internal resolve-step return value that toast conversion switches on.
  */
 export type DispatchActivation =
   | { readonly kind: 'skill'; readonly skillName: string; readonly args: string }
@@ -108,23 +115,31 @@ function resolveDispatchActivation(
   return undefined;
 }
 
+/** B6 rejection copy, shared by a not-runnable-here builtin and (item 2) a
+ *  resolved plugin command — neither has anywhere to run from this composer. */
+function notRunnableToast(command: string): string {
+  return `${command} isn't available in agent view — attach to a session to run it`;
+}
+
 /**
  * Parses raw dispatch input. Plain text becomes the first prompt of a new
  * session; a leading `/model <name>` or `/agent <profile>` stages that
- * override for the first prompt; a leading skill or plugin-command name
- * (resolved against `activatable`, the same maps the main chat's own
- * dispatcher uses) stages a skill/plugin activation instead — see
- * `DispatchActivation`. A leading slash command that positively resolves
- * against the builtin registry (`findBuiltInSlashCommand` — name or alias)
- * but isn't runnable from this composer (B6) is rejected with a `toast`
- * result naming it. Anything else starting with `/` isn't a command we can
- * identify at all — rather than reject text that only happens to start with
- * a slash (a path, a stray character), it's treated as ordinary prompt text,
- * same as if there were no leading slash. `/model` or `/agent` with no
- * argument is rejected with a command-specific usage hint rather than
- * falling through to the generic too-short message. Skill/plugin-command
- * args carry no minimum length (matching the main chat, which applies none
- * either — many skills take no arguments at all).
+ * override for the first prompt; a leading skill name (resolved against
+ * `activatable`, the same maps the main chat's own dispatcher uses) stages a
+ * skill activation instead — see `DispatchActivation`. A leading plugin-
+ * command name resolves against the same maps but has no wire activation
+ * route, so it is rejected with the same `toast` a not-runnable-here builtin
+ * gets, before any session is created. A leading slash command that
+ * positively resolves against the builtin registry (`findBuiltInSlashCommand`
+ * — name or alias) but isn't runnable from this composer (B6) is rejected
+ * with a `toast` result naming it. Anything else starting with `/` isn't a
+ * command we can identify at all — rather than reject text that only happens
+ * to start with a slash (a path, a stray character), it's treated as
+ * ordinary prompt text, same as if there were no leading slash. `/model` or
+ * `/agent` with no argument is rejected with a command-specific usage hint
+ * rather than falling through to the generic too-short message. Skill args
+ * carry no minimum length (matching the main chat, which applies none either
+ * — many skills take no arguments at all).
  */
 export function parseDispatchInput(
   raw: string,
@@ -152,9 +167,16 @@ export function parseDispatchInput(
       else profile = argument;
     } else {
       const activation = resolveDispatchActivation(command.slice(1), rest, activatable);
-      if (activation !== undefined) return { text: '', activation };
+      if (activation !== undefined) {
+        // Item 2: a plugin command resolves fine but has no wire activation
+        // route — reject it the same way a not-runnable-here builtin is
+        // rejected below, before any session is created. Only a skill
+        // activation actually stages.
+        if (activation.kind === 'plugin-command') return { toast: notRunnableToast(command) };
+        return { text: '', activation };
+      }
       if (findBuiltInSlashCommand(command.slice(1)) !== undefined) {
-        return { toast: `${command} isn't available in agent view — attach to a session to run it` };
+        return { toast: notRunnableToast(command) };
       }
       // Not a command we recognize at all — literal prompt text, `text`
       // already holds the whole trimmed line.

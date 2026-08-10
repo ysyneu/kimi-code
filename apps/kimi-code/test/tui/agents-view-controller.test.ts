@@ -1807,27 +1807,15 @@ describe('parseDispatchInput', () => {
       });
     });
 
-    it('a plugin command stages a plugin-command activation, splitting pluginId:commandName', () => {
+    it('a plugin command resolves but has no wire activation route — rejected with the toast, not staged', () => {
       expect(parseDispatchInput('/myplugin:mycommand do the thing', activatable)).toEqual({
-        text: '',
-        activation: {
-          kind: 'plugin-command',
-          pluginId: 'myplugin',
-          commandName: 'mycommand',
-          args: 'do the thing',
-        },
+        toast: "/myplugin:mycommand isn't available in agent view — attach to a session to run it",
       });
     });
 
-    it('skill/plugin activation args carry no minimum length — a bare activation with no args is valid', () => {
+    it('a plugin command is rejected even with no args — the toast wins over the too-short check', () => {
       expect(parseDispatchInput('/myplugin:mycommand', activatable)).toEqual({
-        text: '',
-        activation: {
-          kind: 'plugin-command',
-          pluginId: 'myplugin',
-          commandName: 'mycommand',
-          args: '',
-        },
+        toast: "/myplugin:mycommand isn't available in agent view — attach to a session to run it",
       });
     });
 
@@ -2105,7 +2093,7 @@ describe('AgentsViewDispatch — editor wiring', () => {
     });
   });
 
-  it('an editor submission for a known plugin command forwards a plugin-command activation to onSubmit', () => {
+  it('an editor submission for a known plugin command is rejected with the toast, never reaches onSubmit', () => {
     const activatable: DispatchActivatableCommands = {
       commands: [],
       skillCommandMap: new Map(),
@@ -2113,20 +2101,17 @@ describe('AgentsViewDispatch — editor wiring', () => {
     };
     const dispatch = makeDispatch(activatable);
     const onSubmit = vi.fn();
+    const onToast = vi.fn();
     dispatch.onSubmit = onSubmit;
+    dispatch.onToast = onToast;
     dispatch.editor.onSubmit?.('/myplugin:mycommand do the thing');
-    expect(onSubmit).toHaveBeenCalledWith({
-      text: '',
-      activation: {
-        kind: 'plugin-command',
-        pluginId: 'myplugin',
-        commandName: 'mycommand',
-        args: 'do the thing',
-      },
-    });
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(onToast).toHaveBeenCalledWith(
+      "/myplugin:mycommand isn't available in agent view — attach to a session to run it",
+    );
   });
 
-  it('menu sourcing includes every skill and plugin command supplied, using the exact entries given — no relabeling', () => {
+  it('menu sourcing includes every skill entry supplied, using the exact entry given (no relabeling), and drops plugin-command entries (item 2 — no wire activation route)', () => {
     const dispatch = makeDispatch();
     const skillEntry = { name: 'skill:reviewcode', aliases: [], description: 'Review code changes' };
     const pluginEntry = { name: 'myplugin:mycommand', aliases: [], description: 'Run my command' };
@@ -2136,7 +2121,7 @@ describe('AgentsViewDispatch — editor wiring', () => {
         () => ({
           commands: [skillEntry, pluginEntry],
           skillCommandMap: new Map(),
-          pluginCommandMap: new Map(),
+          pluginCommandMap: new Map([['myplugin:mycommand', 'body']]),
         }),
       ),
     );
@@ -2156,7 +2141,6 @@ describe('AgentsViewDispatch — editor wiring', () => {
       expect(suggestions?.items.map((item) => item.value).toSorted()).toEqual([
         'agent',
         'model',
-        'myplugin:mycommand',
         'skill:reviewcode',
       ]);
     });
@@ -2368,7 +2352,7 @@ describe('AgentsViewController — dispatch', () => {
     expect(b.fake.createdSession.prompt).not.toHaveBeenCalled();
   });
 
-  it('a plugin command stages an activatePluginCommand call — never a literal-text Session.prompt', async () => {
+  it('a plugin command has no wire activation route (item 2) — rejected with the toast, creating no session', async () => {
     const b = await boot([summary('s1')], {
       activatableCommands: {
         commands: [],
@@ -2377,15 +2361,16 @@ describe('AgentsViewController — dispatch', () => {
       },
     });
     dir = b.homeDir;
+    b.view().dispatch.editor.setText('');
     b.view().dispatch.editor.onSubmit?.('/myplugin:mycommand do the thing');
     await flush();
-    expect(b.fake.createSession).toHaveBeenCalledWith({ workDir: '/home/user/project' });
-    expect(b.fake.createdSession.activatePluginCommand).toHaveBeenCalledWith(
-      'myplugin',
-      'mycommand',
-      'do the thing',
+    expect(b.fake.createSession).not.toHaveBeenCalled();
+    expect(b.fake.createdSession.activatePluginCommand).not.toHaveBeenCalled();
+    expect(b.render()).toContain(
+      "/myplugin:mycommand isn't available in agent view — attach to a session to run it",
     );
-    expect(b.fake.createdSession.prompt).not.toHaveBeenCalled();
+    expect(b.view().dispatch.editor.getText()).toBe('/myplugin:mycommand do the thing');
+    b.controller.close(); // clear the pending flash timer
   });
 
   it('a cold view (no prior attach) offers skill commands once the host warms them — the plugin section stays empty, undisturbed by the warm', async () => {
