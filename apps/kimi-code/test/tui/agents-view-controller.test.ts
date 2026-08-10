@@ -1749,6 +1749,17 @@ describe('parseDispatchInput', () => {
     });
   });
 
+  it('B6: a command that cannot run once attached either is not told to attach', () => {
+    // These four have no route on the wire transport the attached chat also
+    // runs on, so "attach to a session to run it" would be advice that cannot
+    // pay off — they get the attached chat's own refusal sentence instead.
+    for (const name of ['plugins', 'add-dir', 'experiments', 'reload']) {
+      expect(parseDispatchInput(`/${name}`, EMPTY_ACTIVATABLE)).toEqual({
+        toast: `/${name} is not available in agents view.`,
+      });
+    }
+  });
+
   it("B6: a registry command's alias also resolves to the toast, named as typed", () => {
     // 'help' registers 'h' and '?' as aliases (commands/registry.ts).
     expect(parseDispatchInput('/h', EMPTY_ACTIVATABLE)).toEqual({

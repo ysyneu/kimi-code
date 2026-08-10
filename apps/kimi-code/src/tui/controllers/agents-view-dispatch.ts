@@ -20,7 +20,7 @@
 import type { TUI } from '@moonshot-ai/pi-tui';
 
 import { findBuiltInSlashCommand } from '../commands/registry';
-import { resolveSkillCommand } from '../commands/resolve';
+import { resolveSkillCommand, slashUnavailableMessage } from '../commands/resolve';
 import type { KimiSlashCommand } from '../commands/types';
 import { CustomEditor } from '../components/editor/custom-editor';
 import {
@@ -116,8 +116,16 @@ function resolveDispatchActivation(
 }
 
 /** B6 rejection copy, shared by a not-runnable-here builtin and (item 2) a
- *  resolved plugin command — neither has anywhere to run from this composer. */
-function notRunnableToast(command: string): string {
+ *  resolved plugin command — neither has anywhere to run from this composer.
+ *
+ *  "attach to a session to run it" is only true for a command that WORKS once
+ *  attached. A command flagged `unavailableInAgentsView` has no route on the
+ *  wire transport the attached chat also runs on, so it is refused there too —
+ *  sending the user to attach would be advice that cannot pay off. Those get
+ *  the attached chat's own wording, from its one owner, so both surfaces
+ *  refuse in the same sentence. */
+function notRunnableToast(command: string, neverRunnableHere = false): string {
+  if (neverRunnableHere) return slashUnavailableMessage(command.replace(/^\//, ''));
   return `${command} isn't available in agent view — attach to a session to run it`;
 }
 
@@ -175,8 +183,14 @@ export function parseDispatchInput(
         if (activation.kind === 'plugin-command') return { toast: notRunnableToast(command) };
         return { text: '', activation };
       }
-      if (findBuiltInSlashCommand(command.slice(1)) !== undefined) {
-        return { toast: notRunnableToast(command) };
+      const builtin = findBuiltInSlashCommand(command.slice(1));
+      if (builtin !== undefined) {
+        return {
+          toast: notRunnableToast(
+            command,
+            (builtin as KimiSlashCommand).unavailableInAgentsView === true,
+          ),
+        };
       }
       // Not a command we recognize at all — literal prompt text, `text`
       // already holds the whole trimmed line.
