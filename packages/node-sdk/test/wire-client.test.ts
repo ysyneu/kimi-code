@@ -1146,6 +1146,109 @@ describe('SDKRpcClientWire degrade surface', () => {
 });
 
 // ---------------------------------------------------------------------------
+// SDKRpcClientWire wire-supported surface — a structural guard against the
+// bug class items 1-3 of dogfood round 2 are instances 3-5 of: the wire
+// client inherits ~60 base RPC methods it never overrides, every one of
+// which throws not_implemented at runtime with nothing failing at compile
+// time, and the unit-test harness never notices because it implements the
+// methods locally. This derives the expectation mechanically instead of
+// eyeballing the class body: each SUPPORTED_METHODS entry must be the wire
+// class's OWN prototype property, not one it merely inherits.
+//
+// The list is scoped to what apps/kimi-code/src/tui actually calls while
+// running under this transport (`kimi agents` boots the whole KimiTUI app —
+// not just the roster — on a wire harness; see
+// apps/kimi-code/src/cli/sub/agents-run.ts), currently every method already
+// overridden above plus the four fixed by the config/model section. A wider
+// TUI-wide grep turns up further reached-but-unoverridden methods (e.g.
+// getPlan, createGoal, startBtw, setPluginEnabled, exportSession, …) that are
+// pre-existing gaps outside this round's scope, not something this guard
+// silently signs off on — they are simply not in SUPPORTED_METHODS yet.
+// ---------------------------------------------------------------------------
+
+describe('SDKRpcClientWire wire-supported surface', () => {
+  const SUPPORTED_METHODS = [
+    'listSessions',
+    'createSession',
+    'resumeSession',
+    'closeSession',
+    'deleteSession',
+    'renameSession',
+    'forkSession',
+    'prompt',
+    'steer',
+    'cancel',
+    'getStatus',
+    'getContext',
+    'getUsage',
+    'compact',
+    'undoHistory',
+    'getSessionWarnings',
+    'getGoal',
+    'activateSkill',
+    'listWorkspaceSkills',
+    'listPlugins',
+    'listPluginCommands',
+    'listSkills',
+    'listMcpServers',
+    'getMcpStartupMetrics',
+    'setPermission',
+    // Fixed by this round's config/model section (item 2):
+    'getConfig',
+    'setConfig',
+    'setModel',
+    'setThinking',
+  ] as const;
+
+  // Methods the TUI also reaches over the wire that this transport has
+  // reviewed and deliberately left on the throwing base implementation —
+  // reserved for a genuine "the server has no primitive for this" case.
+  // Empty today: kap-server turns out to expose a route for every gap this
+  // audit found (including session export), so nothing currently qualifies —
+  // this list exists so a real future case has a reviewed home instead of
+  // silently staying unimplemented.
+  const NOT_SUPPORTED_METHODS: readonly string[] = [];
+
+  function ownMethodNames(): Set<string> {
+    return new Set(
+      Object.getOwnPropertyNames(SDKRpcClientWire.prototype).filter(
+        (name) => name !== 'constructor',
+      ),
+    );
+  }
+
+  it('overrides every method SUPPORTED_METHODS lists, instead of inheriting the throwing base', () => {
+    const own = ownMethodNames();
+    const missing = SUPPORTED_METHODS.filter((name) => !own.has(name));
+    const report = missing
+      .map(
+        (name) =>
+          `"${name}" is not its own override on SDKRpcClientWire — it falls through to ` +
+          `getRpc(), which throws not_implemented the first time the agents-view TUI reaches it ` +
+          `live. Add a real override in packages/node-sdk/src/wire/sdk-rpc-client-wire.ts (or, if ` +
+          `the wire genuinely cannot support it, move "${name}" into NOT_SUPPORTED_METHODS in ` +
+          `this test instead of SUPPORTED_METHODS).`,
+      )
+      .join('\n');
+    expect(report).toBe('');
+  });
+
+  it('leaves every method NOT_SUPPORTED_METHODS lists on the throwing base implementation', () => {
+    const own = ownMethodNames();
+    const wronglyOverridden = NOT_SUPPORTED_METHODS.filter((name) => own.has(name));
+    const report = wronglyOverridden
+      .map(
+        (name) =>
+          `"${name}" is now overridden on SDKRpcClientWire but is still listed in ` +
+          `NOT_SUPPORTED_METHODS — move it to SUPPORTED_METHODS in this test so the guard above ` +
+          `actually exercises it.`,
+      )
+      .join('\n');
+    expect(report).toBe('');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // toWireContent — the kosong PromptPart → protocol message content mapping
 // the prompt/steer submissions depend on. Pure unit tests (no live server).
 // ---------------------------------------------------------------------------
