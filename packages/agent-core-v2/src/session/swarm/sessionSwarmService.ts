@@ -180,9 +180,6 @@ export class SessionSwarmService implements ISessionSwarmService {
       throw wrapSubagentModelError(error, binding.model, callerData.modelAlias);
     }
     child.accessor
-      .get(IAgentPermissionModeService)
-      .setMode(caller.accessor.get(IAgentPermissionModeService).mode);
-    child.accessor
       .get(IAgentUserToolService)
       .inheritUserTools(caller.accessor.get(IAgentUserToolService));
     emitAgentRunSpawned(caller, child.id, {
@@ -199,7 +196,7 @@ export class SessionSwarmService implements ISessionSwarmService {
       runner: this.processRunner,
       log: this.log,
     });
-    return this.observe(caller, child.id, options.profileName, {
+    return this.observe(caller, child, options.profileName, {
       kind: 'prompt',
       prompt: promptText,
     }, options);
@@ -236,17 +233,23 @@ export class SessionSwarmService implements ISessionSwarmService {
     const request = retryTurn
       ? ({ kind: 'retry' } as const)
       : ({ kind: 'prompt', prompt: options.prompt } as const);
-    return this.observe(caller, child.id, profileName, request, options);
+    return this.observe(caller, child, profileName, request, options);
   }
 
   private async observe(
     caller: IAgentScopeHandle,
-    agentId: string,
+    child: IAgentScopeHandle,
     profileName: string,
     request: { kind: 'prompt'; prompt: string } | { kind: 'retry' },
     options: AgentRunAttemptOptions,
   ): Promise<AgentRunAttemptHandle> {
-    const run = await this.subagents.run(agentId, request, {
+    // Single call site for spawn, resume, and retry alike, so a resumed or
+    // retried subagent always picks up the caller's current mode instead of
+    // staying on whatever it was originally spawned under.
+    child.accessor
+      .get(IAgentPermissionModeService)
+      .setMode(caller.accessor.get(IAgentPermissionModeService).mode);
+    const run = await this.subagents.run(child.id, request, {
       signal: options.signal,
       onReady: options.onReady,
     });
@@ -257,7 +260,7 @@ export class SessionSwarmService implements ISessionSwarmService {
       signal: options.signal,
     });
     return {
-      agentId,
+      agentId: child.id,
       profileName,
       completion: mirrored.then((r) => ({ result: r.summary, usage: r.usage })),
     };
