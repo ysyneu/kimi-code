@@ -17,6 +17,7 @@ import type {
   WireApprovalRequest,
   WireMessage,
   WireQuestionRequest,
+  WireSessionStatus,
   WireTask,
 } from '#/wire/protocol';
 import { collectReplayMessages } from '#/wire/resume-replay';
@@ -1411,6 +1412,168 @@ describe('SDKRpcClientWire degrade surface', () => {
     live.mockRestore();
     await rpc.close();
   });
+
+  it('defers setPlanMode onto the next prompt body, then clears it', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const { bodies, spy } = stubSubmitPrompt();
+    await rpc.setPlanMode({ sessionId: 's1', enabled: true });
+    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'first' }] });
+    expect(bodies[0]?.plan_mode).toBe(true);
+    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'second' }] });
+    expect(bodies[1]?.plan_mode).toBeUndefined();
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('defers setPlanMode onto steer submissions too', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const { bodies, spy } = stubSubmitPrompt();
+    await rpc.setPlanMode({ sessionId: 's1', enabled: false });
+    await rpc.steer({ sessionId: 's1', input: [{ type: 'text', text: 'steered' }] });
+    expect(bodies[0]?.plan_mode).toBe(false);
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('keeps the deferred plan mode when the submission fails', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const { bodies, spy } = stubSubmitPrompt();
+    spy.mockRejectedValueOnce(new Error('boom'));
+    await rpc.setPlanMode({ sessionId: 's1', enabled: true });
+    await expect(
+      rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'fails' }] }),
+    ).rejects.toThrow('boom');
+    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'retry' }] });
+    expect(bodies[0]?.plan_mode).toBe(true);
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('I9: closeSession (local detach) clears a deferred plan mode override too', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const { bodies, spy } = stubSubmitPrompt();
+    await rpc.setPlanMode({ sessionId: 's1', enabled: true });
+    await rpc.closeSession({ sessionId: 's1' });
+    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'after reattach' }] });
+    expect(bodies[0]?.plan_mode).toBeUndefined();
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  // setPermission and setPlanMode share one pending-override entry per
+  // session (not two parallel maps): a mode set on each rides the SAME next
+  // submission together, and clearing one does not touch the other.
+  it('rides a pending permission mode and a pending plan mode on the same next submission', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const { bodies, spy } = stubSubmitPrompt();
+    await rpc.setPermission({ sessionId: 's1', mode: 'yolo' });
+    await rpc.setPlanMode({ sessionId: 's1', enabled: true });
+    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'both' }] });
+    expect(bodies[0]).toMatchObject({ permission_mode: 'yolo', plan_mode: true });
+    // Both cleared: a second submission carries neither.
+    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'after' }] });
+    expect(bodies[1]?.permission_mode).toBeUndefined();
+    expect(bodies[1]?.plan_mode).toBeUndefined();
+    spy.mockRestore();
+    await rpc.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDKRpcClientWire getStatus mode overlay — half 1 of the wire pending-state
+// task: getStatus reads the SERVER's view, which between a setPermission /
+// setPlanMode stash and the next prompt still reports the OLD mode. The wire
+// client owns the pending value, so its getStatus must overlay it — reporting
+// what WILL be in force for the next turn, which is what a status caller
+// (e.g. the TUI's syncRuntimeState on every attach/session-switch) is
+// actually asking about. `getSessionStatus` is stubbed directly rather than
+// going through a live turn: nothing server-side ever needs to run for this
+// to matter, only the deferred value the wire client itself holds.
+// ---------------------------------------------------------------------------
+
+describe('SDKRpcClientWire getStatus mode overlay', () => {
+  const SERVER_STATUS: WireSessionStatus = {
+    busy: false,
+    thinking_level: 'medium',
+    permission: 'manual',
+    plan_mode: false,
+    swarm_mode: false,
+    context_tokens: 0,
+    max_context_tokens: 100_000,
+    context_usage: 0,
+  };
+
+  function stubGetSessionStatus(status: WireSessionStatus) {
+    return vi.spyOn(WireHttpClient.prototype, 'getSessionStatus').mockResolvedValue(status);
+  }
+
+  it('overlays a pending permission mode onto getStatus, not the server value', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = stubGetSessionStatus(SERVER_STATUS);
+    await rpc.setPermission({ sessionId: 's1', mode: 'yolo' });
+    const status = await rpc.getStatus({ sessionId: 's1' });
+    expect(status.permission).toBe('yolo');
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('overlays a pending plan mode onto getStatus, not the server value', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = stubGetSessionStatus(SERVER_STATUS);
+    await rpc.setPlanMode({ sessionId: 's1', enabled: true });
+    const status = await rpc.getStatus({ sessionId: 's1' });
+    expect(status.planMode).toBe(true);
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('overlays both a pending permission mode and a pending plan mode together', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = stubGetSessionStatus(SERVER_STATUS);
+    await rpc.setPermission({ sessionId: 's1', mode: 'yolo' });
+    await rpc.setPlanMode({ sessionId: 's1', enabled: true });
+    const status = await rpc.getStatus({ sessionId: 's1' });
+    expect(status.permission).toBe('yolo');
+    expect(status.planMode).toBe(true);
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('scopes the overlay per session — a pending mode on one session never leaks onto another', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = stubGetSessionStatus(SERVER_STATUS);
+    await rpc.setPermission({ sessionId: 's1', mode: 'yolo' });
+    const status = await rpc.getStatus({ sessionId: 's2' });
+    expect(status.permission).toBe('manual');
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('reports the server value once nothing is pending', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = stubGetSessionStatus(SERVER_STATUS);
+    const status = await rpc.getStatus({ sessionId: 's1' });
+    expect(status.permission).toBe('manual');
+    expect(status.planMode).toBe(false);
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('the overlay is self-limiting: once a prompt carries the pending mode, getStatus reports the server value again', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const statusSpy = stubGetSessionStatus(SERVER_STATUS);
+    const { spy: promptSpy } = stubSubmitPrompt();
+    await rpc.setPermission({ sessionId: 's1', mode: 'yolo' });
+    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'go' }] });
+    // The stash is gone; getStatus now reflects whatever the server reports —
+    // simulated here as still 'manual' (a real server would have applied
+    // the mode by now, but the overlay itself must no longer override it).
+    const status = await rpc.getStatus({ sessionId: 's1' });
+    expect(status.permission).toBe('manual');
+    promptSpy.mockRestore();
+    statusSpy.mockRestore();
+    await rpc.close();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1462,6 +1625,9 @@ describe('SDKRpcClientWire wire-supported surface', () => {
     'listMcpServers',
     'getMcpStartupMetrics',
     'setPermission',
+    // Fixed by the wire pending-state round: setPlanMode shares setPermission's
+    // deferred-submission shape (see the getStatus mode overlay tests above).
+    'setPlanMode',
     // Fixed by this round's config/model section (item 2):
     'getConfig',
     'setConfig',

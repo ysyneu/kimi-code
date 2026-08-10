@@ -13,11 +13,11 @@
  * Deliberate wire-transport semantics:
  * - `closeSession` is a LOCAL DETACH ONLY (unsubscribe + drop the registered
  *   handlers + drop the bridge's dedupe/queued state + drop any armed-but-
- *   unsent permission override) — no HTTP call, the server-side session
- *   stays alive and resumable, and a later reattach re-presents interactions
- *   that are still pending. The wire has no per-connection session-close
- *   verb, and the daemon owns the session lifetime. `deleteSession` drops
- *   the same permission override.
+ *   unsent permission/plan-mode override) — no HTTP call, the server-side
+ *   session stays alive and resumable, and a later reattach re-presents
+ *   interactions that are still pending. The wire has no per-connection
+ *   session-close verb, and the daemon owns the session lifetime.
+ *   `deleteSession` drops the same overrides.
  * - `deleteSession` maps to `:archive` (the wire's only session-removal verb).
  * - Turns and state reads map onto the prompts / status / messages REST
  *   surface: `steer` is submit-then-`prompts:steer`, `cancel` is `:abort`,
@@ -61,6 +61,7 @@ import {
   type SetSessionModelRpcInput,
   type SetSessionModelRpcResult,
   type SetSessionPermissionRpcInput,
+  type SetSessionPlanModeRpcInput,
   type SetSessionThinkingRpcInput,
 } from '#/rpc';
 import type {
@@ -141,6 +142,16 @@ export interface SDKRpcClientWireOptions {
 export interface WirePromptRpcInput extends SessionPromptRpcInput {
   readonly model?: string;
   readonly profile?: string;
+}
+
+/**
+ * One session's deferred mode overrides — see `pendingModeOverrides` on
+ * {@link SDKRpcClientWire} for why `setPermission` and `setPlanMode` share
+ * this single shape instead of two parallel maps.
+ */
+interface PendingModeOverride {
+  readonly permissionMode?: PermissionMode;
+  readonly planMode?: boolean;
 }
 
 /**
@@ -371,10 +382,19 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
   // bridge queues those interactions instead, and these sets are how it knows.
   private readonly approvalHandlerSessions = new Set<string>();
   private readonly questionHandlerSessions = new Set<string>();
-  // Deferred permission overrides: the wire has no standalone
-  // setPermission verb, so the mode waits here and rides the NEXT prompt/steer
-  // submission for that session as `permission_mode`, then clears.
-  private readonly pendingPermissions = new Map<string, PermissionMode>();
+  // Deferred per-session mode overrides: the wire has no standalone
+  // setPermission or setPlanMode verb, so each mode waits here and rides the
+  // NEXT prompt/steer submission for that session as `permission_mode` /
+  // `plan_mode`, then clears. One map, not two parallel ones — both fields
+  // ride the exact same submission and share the exact same
+  // clear-only-on-success rule (see `prompt` / `steer` below), so a session
+  // with a pending permission change and a pending plan-mode change sends
+  // both together on its next turn. `getStatus` overlays whichever fields are
+  // still pending here onto the server's status read (I-half-1): between the
+  // stash and that next submission, the server still reports the OLD values,
+  // and a stale status read is not a lie so much as a report of what WILL be
+  // in force for the next turn — which is what a status caller is asking.
+  private readonly pendingModeOverrides = new Map<string, PendingModeOverride>();
 
   constructor(options: SDKRpcClientWireOptions) {
     super();
@@ -570,12 +590,12 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
     await this.supervisor.unsubscribe(input.sessionId);
     this.clearSessionHandlers(input.sessionId);
     this.bridge.forgetSession(input.sessionId);
-    this.pendingPermissions.delete(input.sessionId);
+    this.pendingModeOverrides.delete(input.sessionId);
   }
 
   override async deleteSession(input: SessionIdRpcInput): Promise<void> {
     await this.http.sessionAction(input.sessionId, 'archive');
-    this.pendingPermissions.delete(input.sessionId);
+    this.pendingModeOverrides.delete(input.sessionId);
   }
 
   override async renameSession(input: RenameSessionInput): Promise<void> {
@@ -656,17 +676,18 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
   // -----------------------------------------------------------------------
 
   override async prompt(input: WirePromptRpcInput): Promise<void> {
-    const permissionMode = this.pendingPermissions.get(input.sessionId);
+    const pending = this.pendingModeOverrides.get(input.sessionId);
     await this.http.submitPrompt(input.sessionId, {
       content: input.input.map(toWireContent),
       disabled_tools: input.disabledTools,
       model: input.model,
       profile: input.profile,
-      permission_mode: permissionMode,
+      permission_mode: pending?.permissionMode,
+      plan_mode: pending?.planMode,
     });
     // Cleared only after a successful submission: a failed prompt must not
-    // silently drop the caller's mode change.
-    if (permissionMode !== undefined) this.pendingPermissions.delete(input.sessionId);
+    // silently drop the caller's mode change(s).
+    if (pending !== undefined) this.pendingModeOverrides.delete(input.sessionId);
   }
 
   /**
@@ -677,14 +698,15 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
    * call follows.
    */
   override async steer(input: WirePromptRpcInput): Promise<void> {
-    const permissionMode = this.pendingPermissions.get(input.sessionId);
+    const pending = this.pendingModeOverrides.get(input.sessionId);
     const submitted = await this.http.submitPrompt(input.sessionId, {
       content: input.input.map(toWireContent),
       model: input.model,
       profile: input.profile,
-      permission_mode: permissionMode,
+      permission_mode: pending?.permissionMode,
+      plan_mode: pending?.planMode,
     });
-    if (permissionMode !== undefined) this.pendingPermissions.delete(input.sessionId);
+    if (pending !== undefined) this.pendingModeOverrides.delete(input.sessionId);
     if (submitted.status === 'queued') {
       await this.http.steerPrompts(input.sessionId, { prompt_ids: [submitted.prompt_id] });
     }
@@ -694,8 +716,21 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
     await this.http.sessionAction(input.sessionId, 'abort');
   }
 
+  /**
+   * Overlays any still-pending `setPermission` / `setPlanMode` mode onto the
+   * server's status read (see `pendingModeOverrides`'s doc comment for why).
+   * Once a prompt/steer carries the mode the stash clears and this becomes a
+   * pass-through again — the overlay is self-limiting.
+   */
   override async getStatus(input: SessionIdRpcInput): Promise<SessionStatus> {
-    return wireStatusToSessionStatus(await this.http.getSessionStatus(input.sessionId));
+    const status = wireStatusToSessionStatus(await this.http.getSessionStatus(input.sessionId));
+    const pending = this.pendingModeOverrides.get(input.sessionId);
+    if (pending === undefined) return status;
+    return {
+      ...status,
+      permission: pending.permissionMode ?? status.permission,
+      planMode: pending.planMode ?? status.planMode,
+    };
   }
 
   /**
@@ -961,12 +996,30 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
   }
 
   /**
-   * The wire has no standalone setPermission verb: the mode is
-   * stored per session and rides the next prompt/steer submission as
-   * `permission_mode`, then clears.
+   * The wire has no standalone setPermission verb: the mode is stored per
+   * session (alongside any pending plan-mode change) and rides the next
+   * prompt/steer submission as `permission_mode`, then clears.
    */
   override async setPermission(input: SetSessionPermissionRpcInput): Promise<void> {
-    this.pendingPermissions.set(input.sessionId, input.mode);
+    this.pendingModeOverrides.set(input.sessionId, {
+      ...this.pendingModeOverrides.get(input.sessionId),
+      permissionMode: input.mode,
+    });
+  }
+
+  /**
+   * The wire has no standalone setPlanMode verb either — `plan_mode` is
+   * already accepted on the prompt submission body, exactly like
+   * `permission_mode`, so this needs no server work. Same deferred shape as
+   * `setPermission`, sharing the same `pendingModeOverrides` entry (and the
+   * same `getStatus` overlay above): the flag rides the next prompt/steer
+   * submission for this session as `plan_mode`, then clears.
+   */
+  override async setPlanMode(input: SetSessionPlanModeRpcInput): Promise<void> {
+    this.pendingModeOverrides.set(input.sessionId, {
+      ...this.pendingModeOverrides.get(input.sessionId),
+      planMode: input.enabled,
+    });
   }
 
   /**
