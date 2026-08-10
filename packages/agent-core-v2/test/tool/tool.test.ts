@@ -28,6 +28,7 @@ import { IAgentContextSizeService } from '#/agent/contextSize/contextSize';
 import { makeHookRunner } from '../agent/externalHooks/runner-stub';
 import { IAgentProfileService } from '#/agent/profile/profile';
 import { IAgentPermissionModeService } from '#/agent/permissionMode/permissionMode';
+import type { PermissionMode } from '#/agent/permissionPolicy/types';
 import { ToolAccesses, type ExecutableTool } from '#/tool/toolContract';
 import { IAgentToolRegistryService } from '#/agent/toolRegistry/toolRegistry';
 import { IAgentLoopService } from '#/agent/loop/loop';
@@ -75,6 +76,7 @@ import {
   externalHookServices,
   homeDirServices,
   modelProviderServices,
+  permissionModeServices,
   sessionService,
   swarmServices,
   type TestAgentContext,
@@ -207,6 +209,23 @@ function modelCatalogResolving(...aliases: readonly string[]): IModelCatalog {
     },
     notifyConfigChanged: () => {},
   } as unknown as IModelCatalog;
+}
+
+function spyPermissionMode(initialMode: PermissionMode): IAgentPermissionModeService & {
+  readonly setMode: ReturnType<typeof vi.fn<IAgentPermissionModeService['setMode']>>;
+} {
+  let mode = initialMode;
+  const setMode = vi.fn((nextMode: PermissionMode) => {
+    mode = nextMode;
+  });
+  return {
+    _serviceBrand: undefined,
+    get mode() {
+      return mode;
+    },
+    setMode,
+    onDidChangeMode: Event.None as IAgentPermissionModeService['onDidChangeMode'],
+  };
 }
 
 interface AgentLifecycleStubOptions {
@@ -1442,6 +1461,83 @@ describe('Agent tool execution contract', () => {
       { kind: 'prompt', prompt: 'Continue' },
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
+  });
+
+  it('applies the caller current permission mode to a resumed subagent (loosening)', async () => {
+    const targetPermissionMode = spyPermissionMode('manual');
+    const lifecycle = createAgentLifecycleStub({
+      runCompletion: async () => ({ summary: 'resumed result' }),
+      handleServices: new Map([
+        ['agent-existing', new Map([[IAgentPermissionModeService, targetPermissionMode]])],
+      ]),
+    });
+    const context = createAgentToolContext(
+      lifecycle,
+      permissionModeServices('auto'),
+      sessionService(
+        ISessionMetadata,
+        sessionMetadataStub({ 'agent-existing': subagentMeta() }),
+      ),
+    );
+    lifecycle.addHandle('agent-existing', 'explore');
+
+    await executeAgentTool(context, {
+      prompt: 'Continue',
+      description: 'Continue work',
+      resume: 'agent-existing',
+    });
+
+    expect(targetPermissionMode.setMode).toHaveBeenCalledWith('auto');
+    expect(targetPermissionMode.mode).toBe('auto');
+  });
+
+  it('applies the caller current permission mode to a resumed subagent (tightening)', async () => {
+    // Parent revoked its own blanket approval (now manual) after spawning this
+    // subagent under auto; resuming it must not leave it auto-approving.
+    const targetPermissionMode = spyPermissionMode('auto');
+    const lifecycle = createAgentLifecycleStub({
+      runCompletion: async () => ({ summary: 'resumed result' }),
+      handleServices: new Map([
+        ['agent-existing', new Map([[IAgentPermissionModeService, targetPermissionMode]])],
+      ]),
+    });
+    const context = createAgentToolContext(
+      lifecycle,
+      permissionModeServices('manual'),
+      sessionService(
+        ISessionMetadata,
+        sessionMetadataStub({ 'agent-existing': subagentMeta() }),
+      ),
+    );
+    lifecycle.addHandle('agent-existing', 'explore');
+
+    await executeAgentTool(context, {
+      prompt: 'Continue',
+      description: 'Continue work',
+      resume: 'agent-existing',
+    });
+
+    expect(targetPermissionMode.setMode).toHaveBeenCalledWith('manual');
+    expect(targetPermissionMode.mode).toBe('manual');
+  });
+
+  it('still applies the caller current permission mode to a newly created subagent', async () => {
+    const childPermissionMode = spyPermissionMode('manual');
+    const lifecycle = createAgentLifecycleStub({
+      createAgentIds: ['agent-child'],
+      handleServices: new Map([
+        ['agent-child', new Map([[IAgentPermissionModeService, childPermissionMode]])],
+      ]),
+    });
+    const context = createAgentToolContext(lifecycle, permissionModeServices('auto'));
+
+    await executeAgentTool(context, {
+      prompt: 'Investigate',
+      description: 'Find cause',
+    });
+
+    expect(childPermissionMode.setMode).toHaveBeenCalledWith('auto');
+    expect(childPermissionMode.mode).toBe('auto');
   });
 
   it('registers background subagents with the task manager', async () => {
