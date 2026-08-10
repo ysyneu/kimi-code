@@ -44,7 +44,15 @@ export interface AppState {
   isCompacting: boolean;
   isReplaying: boolean;
   streamingPhase: 'idle' | 'waiting' | 'thinking' | 'composing' | 'shell';
+  /** Wall-clock start of the CURRENT TURN (not the current phase) — set once
+   * when the turn begins and held constant across waiting/thinking/composing/
+   * tool, so the live elapsed-time display has one clock per turn. */
   streamingStartTime: number;
+  /** True when `streamingStartTime` is an attach-time approximation: this
+   * client did not observe the turn's real start (e.g. attaching to a
+   * session whose turn was already in flight), so the value is a lower
+   * bound, not the true origin. The elapsed display renders a trailing `+`. */
+  streamingStartApprox?: boolean;
   theme: ThemeName;
   version: string;
   editorCommand: string | null;

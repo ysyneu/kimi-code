@@ -244,6 +244,7 @@ function createInitialAppState(input: KimiTUIStartupInput): AppState {
     isReplaying: false,
     streamingPhase: 'idle',
     streamingStartTime: 0,
+    streamingStartApprox: false,
     theme: input.tuiConfig.theme,
     version: input.version,
     editorCommand: input.tuiConfig.editorCommand,
@@ -1430,6 +1431,7 @@ export class KimiTUI {
     this.setAppState({
       streamingPhase: 'waiting',
       streamingStartTime: Date.now(),
+      streamingStartApprox: false,
     });
   }
 
@@ -1933,7 +1935,16 @@ export class KimiTUI {
     // turn start would. Guarded on currently-idle so this only ever seeds,
     // never downgrades a phase a delta already narrowed.
     if (status.busy === true && this.state.appState.streamingPhase === 'idle') {
-      this.setAppState({ streamingPhase: 'waiting', streamingStartTime: Date.now() });
+      // This client did not observe the turn's real start — it predates the
+      // subscription (see reconcileStreamingPhaseAfterAttach above) and is
+      // never replayed. Seed the clock at attach time and mark it
+      // approximate so the elapsed display renders "at least this long"
+      // (trailing `+`) instead of fabricating an age.
+      this.setAppState({
+        streamingPhase: 'waiting',
+        streamingStartTime: Date.now(),
+        streamingStartApprox: true,
+      });
     }
     this.setAppState({
       sessionId: session.id,
@@ -2910,6 +2921,7 @@ export class KimiTUI {
         return;
       case 'waiting': {
         const spinner = this.ensureActivitySpinner('moon');
+        spinner.setElapsedOrigin(this.turnElapsedOrigin(), this.state.appState.streamingStartApprox === true);
         this.syncAgentSwarmActivitySpinner(placeSpinnerInAgentSwarm ? spinner : undefined);
         if (placeSpinnerInAgentSwarm) break;
         this.state.activityContainer.addChild(
@@ -2930,6 +2942,7 @@ export class KimiTUI {
         const spinner = this.ensureActivitySpinner('braille', 'working...', (s) =>
           currentTheme.fg('primary', s),
         );
+        spinner.setElapsedOrigin(this.turnElapsedOrigin(), this.state.appState.streamingStartApprox === true);
         this.syncAgentSwarmActivitySpinner(undefined);
         this.state.activityContainer.addChild(
           new ActivityPaneComponent({
@@ -2942,6 +2955,7 @@ export class KimiTUI {
       }
       case 'tool': {
         const spinner = this.ensureActivitySpinner('moon');
+        spinner.setElapsedOrigin(this.turnElapsedOrigin(), this.state.appState.streamingStartApprox === true);
         this.syncAgentSwarmActivitySpinner(placeSpinnerInAgentSwarm ? spinner : undefined);
         if (placeSpinnerInAgentSwarm) break;
         this.state.activityContainer.addChild(
@@ -2965,6 +2979,16 @@ export class KimiTUI {
       }
     }
     this.state.ui.requestRender();
+  }
+
+  // The elapsed clock is only meaningful while an actual turn is in flight
+  // (waiting/thinking/composing) — NOT during a `!` shell command, which
+  // reuses the `waiting` activity-pane presentation (see
+  // resolveActivityPaneMode) but shares no timestamp with any turn.
+  private turnElapsedOrigin(): number | undefined {
+    const phase = this.state.appState.streamingPhase;
+    if (phase !== 'waiting' && phase !== 'thinking' && phase !== 'composing') return undefined;
+    return this.state.appState.streamingStartTime;
   }
 
   private resolveActivityPaneMode(): EffectiveActivityPaneMode {

@@ -337,6 +337,7 @@ export class SessionEventHandler {
     this.host.setAppState({
       streamingPhase: 'waiting',
       streamingStartTime: Date.now(),
+      streamingStartApprox: false,
     });
   }
 
@@ -407,10 +408,10 @@ export class SessionEventHandler {
       pendingApproval: null,
       pendingQuestion: null,
     });
-    this.host.setAppState({
-      streamingPhase: 'waiting',
-      streamingStartTime: Date.now(),
-    });
+    // A step boundary within the SAME turn — not a new turn, so the elapsed
+    // clock (streamingStartTime) is intentionally left untouched (see
+    // handleTurnBegin for the actual per-turn reset).
+    this.host.setAppState({ streamingPhase: 'waiting' });
   }
 
   private handleStepCompleted(event: TurnStepCompletedEvent): void {
@@ -502,8 +503,10 @@ export class SessionEventHandler {
     if (event.delta.trim().length === 0 && !streamingUI.hasThinkingDraft()) return;
     streamingUI.appendThinkingDelta(event.delta);
     this.host.patchLivePane({ mode: 'idle' });
+    // A phase change within the same turn — the elapsed clock is turn-scoped
+    // (see handleTurnBegin), so streamingStartTime is deliberately untouched.
     if (state.appState.streamingPhase !== 'thinking') {
-      this.host.setAppState({ streamingPhase: 'thinking', streamingStartTime: Date.now() });
+      this.host.setAppState({ streamingPhase: 'thinking' });
     }
     streamingUI.scheduleFlush();
   }
@@ -525,8 +528,9 @@ export class SessionEventHandler {
       pendingApproval: null,
       pendingQuestion: null,
     });
+    // Same-turn phase change — streamingStartTime is intentionally left alone.
     if (state.appState.streamingPhase !== 'composing') {
-      this.host.setAppState({ streamingPhase: 'composing', streamingStartTime: Date.now() });
+      this.host.setAppState({ streamingPhase: 'composing' });
     }
     streamingUI.scheduleFlush();
   }
@@ -598,8 +602,9 @@ export class SessionEventHandler {
       pendingApproval: null,
       pendingQuestion: null,
     });
+    // Same-turn phase change — streamingStartTime is intentionally left alone.
     if (state.appState.streamingPhase !== 'composing') {
-      this.host.setAppState({ streamingPhase: 'composing', streamingStartTime: Date.now() });
+      this.host.setAppState({ streamingPhase: 'composing' });
     }
     streamingUI.scheduleFlush();
   }
@@ -1034,10 +1039,12 @@ export class SessionEventHandler {
 
   private handleCompactionBegin(event: CompactionStartedEvent): void {
     this.host.streamingUI.finalizeLiveTextBuffers('waiting');
+    // isCompacting hides the activity pane outright (resolveActivityPaneMode),
+    // and a mid-turn compaction must not disturb that turn's elapsed clock —
+    // so streamingStartTime is deliberately left alone here.
     this.host.setAppState({
       isCompacting: true,
       streamingPhase: 'waiting',
-      streamingStartTime: Date.now(),
     });
     this.host.streamingUI.beginCompaction(event.instruction);
   }

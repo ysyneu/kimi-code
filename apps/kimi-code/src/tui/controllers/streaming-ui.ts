@@ -569,7 +569,11 @@ export class StreamingUIController {
       // queued-goal promotion, which would otherwise see an empty queue and an
       // idle phase and start a goal ahead of this message.
       state.queuedMessageDispatchPending = true;
-      this.host.setAppState({ streamingPhase: 'idle' });
+      this.host.setAppState({
+        streamingPhase: 'idle',
+        streamingStartTime: 0,
+        streamingStartApprox: false,
+      });
       this.host.resetLivePane();
       setTimeout(() => {
         state.queuedMessageDispatchPending = false;
@@ -578,7 +582,11 @@ export class StreamingUIController {
       return;
     }
 
-    this.host.setAppState({ streamingPhase: 'idle' });
+    this.host.setAppState({
+      streamingPhase: 'idle',
+      streamingStartTime: 0,
+      streamingStartApprox: false,
+    });
     this.host.resetLivePane();
     notifyTerminalOnce(state, `turn-complete:${completedTurnKey}`, {
       title: 'Kimi Code task complete',
@@ -641,6 +649,8 @@ export class StreamingUIController {
         true,
         'live',
         state.ui,
+        state.appState.streamingStartTime,
+        state.appState.streamingStartApprox === true,
       );
       if (state.toolOutputExpanded) this._activeThinkingComponent.setExpanded(true);
       state.transcriptContainer.addChild(this._activeThinkingComponent);
