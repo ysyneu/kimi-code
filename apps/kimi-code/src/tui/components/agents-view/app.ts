@@ -45,6 +45,14 @@
  *   EMPTY, once it holds text every printable char belongs to it.
  * - Open: Enter and → both fire `onOpen` on a row — opening always hands
  *   off to the session's own full-screen chat, never an in-view detail.
+ * - Mouse: a left click on a row's own screen line does the same thing Enter
+ *   does — selects the row, then opens it via the same `onOpen` call, no
+ *   separate path. A click on any other line (header, footer, spacer, the
+ *   dispatch/reply composer) is a no-op. This only ever fires while mouse
+ *   tracking is on, which the controller turns on for exactly as long as
+ *   this component is mounted (see `handleMouse` and its `clickableRows`
+ *   map, rebuilt every render from the same walk `renderList` already does
+ *   — never a second, independently-derived layout).
  * - Reply panel: `space` on a row (main composer empty) fires
  *   `onReplyRequest`, which the controller answers by setting
  *   `replyTargetId` AND `dispatchFocused` together (this component never
@@ -88,6 +96,7 @@ import {
   Container,
   Key,
   matchesKey,
+  type MouseClickEvent,
   type Terminal,
   visibleWidth,
   type Focusable,
@@ -373,6 +382,15 @@ export class AgentsViewApp extends Container implements Focusable {
   private listScroll = 0;
   private helpVisible = false;
   private rename: RenameState | undefined = undefined;
+  /**
+   * Screen row (this component's own output line index) → session row id,
+   * for every row line the last `render()` call actually painted. Rebuilt
+   * from scratch each render inside `renderList` — the only place that
+   * already walks the visible rows in order — never re-derived separately
+   * (see `handleMouse`). Header/footer/spacer/composer lines are simply
+   * absent, which is what makes a click there a no-op.
+   */
+  private clickableRows = new Map<number, string>();
 
   constructor(props: AgentsViewProps, terminal: Terminal) {
     super();
@@ -649,6 +667,25 @@ export class AgentsViewApp extends Container implements Focusable {
     }
   }
 
+  /**
+   * A left click on a roster row: select it (the same `onSelect` notify
+   * `moveSelection` fires) then open it — the same `onOpen` call Enter/→
+   * already make, never a second open path. A click that doesn't land on
+   * any row's own line (header, footer, spacer, the composer) is a no-op —
+   * `clickableRows` simply has no entry for it, so `id` is `undefined`.
+   * Clicking an already-selected row is not special-cased into a no-op or a
+   * double-click trigger: it still just opens, every time (B/req 7).
+   */
+  handleMouse(event: MouseClickEvent): void {
+    const id = this.clickableRows.get(event.row);
+    if (id === undefined) return;
+    const idx = this.deriveItems().findIndex((candidate) => candidate.id === id);
+    if (idx !== -1) this.selectedIndex = idx;
+    this.props.onSelect(id);
+    this.props.onOpen(id);
+    this.invalidate();
+  }
+
   private routeToDispatch(data: string): void {
     this.props.dispatchEditor.handleInput(data);
     this.props.onDispatchFocusChange(true);
@@ -748,6 +785,10 @@ export class AgentsViewApp extends Container implements Focusable {
 
   override render(width: number): string[] {
     const rows = Math.max(1, this.terminal.rows);
+    // Cleared up front, unconditionally: the too-small branch below never
+    // repopulates it, and a stale entry from a wider frame must not survive
+    // into one where that line no longer holds the row it used to.
+    this.clickableRows.clear();
     if (width < MIN_WIDTH || rows < MIN_HEIGHT) {
       return this.renderTooSmall(width, rows);
     }
@@ -823,6 +864,10 @@ export class AgentsViewApp extends Container implements Focusable {
       for (const [vi, item] of window.entries()) {
         const selected = this.listScroll + vi === this.selectedIndex;
         lines.push(this.renderItem(item, selected, width));
+        // HEADER_HEIGHT + vi is this line's index in the FULL screen output
+        // render() returns (header block always comes first, always exactly
+        // HEADER_HEIGHT lines) — see handleMouse and the clickableRows doc.
+        if (item.kind === 'row') this.clickableRows.set(HEADER_HEIGHT + vi, item.id);
       }
     }
     while (lines.length < height) lines.push(' '.repeat(width));

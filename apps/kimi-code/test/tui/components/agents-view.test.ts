@@ -793,6 +793,114 @@ describe('AgentsViewApp — arrow keys open the selected session', () => {
   });
 });
 
+describe('AgentsViewApp — left-click a roster row (pi-tui mouse support)', () => {
+  /** Finds a rendered line by its visible text, so tests never have to
+   *  hardcode the header height or item ordering — the same reason
+   *  `handleMouse` itself is fed by `renderList`'s own walk instead of a
+   *  second, independently-derived layout. */
+  function lineIndexOf(app: AgentsViewApp, needle: string, width = 120): number {
+    const lines = app.render(width).map(strip);
+    const idx = lines.findIndex((l) => l.includes(needle));
+    if (idx === -1) throw new Error(`no rendered line contains ${JSON.stringify(needle)}`);
+    return idx;
+  }
+
+  it('clicking a row line selects it and opens it — same call Enter makes', () => {
+    const onOpen = vi.fn();
+    const onSelect = vi.fn();
+    const app = makeApp({ groups: [group('working', [row('s1'), row('s2')])], onOpen, onSelect });
+    const s2Line = lineIndexOf(app, 's2 title');
+    app.handleMouse({ row: s2Line, column: 3 });
+    expect(onSelect).toHaveBeenCalledWith('s2');
+    expect(onOpen).toHaveBeenCalledWith('s2');
+  });
+
+  it('the clicked column within the row line does not matter — the whole line is clickable', () => {
+    const onOpen = vi.fn();
+    const app = makeApp({ groups: [group('working', [row('s1')])], onOpen });
+    const s1Line = lineIndexOf(app, 's1 title');
+    app.handleMouse({ row: s1Line, column: 0 });
+    expect(onOpen).toHaveBeenCalledWith('s1');
+    onOpen.mockClear();
+    app.handleMouse({ row: s1Line, column: 119 });
+    expect(onOpen).toHaveBeenCalledWith('s1');
+  });
+
+  it('clicking an already-selected row still just opens it — no double-click semantics', () => {
+    const onOpen = vi.fn();
+    const app = makeApp({ groups: [group('working', [row('s1')])], selectedId: 's1', onOpen });
+    const s1Line = lineIndexOf(app, 's1 title');
+    app.handleMouse({ row: s1Line, column: 0 });
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    onOpen.mockClear();
+    app.handleMouse({ row: s1Line, column: 0 }); // second click, same already-selected row
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(onOpen).toHaveBeenCalledWith('s1');
+  });
+
+  it('clicking a row updates the selection away from whatever was selected before', () => {
+    const onSelect = vi.fn();
+    const app = makeApp({ groups: [group('working', [row('s1'), row('s2')])], selectedId: 's1', onSelect });
+    const s2Line = lineIndexOf(app, 's2 title');
+    app.handleMouse({ row: s2Line, column: 0 });
+    expect(onSelect).toHaveBeenCalledWith('s2');
+  });
+
+  it('clicking the group header line opens nothing — only rows are clickable', () => {
+    const onOpen = vi.fn();
+    const app = makeApp({ groups: [group('working', [row('s1')])], onOpen });
+    const headerLine = lineIndexOf(app, 'Working');
+    app.handleMouse({ row: headerLine, column: 3 });
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it('clicking the spacer line between two groups opens nothing', () => {
+    const onOpen = vi.fn();
+    const app = makeApp({
+      groups: [group('working', [row('s1')]), group('completed', [row('s2')])],
+      onOpen,
+    });
+    // The spacer is the one line rendered directly before every non-first
+    // group header (see deriveItems) — never given its own findable text.
+    const spacerLine = lineIndexOf(app, 'Completed') - 1;
+    app.handleMouse({ row: spacerLine, column: 0 });
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it('clicking anywhere in the header chrome (brand line through the trailing blank) opens nothing', () => {
+    const onOpen = vi.fn();
+    const app = makeApp({ groups: [group('working', [row('s1')])], onOpen });
+    const s1Line = lineIndexOf(app, 's1 title');
+    // Everything above the first roster item (the group header at s1Line -
+    // 1) is header chrome: brand/version, model · cwd, counts, and the
+    // trailing blank line — see the header-shape test above.
+    for (let r = 0; r < s1Line - 1; r++) {
+      app.handleMouse({ row: r, column: 0 });
+    }
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it('clicking the footer line opens nothing', () => {
+    const onOpen = vi.fn();
+    const app = makeApp({ groups: [group('working', [row('s1')])], onOpen });
+    const lines = app.render(120);
+    app.handleMouse({ row: lines.length - 1, column: 0 });
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it('a click on a now-stale line from a previous, wider render is a no-op — the map is rebuilt every render', () => {
+    const onOpen = vi.fn();
+    const app = makeApp({ groups: [group('working', [row('s1')])], onOpen }, 30, 120);
+    const s1Line = lineIndexOf(app, 's1 title', 120);
+    // Re-render at the minimum width, which pushes the too-small message
+    // instead of the roster — the previous frame's clickableRows must not
+    // survive into this one.
+    app.render(30);
+    app.handleMouse({ row: s1Line, column: 0 });
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+});
+
 describe('AgentsViewApp — first Ctrl+X (row or group header)', () => {
   it('first Ctrl+X invokes onDeleteRequest on the selected row', () => {
     const onDeleteRequest = vi.fn();

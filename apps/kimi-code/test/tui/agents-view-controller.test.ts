@@ -65,8 +65,15 @@ function selectedLine(out: string): string | undefined {
   return out.split('\n').find((line) => line.trimStart().startsWith('❯'));
 }
 
-/** Minimal Terminal stub — only `rows` is read by the component. */
-function fakeTerminal(rows: number, columns = 120): Terminal {
+/** Minimal Terminal stub — only `rows` is read by the component. Also
+ *  stands in for `ProcessTerminal` as `state.terminal` below (cast, since a
+ *  literal stub can't structurally satisfy a class), so it carries no-op
+ *  `enable`/`disableMouseTracking` too — the controller calls those
+ *  unconditionally on every mount/unmount. */
+function fakeTerminal(
+  rows: number,
+  columns = 120,
+): Terminal & { enableMouseTracking(): void; disableMouseTracking(): void } {
   return {
     start: () => {},
     stop: () => {},
@@ -87,6 +94,8 @@ function fakeTerminal(rows: number, columns = 120): Terminal {
     clearLine: () => {},
     clearFromCursor: () => {},
     clearScreen: () => {},
+    enableMouseTracking: () => {},
+    disableMouseTracking: () => {},
     setTitle: () => {},
     setProgress: () => {},
   };

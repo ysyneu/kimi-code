@@ -597,6 +597,11 @@ export class AgentsViewController {
     state.ui.clear();
     state.ui.addChild(component);
     state.ui.setFocus(component);
+    // Mouse tracking is scoped to exactly this mount window (see
+    // detachForAttach/close for the matching disable) — never left on for
+    // the chat REPL or any other view, which would otherwise break native
+    // text selection there.
+    state.terminal.enableMouseTracking();
     state.ui.requestRender(true);
 
     dispatch.onSubmit = (submission) => {
@@ -813,6 +818,9 @@ export class AgentsViewController {
       state.ui.addChild(child);
     }
     this.host.setAgentsView(undefined);
+    // Unmounting for good — turn mouse tracking back off (see show()'s
+    // matching enable).
+    state.terminal.disableMouseTracking();
     state.ui.setFocus(state.editorContainer.children[0] ?? state.editor);
     state.ui.requestRender(true);
     // Panels deferred while the takeover was up mount now — the user is back
@@ -883,6 +891,9 @@ export class AgentsViewController {
     for (const child of view.savedChildren) {
       state.ui.addChild(child);
     }
+    // Detaching (not closing) still unmounts the component — turn mouse
+    // tracking back off, same as close(); remount() turns it back on.
+    state.terminal.disableMouseTracking();
     // Focus whatever occupies the editor slot: when a reverse-RPC panel is
     // mounted there the editor is off-tree, and focusing it would leave the
     // restored panel visible but keyboard-dead.
@@ -907,6 +918,9 @@ export class AgentsViewController {
     state.ui.clear();
     state.ui.addChild(view.component);
     state.ui.setFocus(view.component);
+    // Remounted — turn mouse tracking back on (see detachForAttach's
+    // matching disable).
+    state.terminal.enableMouseTracking();
     this.pushProps();
     // Back on the view: its own rows show the counts — the badge goes away.
     this.host.setAttachBadge(undefined);

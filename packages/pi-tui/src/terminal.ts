@@ -12,6 +12,11 @@ const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
 const TERMINAL_PROGRESS_CLEAR_SEQUENCE = "\x1b]9;4;0;\x07";
 const APPLE_TERMINAL_SHIFT_ENTER_SEQUENCE = "\x1b[13;2u";
+// Normal button tracking (?1000) plus the SGR extension (?1006) — presses
+// and releases only, deliberately never motion tracking (?1002/?1003),
+// which would flood stdin. See ProcessTerminal.enableMouseTracking.
+const MOUSE_TRACKING_ENABLE_SEQUENCE = "\x1b[?1000h\x1b[?1006h";
+const MOUSE_TRACKING_DISABLE_SEQUENCE = "\x1b[?1006l\x1b[?1000l";
 const DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS = 7;
 const KEYBOARD_PROTOCOL_RESPONSE_FRAGMENT_TIMEOUT_MS = 150;
 const KITTY_KEYBOARD_PROTOCOL_QUERY = `\x1b[>${DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS}u\x1b[?u\x1b[c`;
@@ -102,6 +107,7 @@ export class ProcessTerminal implements Terminal {
 	private resizeHandler?: () => void;
 	private _kittyProtocolActive = false;
 	private _modifyOtherKeysActive = false;
+	private mouseTrackingEnabled = false;
 	private keyboardProtocolPushed = false;
 	private keyboardProtocolNegotiationBuffer = "";
 	private keyboardProtocolBufferFlushTimer?: ReturnType<typeof setTimeout>;
@@ -129,6 +135,27 @@ export class ProcessTerminal implements Terminal {
 
 	get modifyOtherKeysActive(): boolean {
 		return this._modifyOtherKeysActive;
+	}
+
+	/**
+	 * Turn on SGR mouse reporting. Never called automatically — mouse
+	 * tracking stays off (and native terminal selection/drag keeps working)
+	 * everywhere except the narrow window a caller explicitly opts into (e.g.
+	 * only while a specific view is mounted) via this method, paired with a
+	 * matching disableMouseTracking() call when that window ends.
+	 */
+	enableMouseTracking(): void {
+		if (this.mouseTrackingEnabled) return;
+		this.mouseTrackingEnabled = true;
+		process.stdout.write(MOUSE_TRACKING_ENABLE_SEQUENCE);
+	}
+
+	/** Turn off SGR mouse reporting. Also called unconditionally from stop()
+	 *  as a hygiene backstop — see the comment there. */
+	disableMouseTracking(): void {
+		if (!this.mouseTrackingEnabled) return;
+		this.mouseTrackingEnabled = false;
+		process.stdout.write(MOUSE_TRACKING_DISABLE_SEQUENCE);
 	}
 
 	start(onInput: (data: string) => void, onResize: () => void): void {
@@ -410,6 +437,15 @@ export class ProcessTerminal implements Terminal {
 
 		// Disable bracketed paste mode
 		process.stdout.write("\x1b[?2004l");
+
+		// Mouse tracking is scoped to whatever caller turned it on (never
+		// auto-enabled at start()) — write the disable sequence unconditionally
+		// here regardless of mouseTrackingEnabled, the same hygiene backstop
+		// bracketed paste gets above: a mode left on wrecks the user's terminal
+		// (no native text selection until they reset it), so this must not
+		// depend on our own tracking state staying in sync.
+		process.stdout.write(MOUSE_TRACKING_DISABLE_SEQUENCE);
+		this.mouseTrackingEnabled = false;
 
 		const shouldDisableKittyProtocol = this.keyboardProtocolPushed || this._kittyProtocolActive;
 		this.clearKeyboardProtocolNegotiationBuffer();
