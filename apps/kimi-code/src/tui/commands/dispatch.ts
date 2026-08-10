@@ -46,7 +46,7 @@ import { handlePluginsCommand } from './plugins';
 import { handleProviderCommand } from './provider';
 import type { BuiltinSlashCommandName } from './registry';
 import { handleReloadCommand, handleReloadTuiCommand } from './reload';
-import { resolveSlashCommandInput, slashBusyMessage } from './resolve';
+import { resolveSlashCommandInput, slashBusyMessage, slashUnavailableMessage } from './resolve';
 import {
   handleExportDebugZipCommand,
   handleExportMdCommand,
@@ -199,10 +199,15 @@ async function executeSlashCommand(host: SlashCommandHost, input: string): Promi
     pluginCommandMap: host.pluginCommandMap,
     isStreaming: host.state.appState.streamingPhase !== 'idle',
     isCompacting: host.state.appState.isCompacting,
+    isAgentsView: host.state.startupState === 'agents-view',
   });
 
   switch (intent.kind) {
     case 'not-command':
+      return;
+    case 'unavailable':
+      host.track('input_command_invalid', { reason: 'unavailable', command: intent.commandName });
+      host.showError(slashUnavailableMessage(intent.commandName));
       return;
     case 'blocked':
       host.track('input_command_invalid', { reason: 'blocked', command: intent.commandName });

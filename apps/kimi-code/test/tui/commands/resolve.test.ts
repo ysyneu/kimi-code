@@ -4,6 +4,7 @@ import {
   setExperimentalFeatures,
   slashBusyMessage,
   slashCommandBusyReason,
+  slashUnavailableMessage,
 } from '#/tui/commands/index';
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -17,6 +18,7 @@ function resolve(
     pluginCommandMap: new Map<string, string>(),
     isStreaming: false,
     isCompacting: false,
+    isAgentsView: false,
     ...overrides,
   });
 }
@@ -336,5 +338,49 @@ describe('slash command busy helpers', () => {
       commandName: 'my-plugin:deploy',
       reason: 'streaming',
     });
+  });
+});
+
+describe('agents-view command availability', () => {
+  const UNAVAILABLE = ['plugins', 'add-dir', 'experiments', 'reload'] as const;
+
+  it('refuses commands the wire transport cannot serve', () => {
+    for (const name of UNAVAILABLE) {
+      expect(resolve(`/${name}`, { isAgentsView: true })).toEqual({
+        kind: 'unavailable',
+        commandName: name,
+      });
+    }
+  });
+
+  it('refuses them by alias too', () => {
+    expect(resolve('/experimental', { isAgentsView: true })).toEqual({
+      kind: 'unavailable',
+      commandName: 'experimental',
+    });
+  });
+
+  it('resolves the same commands normally outside agents view', () => {
+    for (const name of UNAVAILABLE) {
+      expect(resolve(`/${name}`)).toMatchObject({ kind: 'builtin', name });
+    }
+  });
+
+  it('reports unavailable rather than busy, because waiting never helps', () => {
+    expect(resolve('/add-dir /tmp/x', { isAgentsView: true, isStreaming: true })).toEqual({
+      kind: 'unavailable',
+      commandName: 'add-dir',
+    });
+  });
+
+  it('leaves the TUI-local reload command alone', () => {
+    expect(resolve('/reload-tui', { isAgentsView: true })).toMatchObject({
+      kind: 'builtin',
+      name: 'reload-tui',
+    });
+  });
+
+  it('formats the refusal message', () => {
+    expect(slashUnavailableMessage('plugins')).toBe('/plugins is not available in agents view.');
   });
 });

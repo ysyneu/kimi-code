@@ -488,8 +488,13 @@ export class KimiTUI {
   // =========================================================================
 
   private getSlashCommands(): readonly KimiSlashCommand[] {
-    const builtins = sortSlashCommands(BUILTIN_SLASH_COMMANDS).filter((command) =>
-      isExperimentalFlagEnabled(command.experimentalFlag),
+    const isAgentsView = this.state.startupState === 'agents-view';
+    const builtins = sortSlashCommands(BUILTIN_SLASH_COMMANDS).filter(
+      (command) =>
+        isExperimentalFlagEnabled(command.experimentalFlag) &&
+        // Never advertise what this transport cannot run; the resolve layer
+        // refuses the same commands when one is typed out in full.
+        !(isAgentsView && command.unavailableInAgentsView === true),
     );
     return [...builtins, ...this.skillCommands, ...this.pluginCommands];
   }

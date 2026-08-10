@@ -3482,3 +3482,34 @@ describe('KimiTUI agents-view exit confirmation', () => {
     expect(driver.onExit).toHaveBeenCalledWith(0);
   });
 });
+
+describe('KimiTUI agents-view slash-command palette', () => {
+  interface PaletteDriver extends StartupDriver {
+    getSlashCommands(): readonly { readonly name: string }[];
+  }
+
+  // Kept in step with `unavailableInAgentsView` in the builtin registry.
+  const UNAVAILABLE = ['plugins', 'add-dir', 'experiments', 'reload'];
+
+  async function paletteNames(startupAgentsView: boolean): Promise<string[]> {
+    const driver = makeDriver(makeHarness(), {
+      ...makeStartupInput(),
+      startupAgentsView,
+    }) as unknown as PaletteDriver;
+    await driver.init();
+    expect(driver.state.startupState).toBe(startupAgentsView ? 'agents-view' : 'ready');
+    return driver.getSlashCommands().map((command) => command.name);
+  }
+
+  it('hides the commands the wire transport cannot serve', async () => {
+    const names = await paletteNames(true);
+    for (const name of UNAVAILABLE) expect(names).not.toContain(name);
+    // A neighbour that stays: proves the filter is selective, not empty.
+    expect(names).toContain('reload-tui');
+  });
+
+  it('offers all of them in a normal session', async () => {
+    const names = await paletteNames(false);
+    for (const name of UNAVAILABLE) expect(names).toContain(name);
+  });
+});
