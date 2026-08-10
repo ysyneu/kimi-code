@@ -946,6 +946,37 @@ describe('AgentsViewApp — left-click a roster row (pi-tui mouse support)', () 
     expect(onDispatchFocusChange).toHaveBeenCalledWith(false);
     expect(editor.getText()).toBe('half-typed draft');
   });
+
+  it('a click while the reply panel is open does not open the clicked row and leaves the reply panel untouched — a reply draft is bound to its row, unlike a plain dispatch draft (defect B)', () => {
+    const editor = makeDispatchEditor();
+    editor.setText('half-typed reply');
+    const onOpen = vi.fn();
+    const onSelect = vi.fn();
+    const onReplyClose = vi.fn();
+    const onDispatchFocusChange = vi.fn();
+    const app = makeApp({
+      groups: [group('working', [row('s1'), row('s2')])],
+      selectedId: 's1',
+      dispatchEditor: editor,
+      dispatchFocused: true,
+      replyTargetId: 's1',
+      onOpen,
+      onSelect,
+      onReplyClose,
+      onDispatchFocusChange,
+    });
+    const s2Line = lineIndexOf(app, 's2 title');
+    // The reply panel occupies the composer slot, so the list is shorter here:
+    // assert the clicked row is genuinely on screen, or this test would pass
+    // by clicking nothing at all.
+    expect(s2Line).toBeGreaterThanOrEqual(0);
+    app.handleMouse({ row: s2Line, column: 0 });
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(onSelect).not.toHaveBeenCalled();
+    expect(onReplyClose).not.toHaveBeenCalled();
+    expect(onDispatchFocusChange).not.toHaveBeenCalled();
+    expect(editor.getText()).toBe('half-typed reply');
+  });
 });
 
 describe('AgentsViewApp — first Ctrl+X (row or group header)', () => {

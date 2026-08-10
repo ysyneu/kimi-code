@@ -680,17 +680,30 @@ export class AgentsViewApp extends Container implements Focusable {
    * Clicking an already-selected row is not special-cased into a no-op or a
    * double-click trigger: it still just opens, every time (B/req 7).
    *
-   * Respects the same two modal states `handleInput` refuses to let
-   * anything else through while active — rename (a half-typed title must
-   * not be silently abandoned by a stray click) and the help overlay
-   * (honours only `?`/Esc there too) — a click during either is a no-op,
-   * same as any other key. `onSelect` already runs `clearDeleteOverlays`
-   * (see `buildCallbacks`), so a click leaves no delete armed on a row the
+   * Respects the same modal states `handleInput` refuses to let anything
+   * else through while active — rename (a half-typed title must not be
+   * silently abandoned by a stray click), the help overlay (honours only
+   * `?`/Esc there too), and the reply panel — a click during any of them is
+   * a no-op, same as any other key.
+   *
+   * The reply panel gets the rename treatment rather than the plain
+   * dispatch composer's below, because its draft is bound to ONE row
+   * (`props.replyTargetId`), not "create a new session". Opening some
+   * other row out from under it would leave `replyTargetId` pointing at a
+   * row the user has navigated away from — the next printable char they
+   * type would misdirect into that stale reply instead of starting a new
+   * dispatch. There is also no keyboard way to open a different row
+   * without closing the panel first (Esc) — `dispatchFocused` sends every
+   * key to the composer while it's open — so the pointer must not invent
+   * one either. `onSelect` already runs `clearDeleteOverlays` (see
+   * `buildCallbacks`), so a click leaves no delete armed on a row the
    * selection has moved away from, same as `moveSelection` guarantees —
    * no separate call needed here.
    *
-   * The composer being focused is NOT one of those no-op states: a pointer
-   * aimed at a specific row is an explicit open request even then (refusing
+   * The PLAIN dispatch composer (`dispatchFocused` true, `replyTargetId`
+   * undefined) is NOT a no-op state, because its draft isn't bound to any
+   * row — navigating away leaves it sitting there harmlessly for the user
+   * to come back to. A click there is an explicit open request (refusing
    * it would be the surprising choice), but the view must not come back
    * with the composer still owning ↑/↓ — `onDispatchFocusChange(false)` is
    * the same focus-change signal a printable char uses in reverse to focus
@@ -700,7 +713,7 @@ export class AgentsViewApp extends Container implements Focusable {
   handleMouse(event: MouseClickEvent): void {
     const id = this.clickableRows.get(event.row);
     if (id === undefined) return;
-    if (this.rename !== undefined || this.helpVisible) return;
+    if (this.rename !== undefined || this.helpVisible || this.props.replyTargetId !== undefined) return;
     const idx = this.deriveItems().findIndex((candidate) => candidate.id === id);
     if (idx !== -1) this.selectedIndex = idx;
     this.props.onSelect(id);
