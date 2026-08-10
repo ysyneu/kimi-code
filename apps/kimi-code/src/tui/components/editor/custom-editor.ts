@@ -39,6 +39,17 @@ const CAPS_LOCK_BIT = 64;
 const CTRL_BIT = 4;
 const SHIFT_BIT = 1;
 
+/**
+ * Paste-image key — platform-aware: Windows terminals reserve Ctrl-V for
+ * their own paste handling (e.g. Windows Terminal's Ctrl+V shortcut), so we
+ * listen for Alt-V there. Everywhere else Ctrl-V pastes. Exported so every
+ * caller that needs to recognize this key (this file's own binding below,
+ * plus the agents-view roster's key routing) shares one definition — a
+ * second copy of the platform ternary would drift the first time a
+ * platform is added.
+ */
+export const pasteImageKey = process.platform === 'win32' ? 'alt+v' : Key.ctrl('v');
+
 interface AutocompleteInternals {
   cancelAutocomplete(): void;
   readonly autocompleteAbort?: AbortController;
@@ -461,14 +472,10 @@ export class CustomEditor extends Editor {
       return;
     }
 
-    // Paste image binding — platform-aware:
-    //   Windows terminals reserve Ctrl-V for their own paste handling
-    //   (e.g. Windows Terminal's Ctrl+V shortcut), so we listen for
-    //   Alt-V there. Everywhere else Ctrl-V pastes. When the host
-    //   reports no image available, we fall through to pi-tui's
-    //   normal paste path so text from the clipboard still works.
-    const pasteKey = process.platform === 'win32' ? 'alt+v' : Key.ctrl('v');
-    if (matchesKey(normalized, pasteKey)) {
+    // Paste image binding (see `pasteImageKey`'s own doc comment). When the
+    // host reports no image available, we fall through to pi-tui's normal
+    // paste path so text from the clipboard still works.
+    if (matchesKey(normalized, pasteImageKey)) {
       if (this.expandPasteMarkerAtCursor()) {
         return;
       }

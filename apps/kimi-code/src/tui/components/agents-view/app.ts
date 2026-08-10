@@ -103,7 +103,7 @@ import {
 } from '@moonshot-ai/pi-tui';
 
 import { GROUP_LABELS, type AgentsGroup, type AgentsRosterRow } from '@/tui/agents/roster';
-import type { CustomEditor } from '@/tui/components/editor/custom-editor';
+import { pasteImageKey, type CustomEditor } from '@/tui/components/editor/custom-editor';
 import { getVersion } from '#/cli/version';
 import { PRODUCT_NAME } from '#/constant/app';
 import { currentTheme } from '#/tui/theme';
@@ -661,8 +661,12 @@ export class AgentsViewApp extends Container implements Focusable {
       }
     }
 
-    // Empty editor, no shortcut matched: start typing a dispatch.
-    if (isPrintableChar(k)) {
+    // Empty editor, no shortcut matched: start typing a dispatch. The
+    // paste-image key isn't a printable char (it never matched any branch
+    // above either), so without this it would fall off the end here and
+    // never reach CustomEditor's own paste handling — it needs the same
+    // routeToDispatch path a printable char takes to focus the composer.
+    if (isPrintableChar(k) || matchesKey(data, pasteImageKey)) {
       this.routeToDispatch(data);
     }
   }
@@ -675,14 +679,33 @@ export class AgentsViewApp extends Container implements Focusable {
    * `clickableRows` simply has no entry for it, so `id` is `undefined`.
    * Clicking an already-selected row is not special-cased into a no-op or a
    * double-click trigger: it still just opens, every time (B/req 7).
+   *
+   * Respects the same two modal states `handleInput` refuses to let
+   * anything else through while active — rename (a half-typed title must
+   * not be silently abandoned by a stray click) and the help overlay
+   * (honours only `?`/Esc there too) — a click during either is a no-op,
+   * same as any other key. `onSelect` already runs `clearDeleteOverlays`
+   * (see `buildCallbacks`), so a click leaves no delete armed on a row the
+   * selection has moved away from, same as `moveSelection` guarantees —
+   * no separate call needed here.
+   *
+   * The composer being focused is NOT one of those no-op states: a pointer
+   * aimed at a specific row is an explicit open request even then (refusing
+   * it would be the surprising choice), but the view must not come back
+   * with the composer still owning ↑/↓ — `onDispatchFocusChange(false)` is
+   * the same focus-change signal a printable char uses in reverse to focus
+   * the composer (see `routeToDispatch`); it only unfocuses, leaving the
+   * draft text untouched.
    */
   handleMouse(event: MouseClickEvent): void {
     const id = this.clickableRows.get(event.row);
     if (id === undefined) return;
+    if (this.rename !== undefined || this.helpVisible) return;
     const idx = this.deriveItems().findIndex((candidate) => candidate.id === id);
     if (idx !== -1) this.selectedIndex = idx;
     this.props.onSelect(id);
     this.props.onOpen(id);
+    if (this.props.dispatchFocused) this.props.onDispatchFocusChange(false);
     this.invalidate();
   }
 

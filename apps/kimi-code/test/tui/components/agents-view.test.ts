@@ -899,6 +899,53 @@ describe('AgentsViewApp — left-click a roster row (pi-tui mouse support)', () 
     app.handleMouse({ row: s1Line, column: 0 });
     expect(onOpen).not.toHaveBeenCalled();
   });
+
+  it('a click while rename is active does not open the clicked row — the half-typed title survives (defect B)', () => {
+    const onOpen = vi.fn();
+    const onRenameSubmit = vi.fn();
+    const app = makeApp({
+      groups: [group('working', [row('s1'), row('s2')])],
+      selectedId: 's1',
+      onOpen,
+      onRenameSubmit,
+    });
+    app.handleInput('\u0012'); // Ctrl+R begins the rename modal on s1
+    const s2Line = lineIndexOf(app, 's2 title');
+    app.handleMouse({ row: s2Line, column: 0 });
+    expect(onOpen).not.toHaveBeenCalled();
+    // The stray click must not have abandoned the rename in progress.
+    app.handleInput('x');
+    app.handleInput('\r');
+    expect(onRenameSubmit).toHaveBeenCalledWith('s1', 's1 titlex');
+  });
+
+  it('a click while the help overlay is up does not open the clicked row (defect B)', () => {
+    const onOpen = vi.fn();
+    const app = makeApp({ groups: [group('working', [row('s1')])], onOpen });
+    app.handleInput('?');
+    const s1Line = lineIndexOf(app, 's1 title');
+    app.handleMouse({ row: s1Line, column: 0 });
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it('a click while the composer is focused opens the row AND unfocuses the composer, leaving the draft text intact (defect B)', () => {
+    const editor = makeDispatchEditor();
+    editor.setText('half-typed draft');
+    const onOpen = vi.fn();
+    const onDispatchFocusChange = vi.fn();
+    const app = makeApp({
+      groups: [group('working', [row('s1')])],
+      dispatchEditor: editor,
+      dispatchFocused: true,
+      onOpen,
+      onDispatchFocusChange,
+    });
+    const s1Line = lineIndexOf(app, 's1 title');
+    app.handleMouse({ row: s1Line, column: 0 });
+    expect(onOpen).toHaveBeenCalledWith('s1');
+    expect(onDispatchFocusChange).toHaveBeenCalledWith(false);
+    expect(editor.getText()).toBe('half-typed draft');
+  });
 });
 
 describe('AgentsViewApp — first Ctrl+X (row or group header)', () => {
@@ -1374,6 +1421,18 @@ describe('AgentsViewApp — dispatch editor mount', () => {
     app.handleInput('d');
     expect(editor.getText()).toBe('d');
     expect(onDispatchFocusChange).toHaveBeenCalledWith(true);
+  });
+
+  it('the paste-image key (not a printable char) also routes to the editor from the roster and requests focus, same as a printable char', () => {
+    const CTRL_V = String.fromCodePoint(22);
+    const editor = makeDispatchEditor();
+    const onPasteImage = vi.fn().mockResolvedValue(true);
+    editor.onPasteImage = onPasteImage;
+    const onDispatchFocusChange = vi.fn();
+    const app = makeApp({ dispatchEditor: editor, onDispatchFocusChange });
+    app.handleInput(CTRL_V);
+    expect(onDispatchFocusChange).toHaveBeenCalledWith(true);
+    expect(onPasteImage).toHaveBeenCalledTimes(1);
   });
 
   it('j/k/space/q route to the editor once it holds text (no navigation/quit/reply)', () => {
