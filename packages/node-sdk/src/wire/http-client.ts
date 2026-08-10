@@ -4,6 +4,7 @@ import {
   envelopeSchema,
   unwrapEnvelope,
   wireActivateSkillResultSchema,
+  wireConfigSchema,
   wireGoalSnapshotSchema,
   wireMessageSchema,
   wirePromptSubmitResultSchema,
@@ -16,6 +17,7 @@ import {
   wireWorkspaceSchema,
   type WireActivateSkillResult,
   type WireApprovalResponse,
+  type WireConfig,
   type WireGoalSnapshot,
   type WireMessage,
   type WirePromptSubmitResult,
@@ -280,6 +282,36 @@ export class WireHttpClient {
       `/sessions/${id}/skills/${skillName}:activate`,
       body,
       wireActivateSkillResultSchema,
+    );
+  }
+
+  /** The global Kimi configuration, secrets redacted. */
+  getConfig(): Promise<WireConfig> {
+    return this.request('GET', '/config', undefined, wireConfigSchema);
+  }
+
+  /** Update the global Kimi configuration (merge semantics). */
+  setConfig(patch: Record<string, unknown>): Promise<WireConfig> {
+    return this.request('POST', '/config', patch, wireConfigSchema);
+  }
+
+  /** Apply a model change to a session's main agent, via its `agent_config`. */
+  setModel(id: string, model: string): Promise<WireSession> {
+    return this.request(
+      'POST',
+      `/sessions/${id}/profile`,
+      { agent_config: { model } },
+      wireSessionSchema,
+    );
+  }
+
+  /** Apply a thinking-effort change to a session's main agent, via its `agent_config`. */
+  setThinking(id: string, effort: string): Promise<WireSession> {
+    return this.request(
+      'POST',
+      `/sessions/${id}/profile`,
+      { agent_config: { thinking: effort } },
+      wireSessionSchema,
     );
   }
 }

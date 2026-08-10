@@ -886,6 +886,60 @@ describe('SDKRpcClientWire activateSkill', () => {
 });
 
 // ---------------------------------------------------------------------------
+// SDKRpcClientWire config and model — `/login`'s post-auth
+// `harness.getConfig({ reload: true })` → `session.setModel(model)` →
+// `session.setThinking(effort)` sequence had no wire override for any of the
+// three: every call fell through to getRpc() and threw not_implemented
+// unconditionally, so `/login` always printed "Authentication successful,
+// but failed to refresh config: [not_implemented] This SDK method is not
+// available on the wire transport."
+// ---------------------------------------------------------------------------
+
+describe('SDKRpcClientWire config and model', () => {
+  it('reads the live config, mapping the wire snake_case shape onto KimiConfig', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const config = await rpc.getConfig();
+    expect(config.defaultModel).toBe('stub');
+    expect(config.providers['stub']).toMatchObject({ type: 'openai' });
+    // The wire never returns the real credential, redacted or otherwise.
+    expect(config.providers['stub']).not.toHaveProperty('apiKey');
+    await rpc.close();
+  });
+
+  it('sends the setConfig patch snake_cased at every depth, and reads the change back mapped to camelCase', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = vi.spyOn(WireHttpClient.prototype, 'setConfig');
+    const config = await rpc.setConfig({ defaultProvider: 'stub' });
+    expect(spy.mock.calls[0]?.[0]).toEqual({ default_provider: 'stub' });
+    expect(config.defaultProvider).toBe('stub');
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it("sets a session's model and thinking effort, applying live to the main agent", async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+
+    const setModelSpy = vi.spyOn(WireHttpClient.prototype, 'setModel');
+    const result = await rpc.setModel({ sessionId: created.id, model: 'stub' });
+    expect(setModelSpy).toHaveBeenCalledWith(created.id, 'stub');
+    expect(result).toEqual({ model: 'stub' });
+    setModelSpy.mockRestore();
+
+    const setThinkingSpy = vi.spyOn(WireHttpClient.prototype, 'setThinking');
+    // 'off' is universally accepted regardless of what the model declares.
+    await rpc.setThinking({ sessionId: created.id, effort: 'off' });
+    expect(setThinkingSpy).toHaveBeenCalledWith(created.id, 'off');
+    setThinkingSpy.mockRestore();
+
+    const status = await rpc.getStatus({ sessionId: created.id });
+    expect(status).toMatchObject({ model: 'stub', thinkingEffort: 'off' });
+    await rpc.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // SDKRpcClientWire getGoal — the root fix for the attach crash: the wire
 // transport previously had no override, so every attach's
 // `Promise.all([getStatus(), getGoal()])` rejected with not_implemented.

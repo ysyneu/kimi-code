@@ -51,14 +51,20 @@ import {
   type ActivateSkillRpcInput,
   type SessionIdRpcInput,
   type SessionPromptRpcInput,
+  type SetSessionModelRpcInput,
+  type SetSessionModelRpcResult,
   type SetSessionPermissionRpcInput,
+  type SetSessionThinkingRpcInput,
 } from '#/rpc';
 import type {
   CompactOptions,
   CreateSessionOptions,
   ForkSessionInput,
+  GetConfigOptions,
   GoalToolResult,
   JsonObject,
+  KimiConfig,
+  KimiConfigPatch,
   KimiHostIdentity,
   ListSessionsOptions,
   McpServerInfo,
@@ -83,6 +89,8 @@ import { translateWireEvent } from './event-translator';
 import { WireHttpClient } from './http-client';
 import { EnvelopeError } from './protocol';
 import type {
+  WireConfig,
+  WireProviderConfig,
   WireSession,
   WireSessionStatus,
   WireSessionUsage,
@@ -200,6 +208,72 @@ export function toWireContent(part: PromptPart): Record<string, unknown> {
         source: { kind: 'url', url: part.videoUrl.url, id: part.videoUrl.id },
       };
   }
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function snakeToCamel(key: string): string {
+  return key.replaceAll(/_([a-z])/g, (_, ch: string) => ch.toUpperCase());
+}
+
+function camelToSnake(key: string): string {
+  return key.replaceAll(/[A-Z]/g, (ch) => `_${ch.toLowerCase()}`);
+}
+
+/**
+ * `WireProviderConfig` (redacted: `has_api_key` only) → the closest
+ * `ProviderConfig`-shaped read. The wire never returns the real credential —
+ * `apiKey` / `oauth` are left unset, matching what the route actually redacts.
+ */
+function wireProviderToProviderConfig(provider: WireProviderConfig): Record<string, unknown> {
+  const out: Record<string, unknown> = { type: provider.type };
+  if (provider.base_url !== undefined) out['baseUrl'] = provider.base_url;
+  if (provider.default_model !== undefined) out['defaultModel'] = provider.default_model;
+  return out;
+}
+
+/**
+ * `WireConfig` → `KimiConfig`. Mirrors kap-server's `toConfigResponse`
+ * exactly: a shallow top-level key conversion (only the domain name is
+ * snake_cased on the wire; each domain's VALUE already arrives camelCase),
+ * plus the same `providers` redaction reversed on read.
+ */
+function wireConfigToKimiConfig(config: WireConfig): KimiConfig {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(config)) {
+    if (key === 'providers') {
+      const providers: Record<string, unknown> = {};
+      for (const [id, provider] of Object.entries(value as Record<string, WireProviderConfig>)) {
+        providers[id] = wireProviderToProviderConfig(provider);
+      }
+      out['providers'] = providers;
+      continue;
+    }
+    out[snakeToCamel(key)] = value;
+  }
+  return out as KimiConfig;
+}
+
+/**
+ * `KimiConfigPatch` → the `POST /config` request body. The route
+ * (`convertKeysSnakeToCamel`) recursively snake_cases every key at every
+ * depth before dispatching per-domain patches, so the patch is converted the
+ * other way at every depth too, or it would not round-trip.
+ */
+function kimiConfigPatchToWirePatch(patch: KimiConfigPatch): Record<string, unknown> {
+  return toSnakeCaseDeep(patch) as Record<string, unknown>;
+}
+
+function toSnakeCaseDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(toSnakeCaseDeep);
+  if (isPlainRecord(value)) {
+    const out: Record<string, unknown> = {};
+    for (const [key, v] of Object.entries(value)) out[camelToSnake(key)] = toSnakeCaseDeep(v);
+    return out;
+  }
+  return value;
 }
 
 /** `WireSessionStatus` → the SDK `SessionStatus`. */
@@ -570,6 +644,46 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
    */
   override async activateSkill(input: ActivateSkillRpcInput): Promise<void> {
     await this.http.activateSkill(input.sessionId, input.name, { args: input.args });
+  }
+
+  // -----------------------------------------------------------------------
+  // Config
+  //
+  // None of these four was overridden: every call fell through to getRpc()
+  // and threw not_implemented unconditionally, so `/login`'s post-auth config
+  // refresh and model activation always failed on the wire transport
+  // ("Authentication successful, but failed to refresh config: [not_implemented]
+  // This SDK method is not available on the wire transport.").
+  // -----------------------------------------------------------------------
+
+  /** Global Kimi configuration, secrets redacted — `GET /config`. */
+  override async getConfig(input?: GetConfigOptions): Promise<KimiConfig> {
+    // The server owns the config file and always answers with the live
+    // value, so there is nothing for a `reload` flag to force here.
+    void input;
+    return wireConfigToKimiConfig(await this.http.getConfig());
+  }
+
+  /** Patch the global Kimi configuration (merge semantics) — `POST /config`. */
+  override async setConfig(input: KimiConfigPatch): Promise<KimiConfig> {
+    return wireConfigToKimiConfig(await this.http.setConfig(kimiConfigPatchToWirePatch(input)));
+  }
+
+  /**
+   * Apply a model change to the session's main agent —
+   * `POST /sessions/{id}/profile` with `agent_config.model`.
+   */
+  override async setModel(input: SetSessionModelRpcInput): Promise<SetSessionModelRpcResult> {
+    await this.http.setModel(input.sessionId, input.model);
+    return { model: input.model };
+  }
+
+  /**
+   * Apply a thinking-effort change to the session's main agent —
+   * `POST /sessions/{id}/profile` with `agent_config.thinking`.
+   */
+  override async setThinking(input: SetSessionThinkingRpcInput): Promise<void> {
+    await this.http.setThinking(input.sessionId, input.effort);
   }
 
   // -----------------------------------------------------------------------

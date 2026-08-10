@@ -154,6 +154,48 @@ export const wireSessionWarningSchema = z.object({
 export type WireSessionWarning = z.infer<typeof wireSessionWarningSchema>;
 
 // ---------------------------------------------------------------------------
+// Config
+//
+// Mirrors kap-server's `configResponseSchema` / `patchConfigRequestSchema`
+// (`protocol/rest-config.ts`) byte-for-byte: the route snake_cases only the
+// top-level domain key and forwards each domain's VALUE unchanged (already
+// camelCase, straight from the resolved config), except `providers`, which
+// it redacts credentials out of into this shape.
+// ---------------------------------------------------------------------------
+
+export const wireProviderConfigSchema = z.object({
+  type: z.string(),
+  base_url: z.string().optional(),
+  default_model: z.string().optional(),
+  has_api_key: z.boolean(),
+});
+export type WireProviderConfig = z.infer<typeof wireProviderConfigSchema>;
+
+export const wireConfigSchema = z.object({
+  providers: z.record(z.string(), wireProviderConfigSchema).default({}),
+  default_provider: z.string().optional(),
+  default_model: z.string().optional(),
+  models: z.record(z.string(), z.unknown()).optional(),
+  secondary_model: z.unknown().optional(),
+  thinking: z.unknown().optional(),
+  plan_mode: z.boolean().optional(),
+  yolo: z.boolean().optional(),
+  default_permission_mode: z.string().optional(),
+  default_plan_mode: z.boolean().optional(),
+  permission: z.unknown().optional(),
+  hooks: z.array(z.unknown()).optional(),
+  services: z.unknown().optional(),
+  merge_all_available_skills: z.boolean().optional(),
+  extra_skill_dirs: z.array(z.string()).optional(),
+  loop_control: z.unknown().optional(),
+  background: z.unknown().optional(),
+  experimental: z.record(z.string(), z.boolean()).optional(),
+  telemetry: z.boolean().optional(),
+  raw: z.record(z.string(), z.unknown()).optional(),
+});
+export type WireConfig = z.infer<typeof wireConfigSchema>;
+
+// ---------------------------------------------------------------------------
 // Goal
 // ---------------------------------------------------------------------------
 

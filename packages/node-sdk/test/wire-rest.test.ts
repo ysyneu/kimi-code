@@ -234,3 +234,36 @@ describe('WireHttpClient against a real kap-server', () => {
     ).rejects.toMatchObject({ code: 40410 });
   });
 });
+
+// R9 Q4b sibling: `/login`'s post-auth config/model refresh had no wire
+// override at all, so it always threw not_implemented — see the fix in
+// sdk-rpc-client-wire.ts's Config section for the full evidence trail.
+describe('WireHttpClient config and model routes', () => {
+  it('reads the global config, redacting provider credentials to has_api_key', async () => {
+    const config = await http.getConfig();
+    expect(config.default_model).toBe('stub');
+    expect(config.providers['stub']).toMatchObject({ type: 'openai', has_api_key: true });
+    // The wire never returns the real credential, redacted or otherwise.
+    expect(config.providers['stub']).not.toHaveProperty('api_key');
+  });
+
+  it('patches the global config and reads the change back', async () => {
+    const patched = await http.setConfig({ default_provider: 'stub' });
+    expect(patched.default_provider).toBe('stub');
+    const reread = await http.getConfig();
+    expect(reread.default_provider).toBe('stub');
+  });
+
+  // The route's own `Session` response always echoes back the `agent_config`
+  // placeholder (`{ model: '' }` — see `toWireSession` in kap-server's
+  // sessions.ts), never the live value, so the change is verified through the
+  // status route instead — the same live read `getStatus` uses.
+  it("sets a session's model and thinking effort through its agent_config", async () => {
+    const created = await http.createSession({ metadata: { cwd } });
+    await http.setModel(created.id, 'stub');
+    expect((await http.getSessionStatus(created.id)).model).toBe('stub');
+    // 'off' is universally accepted regardless of what the model declares.
+    await http.setThinking(created.id, 'off');
+    expect((await http.getSessionStatus(created.id)).thinking_level).toBe('off');
+  });
+});
