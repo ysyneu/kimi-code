@@ -952,6 +952,12 @@ export class AgentGoalService extends Disposable implements IAgentGoalService {
         }
         return turn.result;
       })
+      // This chain must carry its own rejection handler: a rejected
+      // assignment (the loop disposing with the request still queued —
+      // 'Agent loop disposed' at server shutdown) used to escape as an
+      // unhandled rejection and crash the host process. Settle the goal
+      // with the same continuation-failure semantics as the other paths.
+      .catch((error) => this.settleGoalAfterContinuationFailure(error, goalId))
       .finally(() => {
         if (pending.turnId !== undefined) this.pendingContinuationGoals.delete(pending.turnId);
         if (this.pendingContinuation === pending) this.pendingContinuation = undefined;

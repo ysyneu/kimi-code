@@ -14,6 +14,8 @@
 
 import {
   createKimiHarnessWire,
+  flushDiagnosticLogsSync,
+  log,
   type KimiHarness,
   type TelemetryClient,
 } from '@moonshot-ai/kimi-code-sdk';
@@ -26,6 +28,7 @@ import {
 import { loadTuiConfig, TuiConfigParseError, type TuiConfig } from '#/tui/config';
 import { KimiTUI } from '#/tui/index';
 import { currentTheme, getColorPalette } from '#/tui/theme';
+import { restoreTerminalModes } from '#/utils/terminal-restore';
 
 import type { CLIOptions } from '#/cli/options';
 import { createCliTelemetryBootstrap } from '#/cli/telemetry';
@@ -109,12 +112,58 @@ export async function runAgents(): Promise<void> {
       server.mode === 'embedded' ? () => countRunningSessions(server) : undefined,
   });
 
+  // The same crash safety net run-shell installs: with no unhandledRejection
+  // listener of our own, the telemetry crash handler stays the process's
+  // sole listener and rethrows by design — so any stray rejection, e.g. the
+  // embedded server's engine disposing in-flight turns during the shutdown
+  // below ('Agent loop disposed'), surfaces as a naked crash dump. Log and
+  // exit cleanly instead.
+  const emergencyExit = (exitCode: number): void => {
+    // The crash log above is only enqueued into the async sink; flush it
+    // synchronously or the `process.exit()` below would drop the one line
+    // that explains why we crashed. Best-effort: an exit path must never
+    // throw.
+    try {
+      flushDiagnosticLogsSync();
+    } catch {
+      /* ignore */
+    }
+    restoreTerminalModes();
+    process.exit(exitCode);
+  };
+  const onUncaughtException = (error: unknown): void => {
+    try {
+      log.error('uncaughtException, restoring terminal and exiting', { error: String(error) });
+    } catch {
+      /* ignore */
+    }
+    emergencyExit(1);
+  };
+  const onUnhandledRejection = (reason: unknown): void => {
+    try {
+      log.error('unhandledRejection, restoring terminal and exiting', { reason: String(reason) });
+    } catch {
+      /* ignore */
+    }
+    emergencyExit(1);
+  };
+  process.on('uncaughtException', onUncaughtException);
+  process.on('unhandledRejection', onUnhandledRejection);
+  const removeCrashHandlers = (): void => {
+    process.off('uncaughtException', onUncaughtException);
+    process.off('unhandledRejection', onUnhandledRejection);
+  };
+
   tui.onExit = async (exitCode = 0) => {
     // Wire transport: close() only disconnects; an attached server keeps
     // running, an embedded one is shut down right after (any running
     // sessions were already confirmed by the stop() exit dialog).
     await harness.close();
     await server.shutdown();
+    // The crash handlers stay up through the shutdown above — that is
+    // exactly the window a stray engine rejection needs them — and come
+    // down only once the process is on its way out cleanly.
+    removeCrashHandlers();
     // The view's sessions run the v2 engine on the kap-server — `kimi
     // --resume` (v1 storage) can't reopen them, so the
     // re-entry point is the view itself.
