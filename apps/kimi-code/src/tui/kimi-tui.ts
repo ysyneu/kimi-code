@@ -104,7 +104,7 @@ import {
 } from './constant/kimi-tui';
 import { CHROME_GUTTER } from './constant/rendering';
 import { MAX_TERMINAL_TITLE_LENGTH } from './constant/terminal';
-import { AgentsViewController } from './controllers/agents-view';
+import { AgentsViewController, attachRpcTimeoutMs, raceTimeout } from './controllers/agents-view';
 import type { DispatchActivatableCommands } from './controllers/agents-view-dispatch';
 import type { AgentsGroupMode } from './controllers/agents-view-groups';
 import { AuthFlowController } from './controllers/auth-flow';
@@ -348,6 +348,8 @@ export class KimiTUI {
   private readonly migrateOnly: boolean;
   private readonly agentsViewServerLabelOverride: string | undefined;
   private readonly agentsViewExitGuard: (() => Promise<number>) | undefined;
+  /** Serializes agents-view attaches — see attachAgentsViewSession. */
+  private agentsViewAttachInFlight = false;
   /**
    * Roster grouping mode (A6): seeded once from the startup `tuiConfig` (the
    * same "read once at process start, mutate in memory, `save*` writes
@@ -2090,7 +2092,7 @@ export class KimiTUI {
     this.state.terminal.setTitle(label);
   }
 
-  resetSessionRuntime(): void {
+  resetSessionRuntime(opts: { keepAgentsView?: boolean } = {}): void {
     this.aborted = false;
     this.streamingUI.discardPending();
     this.state.queuedMessages = [];
@@ -2099,7 +2101,13 @@ export class KimiTUI {
     this.streamingUI.resetToolUi();
     this.sessionEventHandler.resetRuntimeState();
     this.tasksBrowserController.close();
-    this.agentsViewController.close();
+    // Session switches (prepareSessionSwitch) pass keepAgentsView: the agents-
+    // view attach runs this reset while the roster is still the mounted tree,
+    // and the view's teardown is detachForAttach's job later in the attach —
+    // close() here would kill the roster subscription the attach badge feeds
+    // on, and (agents-view startup) setAgentsView(undefined) would stop the
+    // app mid-attach. Non-switch resets keep the close.
+    if (opts.keepAgentsView !== true) this.agentsViewController.close();
     this.btwPanelController.clear();
     // M7: a deferred approval/question mount belongs to the session that
     // raised it — carrying it across a switch means a later flush (e.g.
@@ -2178,8 +2186,15 @@ export class KimiTUI {
 
   /**
    * Agents-view attach: resume first — a failure leaves the view mounted with
-   * the error shown — then detach the view component and switch into the
-   * session's chat UI. The streaming/replay guards of {@link resumeSession}
+   * the error shown — then run the whole session switch while the roster is
+   * STILL the mounted tree (it only touches off-screen children), and only
+   * then detach the view: one visible transition straight into the target
+   * session's finished transcript, no stale-content or clear-screen
+   * intermediate frames. The resume wait is bounded (attachRpcTimeoutMs):
+   * the server-side materialization chain has unbounded `.ready` waits and
+   * the client HTTP layer no timeout of its own, so without a bound here a
+   * wedged resume means the Enter does nothing, forever, with zero feedback.
+   * The streaming/replay guards of {@link resumeSession}
    * are intentionally absent: on the wire transport the switch is a local
    * detach, so an in-flight turn on either session keeps running.
    *
@@ -2189,54 +2204,98 @@ export class KimiTUI {
    */
   private async attachAgentsViewSession(targetSessionId: string): Promise<void> {
     if (targetSessionId === this.state.appState.sessionId) {
-      this.agentsViewController.detachForAttach(targetSessionId);
+      this.agentsViewController.detachForAttach(targetSessionId, true);
       return;
     }
-    // R9 Q1a: a reply just fired at this row from the roster is
-    // fire-and-forget — wait for it to settle (success or the bounded
-    // give-up) before taking the attach snapshot, so the snapshot can never
-    // be taken before the reply is durably applied server-side.
-    await this.agentsViewController.awaitPendingReply(targetSessionId);
-    let session: Session;
-    try {
-      session = await this.harness.resumeSession({
-        id: targetSessionId,
-        replayTurnLimit: REPLAY_TURN_LIMIT,
-      });
-    } catch (error) {
-      const msg = formatErrorMessage(error);
-      // The view is still mounted here (detachForAttach hasn't run yet) —
-      // this.showError would render into the UI-tree child `show()` already
-      // detached, so it must go through the controller's own visible
-      // channel instead (see AgentsViewController.notifyUser's doc).
-      const message = `Failed to attach session ${targetSessionId}: ${msg}`;
-      this.agentsViewController.notifyUser(this.state.agentsView, message, { error: true });
+    // One attach at a time: the roster stays mounted and interactive
+    // through the whole wait below, so without this guard every Enter
+    // starts another attach and their session switches interleave
+    // (setSession's previous.close() racing another attach's setup).
+    if (this.agentsViewAttachInFlight) {
+      this.agentsViewController.notifyUser(
+        this.state.agentsView,
+        'An attach is already in progress.',
+      );
       return;
     }
-    this.agentsViewController.detachForAttach(targetSessionId);
+    this.agentsViewAttachInFlight = true;
     try {
-      await this.switchToSession(session, `Attached to session (${session.id}).`);
-    } catch (error) {
-      const msg = formatErrorMessage(error);
-      this.showError(`Failed to attach session ${targetSessionId}: ${msg}`);
-      // switchToSession can fail after this.session is already assigned
-      // (syncRuntimeState's live HTTP calls, replay, ...) — remount the view
-      // so the failure is recoverable regardless of cause, instead of
-      // leaving the half-attached state behind.
-      void this.agentsViewController.show();
+      // R9 Q1a: a reply just fired at this row from the roster is
+      // fire-and-forget — wait for it to settle (success or the bounded
+      // give-up) before taking the attach snapshot, so the snapshot can never
+      // be taken before the reply is durably applied server-side.
+      await this.agentsViewController.awaitPendingReply(targetSessionId);
+      let session: Session;
+      try {
+        session = await raceTimeout(
+          this.harness.resumeSession({
+            id: targetSessionId,
+            replayTurnLimit: REPLAY_TURN_LIMIT,
+          }),
+          attachRpcTimeoutMs(),
+        );
+      } catch (error) {
+        const msg = formatErrorMessage(error);
+        // The view is still mounted here (detachForAttach hasn't run yet) —
+        // this.showError would render into the UI-tree child `show()` already
+        // detached, so it must go through the controller's own visible
+        // channel instead (see AgentsViewController.notifyUser's doc).
+        const message = `Failed to attach session ${targetSessionId}: ${msg}`;
+        this.agentsViewController.notifyUser(this.state.agentsView, message, { error: true });
+        return;
+      }
+      try {
+        await this.prepareSessionSwitch(session);
+      } catch (error) {
+        const msg = formatErrorMessage(error);
+        // Same mounted-view error channel as the resume failure above —
+        // detachForAttach still hasn't run, so the roster never left the
+        // screen and there is nothing to remount.
+        const message = `Failed to attach session ${targetSessionId}: ${msg}`;
+        this.agentsViewController.notifyUser(this.state.agentsView, message, { error: true });
+        return;
+      }
+      // Everything the switch needs is ready and the roster never flickered:
+      // detach restores the chat subtree — already holding the TARGET
+      // session — and the replay (synchronous in practice) lands before the
+      // detach's queued forced render fires, so the first painted frame IS
+      // the final transcript, pinned to the bottom.
+      this.agentsViewController.detachForAttach(targetSessionId, false);
+      await this.finishSessionSwitch(session, `Attached to session (${session.id}).`);
+    } finally {
+      this.agentsViewAttachInFlight = false;
     }
   }
 
   async switchToSession(session: Session, statusMessage: string): Promise<void> {
-    // The editor is already focused and accepting input while this runs (the
-    // roster focuses it before handing over), but the session's event listener
-    // is not registered until startSubscription() at the end of this method,
-    // and receiveEvent() has no buffering — a prompt sent inside that window
-    // loses every event it produces, including its own turn.ended, so the
-    // spinner wedges forever with no reply and no error. Queue instead: the
-    // message stays visible as queued and goes out once the listener is live.
+    await this.prepareSessionSwitch(session);
+    await this.finishSessionSwitch(session, statusMessage);
+  }
+
+  /**
+   * Everything a session switch needs BEFORE its chat may go on screen:
+   * session assignment, runtime-state sync, dynamic commands, and the
+   * transcript reset. Kept separate from {@link finishSessionSwitch} so the
+   * agents-view attach can run this whole phase while the roster is still
+   * the mounted tree (all of it touches off-screen children only), then
+   * swap trees once — one visible transition, no stale-content or
+   * clear-screen intermediate frames.
+   *
+   * The editor is already focused and accepting input while this runs (the
+   * roster focuses it before handing over), but the session's event listener
+   * is not registered until startSubscription() in finishSessionSwitch,
+   * and receiveEvent() has no buffering — a prompt sent inside that window
+   * loses every event it produces, including its own turn.ended, so the
+   * spinner wedges forever with no reply and no error. Queue instead: the
+   * message stays visible as queued and goes out once the listener is live.
+   */
+  private async prepareSessionSwitch(session: Session): Promise<void> {
     this.deferUserMessages = true;
-    this.resetSessionRuntime();
+    // keepAgentsView: on the agents-view attach path the roster is still the
+    // mounted tree at this point — detachForAttach (later in the attach) owns
+    // its teardown. On every other switch path the view is detached/absent
+    // already, so the skip changes nothing there.
+    this.resetSessionRuntime({ keepAgentsView: true });
     await this.setSession(session);
     await this.syncRuntimeState(session);
     this.updateTerminalTitle();
@@ -2247,6 +2306,10 @@ export class KimiTUI {
       /* keep the switched session usable even if dynamic skills fail */
     }
     this.clearTranscriptAndRedraw();
+  }
+
+  /** Replay + subscription + status lines — see {@link prepareSessionSwitch}. */
+  private async finishSessionSwitch(session: Session, statusMessage: string): Promise<void> {
     try {
       await this.sessionReplay.hydrateFromReplay(session);
     } catch (error) {

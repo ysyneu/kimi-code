@@ -351,6 +351,21 @@ export function replyRpcTimeoutMs(): number {
 }
 
 /**
+ * Bounds an attach's resume RPC (`KimiTUI.attachAgentsViewSession`). The
+ * wire resume chain stacks several individually-bounded legs — the
+ * snapshot read (1× server bound), the WS subscribe ack (~2.5×), and the
+ * status route's cold materialization (root-stat + MCP-ready, 2×) — so
+ * this derives 6× the server bound plus the usual margin. Past it, the
+ * attach fails visibly instead of hanging forever on the materialization
+ * chain's own unbounded `.ready` waits, with the client HTTP layer
+ * carrying no timeout of its own.
+ */
+export function attachRpcTimeoutMs(): number {
+  const serverBound = parseIntegerEnv(process.env['KIMI_SNAPSHOT_TIMEOUT_MS'], DEFAULT_SERVER_TIMEOUT_MS, 100);
+  return 6 * serverBound + REPLY_RPC_TIMEOUT_MARGIN_MS;
+}
+
+/**
  * Bounds `promise` to `ms`: rejects with a timeout error if it hasn't
  * settled in time. Losing race leaves `promise` itself still running in the
  * background — this function doesn't observe it further, though a caller
@@ -360,7 +375,7 @@ export function replyRpcTimeoutMs(): number {
  * (`commands/config.ts`'s `withTimeout`, `cli/run-prompt.ts`'s
  * `raceWithTimeout`).
  */
-function raceTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+export function raceTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => {
@@ -849,11 +864,20 @@ export class AgentsViewController {
    * returns via the Task-4 key, which re-runs show().
    *
    * `sessionId` is the session being attached — the seeded badge excludes it.
-   * It must be passed in: at this point `appState.sessionId` still holds the
-   * PREVIOUS session (switchToSession runs after the detach), so reading the
-   * current id here would seed the badge with the wrong exclusion.
+   * It must be passed in: the attach path runs the session switch BEFORE this
+   * detach (so the restored tree already holds the target session), meaning
+   * `appState.sessionId` says nothing reliable about which session the badge
+   * should exclude at this point.
+   *
+   * `flushPanels`: pending approvals/questions belong to the session that was
+   * current when the view deferred them (handlers are per-session), so they
+   * may only surface when the user is returning to THAT session's chat (the
+   * re-enter path passes true). Attaching into a DIFFERENT session passes
+   * false — those entries stay deferred until the switch's unload cancels
+   * them (the same cancel semantics as any session switch with a pending
+   * approval).
    */
-  detachForAttach(sessionId: string): void {
+  detachForAttach(sessionId: string, flushPanels: boolean): void {
     const { state } = this.host;
     const view = state.agentsView;
     if (view === undefined || view.detached) return;
@@ -897,13 +921,7 @@ export class AgentsViewController {
     state.ui.requestRender(true);
     // Seed the attach-mode footer badge with the current roster counts.
     this.pushAttachBadge(view, sessionId);
-    // Pending approvals/questions belong to the CURRENT session (handlers
-    // are per-session), so only an attach into that session surfaces what
-    // the view deferred. Attaching into a DIFFERENT session must not pop
-    // this session's panel into the wrong chat — those entries stay
-    // deferred until the switch's unload cancels them (the same cancel
-    // semantics as any session switch with a pending approval).
-    if (sessionId === this.host.getCurrentSessionId()) this.host.flushDeferredPanels?.();
+    if (flushPanels) this.host.flushDeferredPanels?.();
   }
 
   /** Return-from-attach remount: same component, same roster, no reload. */

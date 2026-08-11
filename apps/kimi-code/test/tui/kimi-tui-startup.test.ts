@@ -2149,12 +2149,13 @@ describe('KimiTUI agents-view attach', () => {
     expect(driver.state.appState.sessionId).toBe('');
   });
 
-  it('a failed switchToSession after a successful resume remounts the agents view', async () => {
-    // I2: syncRuntimeState's getStatus()/getGoal() are live HTTP calls that
-    // can reject (server restart, network blip) after resumeSession already
-    // succeeded and the view detached for the attach — the view must
-    // remount instead of leaving a half-attached state (appState.model
-    // stuck at '', "LLM not set" gate on the next Enter) behind.
+  it('a failed session-switch after a successful resume never leaves the roster — the error flashes in place', async () => {
+    // syncRuntimeState's getStatus()/getGoal() are live HTTP calls that can
+    // reject (server restart, network blip) after resumeSession already
+    // succeeded. The switch runs BEFORE the detach now, so the roster is
+    // still the mounted tree: the error goes through the controller's own
+    // visible flash (same channel as a resume failure), not the host
+    // surface, and there is no detach/remount churn at all.
     const session = makeAttachSession('ses-attached');
     session.getStatus.mockRejectedValueOnce(new Error('status fetch failed'));
     const { harness } = makeAgentsHarness(session);
@@ -2164,9 +2165,91 @@ describe('KimiTUI agents-view attach', () => {
     driver.onOpenSession('ses-attached');
 
     await vi.waitFor(() => {
-      expect(showError).toHaveBeenCalledWith(expect.stringContaining('status fetch failed'));
+      expect(driver.state.agentsView?.flashMessage).toContain('status fetch failed');
     });
+    expect(showError).not.toHaveBeenCalled();
     expect(driver.state.agentsView?.detached).toBe(false);
+  });
+
+  it('the roster stays mounted through the whole resume/switch wait — one transition into the finished chat', async () => {
+    // The attach used to detach the roster FIRST (painting the previous
+    // session's stale chat), run its RPC awaits on that frame, then clear
+    // the screen again before replaying — two visible full-screen flashes
+    // per open. Now every await runs with the roster still mounted and the
+    // detach is the single transition, so a held-open resume must show the
+    // roster (not detached, no chat) until the very end.
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    let release: (() => void) | undefined;
+    harness.resumeSession.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = () => {
+            resolve(session);
+          };
+        }),
+    );
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(harness.resumeSession).toHaveBeenCalled();
+    });
+    // Mid-wait: the roster is still the mounted tree — the stale chat never
+    // got a frame.
+    expect(driver.state.agentsView?.detached).toBe(false);
+    expect(driver.session).toBeUndefined();
+
+    release!();
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(driver.state.agentsView?.detached).toBe(true);
+    expect(driver.session?.id).toBe('ses-attached');
+  });
+
+  it('a second open during an in-flight attach is refused — no second resume, and the guard resets afterwards', async () => {
+    // The roster stays interactive through the attach wait, so repeated
+    // Enters would otherwise stack concurrent attaches whose session
+    // switches interleave (setSession's previous.close() racing another
+    // attach's setup). The second open is refused with a flash instead.
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    let release: (() => void) | undefined;
+    harness.resumeSession.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = () => {
+            resolve(session);
+          };
+        }),
+    );
+
+    driver.onOpenSession('ses-attached');
+    await vi.waitFor(() => {
+      expect(harness.resumeSession).toHaveBeenCalledTimes(1);
+    });
+    driver.onOpenSession('ses-other');
+    await vi.waitFor(() => {
+      expect(driver.state.agentsView?.flashMessage).toContain('already in progress');
+    });
+    expect(harness.resumeSession).toHaveBeenCalledTimes(1);
+
+    release!();
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    // The guard cleared: a later open attaches normally.
+    driver.returnToAgentsView();
+    await vi.waitFor(() => {
+      expect(driver.state.agentsView?.detached).toBe(false);
+    });
+    driver.onOpenSession('ses-other');
+    await vi.waitFor(() => {
+      expect(harness.resumeSession).toHaveBeenCalledTimes(2);
+    });
   });
 
   it('re-entering the current session resurfaces its chat without resuming again', async () => {

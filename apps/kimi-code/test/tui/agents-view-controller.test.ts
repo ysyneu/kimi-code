@@ -3061,7 +3061,7 @@ describe('AgentsViewController — A2 optimistic dispatch placeholder', () => {
   it('B7: a first-turn failure after the attach hop reaches the host-level error surface, not the (now-unrenderable) roster flash', async () => {
     let ctrl: AgentsViewController | undefined;
     const b = await boot([summary('s1')], {
-      onOpenSession: (id) => ctrl?.detachForAttach(id),
+      onOpenSession: (id) => ctrl?.detachForAttach(id, false),
     });
     ctrl = b.controller;
     dir = b.homeDir;
@@ -4193,7 +4193,7 @@ describe('AgentsViewController — detach for attach', () => {
   it('detachForAttach unmounts the component and restores the saved children', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
-    b.controller.detachForAttach('s1');
+    b.controller.detachForAttach('s1', false);
     expect(b.view().detached).toBe(true);
     expect(b.ui.children).toEqual([SENTINEL_A, SENTINEL_B]);
     expect(b.ui.setFocus).toHaveBeenLastCalledWith(b.host.state.editor);
@@ -4206,14 +4206,14 @@ describe('AgentsViewController — detach for attach', () => {
     dir = b.homeDir;
     b.component().handleInput(CTRL_C);
     expect(b.view().pendingExitTimer).toBeDefined();
-    b.controller.detachForAttach('s1');
+    b.controller.detachForAttach('s1', false);
     expect(b.view().pendingExitTimer).toBeUndefined();
   });
 
   it('the roster subscription keeps reducing events while detached, without rendering', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
-    b.controller.detachForAttach('s1');
+    b.controller.detachForAttach('s1', false);
     b.ui.requestRender.mockClear();
     b.fake.emit({
       type: 'event.session.work_changed',
@@ -4230,7 +4230,7 @@ describe('AgentsViewController — detach for attach', () => {
   it('close while detached is a no-op — the subscription survives the runtime reset', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
-    b.controller.detachForAttach('s1');
+    b.controller.detachForAttach('s1', false);
     b.controller.close();
     expect(b.controller.isOpen).toBe(true);
     b.fake.emit({
@@ -4245,7 +4245,7 @@ describe('AgentsViewController — detach for attach', () => {
   it('show while detached remounts the same component over the live roster', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
-    b.controller.detachForAttach('s1');
+    b.controller.detachForAttach('s1', false);
     b.fake.emit({
       type: 'event.session.work_changed',
       sessionId: 's1',
@@ -4294,7 +4294,7 @@ describe('AgentsViewController — return-to-view origin (isOrigin)', () => {
   it('show(originSessionId) on a detached view remounts with that row bolded', async () => {
     const b = await boot([summary('s1'), summary('s2')]);
     dir = b.homeDir;
-    b.controller.detachForAttach('s1');
+    b.controller.detachForAttach('s1', false);
 
     await b.controller.show('s1');
 
@@ -4319,18 +4319,18 @@ describe('AgentsViewController — return-to-view origin (isOrigin)', () => {
     await b.controller.show('s1'); // no-op: view already mounted, not detached
     expect(b.view().originSessionId).toBeUndefined();
 
-    b.controller.detachForAttach('s2');
+    b.controller.detachForAttach('s2', false);
     expect(b.view().originSessionId).toBeUndefined();
   });
 
   it('a second return overwrites the origin with the newly backed-out-of session', async () => {
     const b = await boot([summary('s1'), summary('s2')]);
     dir = b.homeDir;
-    b.controller.detachForAttach('s1');
+    b.controller.detachForAttach('s1', false);
     await b.controller.show('s1');
     expect(b.view().originSessionId).toBe('s1');
 
-    b.controller.detachForAttach('s2');
+    b.controller.detachForAttach('s2', false);
     await b.controller.show('s2');
     expect(b.view().originSessionId).toBe('s2');
   });
@@ -4338,7 +4338,7 @@ describe('AgentsViewController — return-to-view origin (isOrigin)', () => {
   it('moving the roster selection (↑↓) leaves the origin untouched', async () => {
     const b = await boot([summary('s1'), summary('s2')]);
     dir = b.homeDir;
-    b.controller.detachForAttach('s1');
+    b.controller.detachForAttach('s1', false);
     await b.controller.show('s1');
     expect(b.view().originSessionId).toBe('s1');
 
@@ -4351,10 +4351,10 @@ describe('AgentsViewController — return-to-view origin (isOrigin)', () => {
   it('a remount recovery call without an origin argument (e.g. failed-attach retry) preserves the existing origin', async () => {
     const b = await boot([summary('s1'), summary('s2')]);
     dir = b.homeDir;
-    b.controller.detachForAttach('s1');
+    b.controller.detachForAttach('s1', false);
     await b.controller.show('s1');
     expect(b.view().originSessionId).toBe('s1');
-    b.controller.detachForAttach('s2');
+    b.controller.detachForAttach('s2', false);
 
     await b.controller.show(); // no explicit origin, e.g. a failure-recovery remount
 
@@ -4388,7 +4388,7 @@ describe('AgentsViewController — attach badge feed', () => {
     b.setAttachBadge.mockClear();
 
     // Attaching s2: the working s1 is an OTHER session and counts.
-    b.controller.detachForAttach('s2');
+    b.controller.detachForAttach('s2', false);
 
     expect(b.setAttachBadge).toHaveBeenCalledTimes(1);
     expect(b.setAttachBadge).toHaveBeenLastCalledWith({ agents: 1, awaiting: 0 });
@@ -4416,7 +4416,7 @@ describe('AgentsViewController — attach badge feed', () => {
     });
     b.setAttachBadge.mockClear();
 
-    b.controller.detachForAttach('s1');
+    b.controller.detachForAttach('s1', false);
 
     // s1 is excluded from the seed even though the host's current id is ''.
     expect(b.setAttachBadge).toHaveBeenCalledTimes(1);
@@ -4426,7 +4426,7 @@ describe('AgentsViewController — attach badge feed', () => {
   it('roster events while detached keep pushing live counts', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
-    b.controller.detachForAttach('s1');
+    b.controller.detachForAttach('s1', false);
     b.setAttachBadge.mockClear();
 
     b.fake.emit({
@@ -4457,7 +4457,7 @@ describe('AgentsViewController — attach badge feed', () => {
     });
     b.setAttachBadge.mockClear();
 
-    b.controller.detachForAttach('s1');
+    b.controller.detachForAttach('s1', false);
 
     // Only s2 counts — the attached s1 is on screen, not badge-worthy.
     expect(b.setAttachBadge).toHaveBeenLastCalledWith({ agents: 0, awaiting: 1 });
@@ -4491,7 +4491,7 @@ describe('AgentsViewController — attach badge feed', () => {
   it('returning to the view (remount) clears the badge', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
-    b.controller.detachForAttach('s1');
+    b.controller.detachForAttach('s1', false);
     b.setAttachBadge.mockClear();
 
     await b.controller.show();
