@@ -57,6 +57,7 @@ export function v2SummaryToSessionSummary(
     archived: summary.archived,
     metadata: summary.custom as JsonObject | undefined,
     additionalDirs: facts.additionalDirs,
+    lastTurnReason: summary.lastTurnReason,
   };
 }
 

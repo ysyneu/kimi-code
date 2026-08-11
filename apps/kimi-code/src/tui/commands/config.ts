@@ -52,11 +52,14 @@ function hasConversationHistory(host: SlashCommandHost): boolean {
   );
 }
 
-function currentTuiConfig(host: SlashCommandHost): TuiConfig {
+export function currentTuiConfig(
+  host: Pick<SlashCommandHost, 'state' | 'agentsViewGroupMode'>,
+): TuiConfig {
   return {
     theme: host.state.appState.theme,
     editorCommand: host.state.appState.editorCommand,
     disablePasteBurst: host.state.appState.disablePasteBurst ?? DEFAULT_TUI_CONFIG.disablePasteBurst,
+    cacheExpiryHint: host.state.appState.cacheExpiryHint ?? DEFAULT_TUI_CONFIG.cacheExpiryHint,
     notifications: host.state.appState.notifications,
     upgrade: host.state.appState.upgrade,
     // Every field this helper omits gets silently reset to the schema
@@ -64,6 +67,7 @@ function currentTuiConfig(host: SlashCommandHost): TuiConfig {
     // save (each spreads this snapshot into `saveTuiConfig`) — agentsView
     // must be threaded through the same as every other persisted field.
     agentsView: { groupMode: host.agentsViewGroupMode() },
+    statusLine: host.state.appState.statusLine ?? DEFAULT_TUI_CONFIG.statusLine,
   };
 }
 
@@ -98,6 +102,13 @@ export async function handlePlanCommand(host: SlashCommandHost, args: string): P
     return;
   }
 
+  // The session may already be in the requested mode (e.g. it was created
+  // with config.defaultPlanMode applied), and re-entering plan mode throws.
+  if (host.state.appState.planMode === enabled) {
+    host.showNotice(`Plan mode is already ${enabled ? 'on' : 'off'}`);
+    return;
+  }
+
   await applyPlanMode(host, session, enabled);
 }
 
@@ -122,10 +133,12 @@ async function applyPlanMode(host: SlashCommandHost, session: Session, enabled: 
 
 export async function handleYoloCommand(host: SlashCommandHost, args: string): Promise<void> {
   const session = host.session;
-  if (session === undefined) {
+  if (session === undefined && !host.engineV2) {
     host.showError(NO_ACTIVE_SESSION_MESSAGE);
     return;
   }
+  // v2 session-less: the chosen mode is recorded in appState and passed to the
+  // lazy-created session; apply the runtime permission only when one exists.
 
   const subcmd = args.trim().toLowerCase();
   const currentMode = host.state.appState.permissionMode;
@@ -135,7 +148,7 @@ export async function handleYoloCommand(host: SlashCommandHost, args: string): P
       host.showNotice('YOLO mode is already on');
       return;
     }
-    await session.setPermission('yolo');
+    await session?.setPermission('yolo');
     host.setAppState({ permissionMode: 'yolo' });
     host.showNotice('YOLO mode: ON', 'Tool actions auto-approved; the agent may still ask you questions.');
     return;
@@ -146,7 +159,7 @@ export async function handleYoloCommand(host: SlashCommandHost, args: string): P
       host.showNotice('YOLO mode is already off');
       return;
     }
-    await session.setPermission('manual');
+    await session?.setPermission('manual');
     host.setAppState({ permissionMode: 'manual' });
     host.showNotice('YOLO mode: OFF');
     return;
@@ -154,11 +167,11 @@ export async function handleYoloCommand(host: SlashCommandHost, args: string): P
 
   // toggle
   if (currentMode === 'yolo') {
-    await session.setPermission('manual');
+    await session?.setPermission('manual');
     host.setAppState({ permissionMode: 'manual' });
     host.showNotice('YOLO mode: OFF');
   } else {
-    await session.setPermission('yolo');
+    await session?.setPermission('yolo');
     host.setAppState({ permissionMode: 'yolo' });
     host.showNotice('YOLO mode: ON', 'Tool actions auto-approved; the agent may still ask you questions.');
   }
@@ -166,10 +179,12 @@ export async function handleYoloCommand(host: SlashCommandHost, args: string): P
 
 export async function handleAutoCommand(host: SlashCommandHost, args: string): Promise<void> {
   const session = host.session;
-  if (session === undefined) {
+  if (session === undefined && !host.engineV2) {
     host.showError(NO_ACTIVE_SESSION_MESSAGE);
     return;
   }
+  // v2 session-less: the chosen mode is recorded in appState and passed to the
+  // lazy-created session; apply the runtime permission only when one exists.
 
   const subcmd = args.trim().toLowerCase();
   const currentMode = host.state.appState.permissionMode;
@@ -179,7 +194,7 @@ export async function handleAutoCommand(host: SlashCommandHost, args: string): P
       host.showNotice('Auto mode is already on');
       return;
     }
-    await session.setPermission('auto');
+    await session?.setPermission('auto');
     host.setAppState({ permissionMode: 'auto' });
     host.showNotice('Auto mode: ON', 'All actions auto-approved; the agent will not ask you questions.');
     return;
@@ -190,7 +205,7 @@ export async function handleAutoCommand(host: SlashCommandHost, args: string): P
       host.showNotice('Auto mode is already off');
       return;
     }
-    await session.setPermission('manual');
+    await session?.setPermission('manual');
     host.setAppState({ permissionMode: 'manual' });
     host.showNotice('Auto mode: OFF');
     return;
@@ -198,11 +213,11 @@ export async function handleAutoCommand(host: SlashCommandHost, args: string): P
 
   // toggle
   if (currentMode === 'auto') {
-    await session.setPermission('manual');
+    await session?.setPermission('manual');
     host.setAppState({ permissionMode: 'manual' });
     host.showNotice('Auto mode: OFF');
   } else {
-    await session.setPermission('auto');
+    await session?.setPermission('auto');
     host.setAppState({ permissionMode: 'auto' });
     host.showNotice('Auto mode: ON', 'All actions auto-approved; the agent will not ask you questions.');
   }
@@ -468,6 +483,14 @@ async function performModelSwitch(
   effort: ThinkingEffort,
   persist: boolean,
 ): Promise<void> {
+  let session = host.session;
+  if (session === undefined && host.engineV2) {
+    // A first prompt may still be inside lazy creation: wait it out so the
+    // switch lands on the new session instead of being overwritten by its
+    // assembly.
+    await host.waitForLazyCreation();
+    session = host.session;
+  }
   if (host.state.appState.streamingPhase !== 'idle') {
     host.showError('Cannot switch models while streaming — press Esc or Ctrl-C first.');
     return;
@@ -481,7 +504,6 @@ async function performModelSwitch(
   let effectiveAlias = alias;
   let effectiveEffort = effort;
 
-  const session = host.session;
   try {
     if (session === undefined && runtimeChanged) {
       await host.authFlow.activateModelAfterLogin(alias, effort);
@@ -884,7 +906,14 @@ async function applyPermissionChoice(host: SlashCommandHost, mode: PermissionMod
   }
 
   try {
-    await host.requireSession().setPermission(mode);
+    if (host.session !== undefined) {
+      await host.session.setPermission(mode);
+    } else if (!host.engineV2) {
+      host.showError(NO_ACTIVE_SESSION_MESSAGE);
+      return;
+    }
+    // v2 session-less: the chosen mode is recorded in appState and passed to
+    // the lazy-created session.
   } catch (error) {
     const msg = formatErrorMessage(error);
     host.showError(`Failed to set permission mode: ${msg}`);

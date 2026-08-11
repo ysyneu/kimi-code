@@ -8,6 +8,8 @@ export const CTRL_D_HINT = 'Press Ctrl+D again to exit';
 export const CTRL_C_HINT = 'Press Ctrl+C again to exit';
 export const MAIN_AGENT_ID = 'main';
 export const OAUTH_LOGIN_REQUIRED_STARTUP_NOTICE = 'OAuth login expired. Send /login to login.';
+export const SESSIONLESS_STARTUP_NOTICE =
+  'No session yet — one will be created on your first message.';
 export const EXIT_CONFIRM_WINDOW_MS = 1500;
 // B1: how long the agents view's roster leaves a Ctrl+X row-delete armed
 // (`ctrl+x again to delete`) before auto-cancelling. 2000ms per the parity

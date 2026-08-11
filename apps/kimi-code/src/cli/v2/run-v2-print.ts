@@ -13,7 +13,7 @@
  *   - applies the print-mode background policy (config-driven, v1-aligned:
  *     `exit` / `drain` / `steer`) before exiting.
  *
- * Selected by `runPrompt` when `KIMI_CODE_EXPERIMENTAL_FLAG` is set.
+ * Selected by `runPrompt` unless `KIMI_CODE_LEGACY_FLAG` is truthy.
  */
 
 import { readFile } from 'node:fs/promises';
@@ -32,18 +32,16 @@ import {
   IOAuthToolkit,
   ISessionCronService,
   ISessionIndex,
-  IWorkspaceHandlerService,
+  ISessionLifecycleService,
   IWorkspaceLifecycleService,
   ITelemetryService,
   PRINT_MAX_TURNS_DEFAULT,
   PRINT_WAIT_CEILING_S_DEFAULT,
-  agentCatalogRuntimeOptionsSeed,
   applyPrintModeConfigDefaults,
   bootstrap,
   createCloudAppender,
   ensureMainAgent,
   resumeSessionById,
-  hostRequestHeadersSeed,
   logSeed,
   parseAgentFileText,
   resolveAgentPath,
@@ -51,7 +49,7 @@ import {
   resolveKimiHome,
   resolveLoggingConfig,
   resolvePrintBackgroundMode,
-  skillCatalogRuntimeOptionsSeed,
+  setClampedTimeout,
   type DomainEvent,
   type IAgentScopeHandle,
   type ISessionScopeHandle,
@@ -130,18 +128,24 @@ export async function runV2Print(
   const identity = createKimiCodeHostIdentity(version);
   const hostHeaders = createKimiDefaultHeaders({ homeDir, ...identity });
 
-  const { app } = bootstrap({ homeDir, clientIdentity: identity }, [
-    ...logSeed(logging),
-    ...hostRequestHeadersSeed(hostHeaders),
-    // `--skillsDir` (v1 print parity): explicit skill dirs replace default
-    // user / project discovery for this process.
-    ...skillCatalogRuntimeOptionsSeed(opts.skillsDirs),
-    // `--agent-file`: explicit agent definition files, registered with the
-    // highest-precedence source for this process. Passed through unresolved —
-    // the engine expands `~` and resolves relative paths against the session
-    // workDir (mirroring `--skills-dir`).
-    ...agentCatalogRuntimeOptionsSeed(opts.agentFiles),
-  ]);
+  const { app } = bootstrap(
+    {
+      homeDir,
+      clientIdentity: identity,
+      args: {
+        requestHeaders: hostHeaders,
+        // `--skillsDir` (v1 print parity): explicit skill dirs replace default
+        // user / project discovery for this process.
+        skillDirs: opts.skillsDirs,
+        // `--agent-file`: explicit agent definition files, registered with the
+        // highest-precedence source for this process. Passed through unresolved —
+        // the engine expands `~` and resolves relative paths against the session
+        // workDir (mirroring `--skills-dir`).
+        agentFiles: opts.agentFiles,
+      },
+    },
+    [...logSeed(logging)],
+  );
   const auth = app.accessor.get(IOAuthToolkit);
 
   const configService = app.accessor.get(IConfigService);
@@ -327,8 +331,7 @@ async function resolveNativeSession(
   };
 
   if (opts.session !== undefined) {
-    const page = await index.list({});
-    const target = page.items.find((summary) => summary.id === opts.session);
+    const target = await index.get(opts.session);
     if (target === undefined) {
       throw new Error(`Session "${opts.session}" not found.`);
     }
@@ -355,7 +358,7 @@ async function resolveNativeSession(
   }
 
   if (opts.continue) {
-    const page = await index.list({});
+    const page = await index.listRecent({});
     const previous = page.items.find((summary) => summary.cwd === workDir);
     if (previous !== undefined) {
       const session = await resumeById(previous.id);
@@ -377,7 +380,7 @@ async function resolveNativeSession(
 
   const model = requireConfiguredModel(opts.model, defaultModel);
   const handler = await workspaceLifecycle.handlerFor({ root: workDir });
-  const session = await handler.accessor.get(IWorkspaceHandlerService).create({
+  const session = await handler.accessor.get(ISessionLifecycleService).create({
     workDir,
     additionalDirs: opts.addDirs?.length ? opts.addDirs : undefined,
     mainAgentBinding: {
@@ -619,8 +622,13 @@ export function createPrintTurnEndings(): PrintTurnEndings & {
             // oxlint-disable-next-line promise/no-multiple-resolved -- `settled` guards the single resolve; the rule cannot see it
             resolve(value);
           };
+          // A delay beyond the host timer ceiling (an explicit
+          // `print_wait_ceiling_s` or a far-future cron fire can still reach
+          // it) is clamped by `setClampedTimeout`, so the timer can expire
+          // early: the loop below treats that as a chunk boundary and
+          // re-arms against the real deadline.
           const timer = Number.isFinite(ms)
-            ? setTimeout(() => {
+            ? setClampedTimeout(() => {
                 settle(null);
               }, ms)
             : undefined;
@@ -634,7 +642,8 @@ export function createPrintTurnEndings(): PrintTurnEndings & {
         const ms = deadlineAt - Date.now();
         if (ms <= 0) return null;
         const ending = await waitOnce(ms);
-        if (ending === null) return null;
+        // Timer-chunk boundary, not the real deadline: keep waiting.
+        if (ending === null) continue;
         if (ending.turnId !== skipTurnId) return ending;
         // The skipped turn's own ending: keep waiting within the same budget.
       }

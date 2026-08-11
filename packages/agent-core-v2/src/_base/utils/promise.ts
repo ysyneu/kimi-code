@@ -3,7 +3,13 @@
  * value after a delay (clearable); `raceTimeout` is its reject-on-timeout
  * counterpart, for callers that want a clear error instead of a fallback
  * value when a promise doesn't settle in time.
+ *
+ * The timer goes through `setClampedTimeout`, so huge ("effectively
+ * unbounded") timeouts still mean a long wait instead of overflowing into an
+ * immediate fire.
  */
+
+import { setClampedTimeout } from './timer';
 
 const NEVER = new Promise<never>(() => {});
 
@@ -20,7 +26,7 @@ export function timeoutOutcome<Outcome>(
     timeoutMs === undefined || timeoutMs <= 0
       ? NEVER
       : new Promise((resolve) => {
-          timeout = setTimeout(() => {
+          timeout = setClampedTimeout(() => {
             timeout = undefined;
             resolve(outcome);
           }, timeoutMs);

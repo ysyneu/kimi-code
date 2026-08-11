@@ -24,6 +24,7 @@ export const sessionMetaSchema = z.object({
   title: z.string().optional(),
   isCustomTitle: z.boolean().optional(),
   lastPrompt: z.string().optional(),
+  lastAssistantText: z.string().optional(),
   createdAt: z.number(),
   updatedAt: z.number(),
   archived: z.boolean(),
@@ -31,6 +32,7 @@ export const sessionMetaSchema = z.object({
   forkedFrom: z.string().optional(),
   agents: z.record(z.string(), agentMetaSchema).optional(),
   custom: z.record(z.string(), z.unknown()).optional(),
+  lastTurnReason: z.enum(['completed', 'cancelled', 'failed']).optional(),
 });
 
 /** `Partial<Omit<SessionMeta, 'id' | 'createdAt'>>` — every key optional. */
@@ -39,12 +41,14 @@ export const sessionMetaPatchSchema = z.object({
   title: z.string().optional(),
   isCustomTitle: z.boolean().optional(),
   lastPrompt: z.string().optional(),
+  lastAssistantText: z.string().optional(),
   updatedAt: z.number().optional(),
   archived: z.boolean().optional(),
   cwd: z.string().optional(),
   forkedFrom: z.string().optional(),
   agents: z.record(z.string(), agentMetaSchema).optional(),
   custom: z.record(z.string(), z.unknown()).optional(),
+  lastTurnReason: z.enum(['completed', 'cancelled', 'failed']).optional(),
 });
 
 /** `keyof SessionMeta` — keep in sync with `sessionMetaSchema`. */
@@ -54,6 +58,7 @@ export const sessionMetaKeySchema = z.enum([
   'title',
   'isCustomTitle',
   'lastPrompt',
+  'lastAssistantText',
   'createdAt',
   'updatedAt',
   'archived',
@@ -61,6 +66,7 @@ export const sessionMetaKeySchema = z.enum([
   'forkedFrom',
   'agents',
   'custom',
+  'lastTurnReason',
 ]);
 
 export const sessionMetadataChangedEventSchema = z.object({

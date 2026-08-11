@@ -1,29 +1,32 @@
 /**
- * `profile` domain (L4) — system-prompt context assembly.
+ * `profile` domain — system-prompt context assembly.
  *
  * Loads the AGENTS.md instruction hierarchy (user-level brand + generic files,
  * then project-level files from the project root down to the cwd — the root
- * discovered through the `git` domain's work-tree probe) and assembles
- * the {@link SystemPromptContext} bag consumed by `IAgentProfileService.useProfile`.
- * `agentsMdWatchRoots` exposes the watch plan for the probed file set so the
- * Workspace-scope `workspaceInstructions` service can watch exactly what the
- * loader reads, and `prepareSystemPromptContext` accepts a
- * `preloadedAgentsMd` snapshot so the
- * agent-side profile service can inject that workspace snapshot instead of
- * re-reading the files.
+ * discovered through a git work-tree probe) and assembles
+ * the {@link SystemPromptContext} bag.
+ * `agentsMdWatchRoots` exposes the watch plan for the probed file set, and
+ * `prepareSystemPromptContext` accepts a `preloadedAgentsMd` snapshot so the
+ * caller can inject an already-read snapshot instead of re-reading the files.
  *
  * Runs on top of the os `IHostFileSystem` (for `readText` / `stat` / `readdir`)
  * plus the host's `homeDir` — supplied together as a small `ProfileContextDeps`
  * bag threaded through the helpers.
  *
- * Port of v1 `packages/agent-core/src/profile/context.ts`. The combined
- * AGENTS.md content is injected in full; when it exceeds the soft
- * {@link AGENTS_MD_RECOMMENDED_MAX_BYTES} budget a visible `agentsMdWarning`
- * is produced (surfaced through `getSessionWarnings`) instead of silently
- * truncating.
+ * The combined AGENTS.md content is injected in full; when it exceeds the
+ * soft {@link AGENTS_MD_RECOMMENDED_MAX_BYTES} budget a visible
+ * `agentsMdWarning` is produced instead of silently truncating.
+ *
+ * The discovered-file list is returned alongside the content as `paths`
+ * (surfaced as `agentsMdPaths`), and the per-directory candidate rules
+ * (`AGENTS_MD_PLAIN_NAMES` / `dotKimiAgentsMdPath` / `findAgentsMdInDir`)
+ * plus the root→leaf chain helpers (`findProjectRoot` / `dirsRootToLeaf`)
+ * are exported so discovery probes and injection never drift apart. Legacy
+ * restored prompts can recover their exact injected paths from the same
+ * rendered source annotations.
  */
 
-import { dirname, join, normalize } from 'pathe';
+import { basename, dirname, join, normalize } from 'pathe';
 
 import { findGitWorkTree } from '#/app/git/workTree';
 import type { IHostFileSystem } from '#/os/interface/hostFileSystem';
@@ -45,16 +48,13 @@ export type { ProfileContextDeps };
 export interface PreparedSystemPromptContext extends SystemPromptContext {
   readonly cwdListing?: string;
   readonly agentsMd?: string;
+  readonly agentsMdPaths?: readonly string[];
   readonly additionalDirsInfo?: string;
   readonly agentsMdWarning?: string;
 }
 
 export interface PrepareSystemPromptContextOptions {
   readonly additionalDirs?: readonly string[];
-  /**
-   * A pre-loaded AGENTS.md result (e.g. the workspace instructions snapshot).
-   * When provided, the loader is not re-run — the caller owns freshness.
-   */
   readonly preloadedAgentsMd?: LoadedAgentsMd;
 }
 
@@ -75,6 +75,7 @@ export async function prepareSystemPromptContext(
   return {
     cwdListing,
     agentsMd: agentsMdResult.content,
+    agentsMdPaths: agentsMdResult.paths,
     additionalDirsInfo,
     agentsMdWarning: agentsMdResult.warning,
   };
@@ -89,12 +90,77 @@ export async function loadAgentsMd(
   return result.content;
 }
 
-interface LoadedAgentsMd {
-  readonly content: string;
-  readonly warning: string | undefined;
+export async function loadAgentsMdDetailed(
+  deps: ProfileContextDeps,
+  workDir: string,
+  brandHome?: string,
+): Promise<LoadedAgentsMd> {
+  return loadAgentsMdForRoots(deps, brandHome, [workDir]);
 }
 
-export type { LoadedAgentsMd };
+export interface LoadedAgentsMd {
+  readonly content: string;
+  readonly warning: string | undefined;
+  readonly paths: readonly string[];
+}
+
+export const AGENTS_MD_PLAIN_NAMES = ['AGENTS.md', 'agents.md'] as const;
+
+export function dotKimiAgentsMdPath(dir: string): string {
+  return join(dir, '.kimi-code', 'AGENTS.md');
+}
+
+export function agentsMdCandidatePaths(dir: string): string[] {
+  return [dotKimiAgentsMdPath(dir), ...AGENTS_MD_PLAIN_NAMES.map((name) => join(dir, name))];
+}
+
+export function extractAgentsMdPathsFromSystemPrompt(systemPrompt: string): string[] {
+  const paths: string[] = [];
+  const seen = new Set<string>();
+  for (const match of systemPrompt.matchAll(/^<!-- From: (.+) -->$/gm)) {
+    const path = match[1];
+    if (
+      path === undefined ||
+      !AGENTS_MD_PLAIN_NAMES.some((candidate) => candidate === basename(path))
+    ) {
+      continue;
+    }
+    const normalized = normalize(path);
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    paths.push(normalized);
+  }
+  return paths;
+}
+
+export async function findAgentsMdInDir(
+  deps: { readonly fs: IHostFileSystem },
+  dir: string,
+): Promise<string[]> {
+  const found: string[] = [];
+  const dotKimi = dotKimiAgentsMdPath(dir);
+  if (await isNonEmptyFile(deps, dotKimi)) found.push(dotKimi);
+  for (const fileName of AGENTS_MD_PLAIN_NAMES) {
+    const candidate = join(dir, fileName);
+    if (await isNonEmptyFile(deps, candidate)) {
+      found.push(candidate);
+      break;
+    }
+  }
+  return found;
+}
+
+async function isNonEmptyFile(
+  deps: { readonly fs: IHostFileSystem },
+  path: string,
+): Promise<boolean> {
+  try {
+    const content = await deps.fs.readText(path, { errors: 'ignore' });
+    return content.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
 
 export async function loadAgentsMdForRoots(
   deps: ProfileContextDeps,
@@ -124,7 +190,7 @@ export async function loadAgentsMdForRoots(
 
   const genericDirs = [join(realHome, '.agents')];
   const genericFiles = genericDirs.flatMap((dir) =>
-    ['AGENTS.md', 'agents.md'].map((name) => join(dir, name)),
+    AGENTS_MD_PLAIN_NAMES.map((name) => join(dir, name)),
   );
   for (const file of genericFiles) {
     if (await collect(file)) break;
@@ -136,8 +202,8 @@ export async function loadAgentsMdForRoots(
     const dirs = dirsRootToLeaf(rootWorkDir, projectRoot);
 
     for (const dir of dirs) {
-      await collect(join(dir, '.kimi-code', 'AGENTS.md'));
-      for (const fileName of ['AGENTS.md', 'agents.md']) {
+      await collect(dotKimiAgentsMdPath(dir));
+      for (const fileName of AGENTS_MD_PLAIN_NAMES) {
         if (await collect(join(dir, fileName))) break;
       }
     }
@@ -153,20 +219,10 @@ export async function loadAgentsMdForRoots(
     );
   }
   const warning = loadWarnings.length > 0 ? loadWarnings.join('\n') : undefined;
-  return { content, warning };
+  const paths = discovered.map((file) => normalize(file.path));
+  return { content, warning, paths };
 }
 
-/**
- * The watch plan for {@link loadAgentsMdForRoots}: one entry per existing
- * watch root with the candidate instruction files beneath it (brand dir,
- * real home for the `.agents` generic files, and the project root for the
- * root→leaf `.kimi-code/AGENTS.md` / `AGENTS.md` / `agents.md` chain) —
- * regardless of existence or the first-existing-wins precedence the loader
- * applies, since a higher-precedence file appearing later must still
- * invalidate the snapshot. Consumers watch each root recursively and filter
- * events to the candidates (watching a missing file directly silently never
- * fires when its parent directory is missing too).
- */
 export interface AgentsMdWatchRoot {
   readonly root: string;
   readonly candidates: readonly string[];
@@ -213,7 +269,15 @@ async function loadAdditionalDirsInfo(
   return sections.join('\n\n');
 }
 
-function dirsRootToLeaf(workDir: string, projectRoot: string): string[] {
+export async function findProjectRoot(
+  deps: { readonly fs: IHostFileSystem },
+  workDir: string,
+): Promise<string> {
+  const rootWorkDir = normalize(workDir);
+  return (await findGitWorkTree(deps.fs, rootWorkDir))?.root ?? rootWorkDir;
+}
+
+export function dirsRootToLeaf(workDir: string, projectRoot: string): string[] {
   const dirs: string[] = [];
   let current = normalize(workDir);
 
@@ -255,7 +319,7 @@ async function readAgentFile(
   return { path, content };
 }
 
-async function pathExists(deps: ProfileContextDeps, path: string): Promise<boolean> {
+async function pathExists(deps: { readonly fs: IHostFileSystem }, path: string): Promise<boolean> {
   try {
     await deps.fs.lstat(path);
     return true;
@@ -264,11 +328,11 @@ async function pathExists(deps: ProfileContextDeps, path: string): Promise<boole
   }
 }
 
-async function entryExists(deps: ProfileContextDeps, path: string): Promise<boolean> {
+async function entryExists(deps: { readonly fs: IHostFileSystem }, path: string): Promise<boolean> {
   return pathExists(deps, path);
 }
 
-async function isFile(deps: ProfileContextDeps, path: string): Promise<boolean> {
+async function isFile(deps: { readonly fs: IHostFileSystem }, path: string): Promise<boolean> {
   try {
     const stat = await deps.fs.stat(path);
     return stat.isFile;

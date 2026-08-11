@@ -34,6 +34,7 @@ describe('TUI config', () => {
     const text = readFileSync(filePath, 'utf-8');
     expect(text).toContain('Client preferences for kimi-code.');
     expect(text).toContain('theme = "auto"');
+    expect(text).toContain('cache_expiry_hint = true');
     expect(text).toContain('command = ""');
     expect(text).toContain('[upgrade]');
     expect(text).toContain('auto_install = true');
@@ -60,6 +61,7 @@ auto_install = false
     expect(config).toEqual({
       theme: 'light',
       disablePasteBurst: false,
+      cacheExpiryHint: true,
       editorCommand: 'code --wait',
       notifications: { enabled: false, condition: 'always' },
       upgrade: { autoInstall: false },
@@ -77,6 +79,15 @@ disable_paste_burst = true
     expect(config.disablePasteBurst).toBe(true);
   });
 
+  it('parses cache_expiry_hint', () => {
+    const config = parseTuiConfig(`
+theme = "dark"
+cache_expiry_hint = false
+`);
+
+    expect(config.cacheExpiryHint).toBe(false);
+  });
+
   it('normalizes an empty editor command to auto-detect', () => {
     const config = parseTuiConfig(`
 [editor]
@@ -86,6 +97,7 @@ command = "   "
     expect(config).toEqual({
       theme: 'auto',
       disablePasteBurst: false,
+      cacheExpiryHint: true,
       editorCommand: null,
       notifications: { enabled: true, condition: 'unfocused' },
       upgrade: { autoInstall: true },
@@ -120,6 +132,7 @@ command = "   "
       {
         theme: 'light',
         disablePasteBurst: false,
+        cacheExpiryHint: true,
         editorCommand: 'vim',
         notifications: { enabled: false, condition: 'always' },
         upgrade: { autoInstall: false },
@@ -132,6 +145,7 @@ command = "   "
     expect(await loadTuiConfig(filePath)).toEqual({
       theme: 'light',
       disablePasteBurst: false,
+      cacheExpiryHint: true,
       editorCommand: 'vim',
       notifications: { enabled: false, condition: 'always' },
       upgrade: { autoInstall: false },
@@ -146,6 +160,7 @@ command = "   "
       {
         theme,
         disablePasteBurst: DEFAULT_TUI_CONFIG.disablePasteBurst,
+        cacheExpiryHint: DEFAULT_TUI_CONFIG.cacheExpiryHint,
         editorCommand: null,
         notifications: DEFAULT_TUI_CONFIG.notifications,
         upgrade: DEFAULT_TUI_CONFIG.upgrade,

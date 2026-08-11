@@ -1,5 +1,5 @@
 /**
- * `workspaceFs` domain (L3) — `IWorkspaceFsWatchService` implementation.
+ * `workspaceFs` domain — `IWorkspaceFsWatchService` implementation.
  *
  * Keeps ONE os `IHostFsWatchService` subscription on the handler root and
  * fans its raw events out to every `IWorkspaceFsWatchSubscription`: the
@@ -17,9 +17,11 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import ignore, { type Ignore } from 'ignore';
 
-import { Disposable, type IDisposable } from '#/_base/di/lifecycle';
+import { type IDisposable } from '#/_base/di/lifecycle';
+import { Service } from '#/_base/di/service';
 import { Emitter, type Event } from '#/_base/event';
-import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
+import { LifecycleScope } from '#/app/scopes';
+import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { ErrorCodes, Error2 } from '#/errors';
 import { IHostFileSystem } from '#/os/interface/hostFileSystem';
 import {
@@ -47,7 +49,7 @@ function readPositiveIntEnv(name: string, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
-export class WorkspaceFsWatchService extends Disposable implements IWorkspaceFsWatchService {
+export class WorkspaceFsWatchService extends Service implements IWorkspaceFsWatchService {
   declare readonly _serviceBrand: undefined;
 
   private readonly subscriptions = new Set<WorkspaceFsWatchSubscription>();
@@ -73,7 +75,6 @@ export class WorkspaceFsWatchService extends Disposable implements IWorkspaceFsW
     return subscription;
   }
 
-  /** Subscription → service: confinement validation + rel normalization. */
   normalizeWatchedPaths(paths: readonly string[]): Set<string> {
     const next = new Set<string>();
     for (const p of paths) {
@@ -83,7 +84,6 @@ export class WorkspaceFsWatchService extends Disposable implements IWorkspaceFsW
     return next;
   }
 
-  /** Subscription → service: a subscription's path set changed (or it disposed). */
   syncHandle(): void {
     for (const sub of this.subscriptions) {
       if (sub.hasPaths()) {
@@ -136,8 +136,6 @@ export class WorkspaceFsWatchService extends Disposable implements IWorkspaceFsW
   }
 
   override dispose(): void {
-    // `sub.dispose()` removes the subscription from the set; deleting the
-    // current element mid-iteration is safe for JS Sets.
     for (const sub of this.subscriptions) {
       sub.dispose();
     }

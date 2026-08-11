@@ -1,12 +1,11 @@
 /**
- * `workspaceToolPolicy` domain (L2) — verifies the capability-derived veto
+ * `workspaceToolPolicy` domain — verifies the capability-derived veto
  * set and the `ISessionToolPolicyGate` live read view the handler seeds into
  * every session.
  */
 
 import { afterEach, describe, expect, it } from 'vitest';
-
-import { LifecycleScope } from '#/_base/di/scope';
+import { LifecycleScope } from '#/app/scopes';
 import { createScopedTestHost, stubPair, type ScopedTestHost } from '#/_base/di/test';
 import { IWorkspaceContext } from '#/workspace/workspaceContext/workspaceContext';
 import { IWorkspaceToolPolicy } from '#/workspace/workspaceToolPolicy/workspaceToolPolicy';

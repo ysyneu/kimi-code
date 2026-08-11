@@ -139,7 +139,6 @@ describe('reduceContextTranscript', () => {
         time: 220,
       },
       { type: 'context.append_loop_event', event: { type: 'step.end', uuid: 'st1' }, time: 230 },
-      // No record time → undefined (falls back to session createdAt + index).
       { type: 'context.append_message', message: userMessage('u2') },
     ]);
 
@@ -189,6 +188,19 @@ describe('reduceContextTranscript', () => {
     ]);
 
     expect(texts(result)).toEqual(['keep me', 'kept answer']);
+  });
+
+  it('undo removes a post-anchor interruption reminder injection', () => {
+    const result = reduceContextTranscript([
+      appendMessage(userMessage('undo me', { kind: 'user' })),
+      appendMessage(
+        userMessage('interrupted notice', { kind: 'injection', variant: 'interruption' }),
+      ),
+      undo(1),
+    ]);
+
+    expect(texts(result)).toEqual([]);
+    expect(result.foldedLength).toBe(0);
   });
 
   it('undo stops at a compaction summary', () => {

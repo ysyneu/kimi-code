@@ -1,5 +1,5 @@
 /**
- * `undo` domain (L6) — `IAgentConversationUndoService` implementation.
+ * `undo` domain — `IAgentConversationUndoService` implementation.
  *
  * Owns idle conversation undo coordination and restored observable state.
  * Coordinates `contextMemory`, undo participants, `fullCompaction`,
@@ -15,8 +15,10 @@
  * reply, same as it can cut off its prompt).
  */
 
-import { Disposable, type IDisposable } from '#/_base/di/lifecycle';
-import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
+import { type IDisposable } from '#/_base/di/lifecycle';
+import { Service } from '#/_base/di/service';
+import { LifecycleScope } from '#/app/scopes';
+import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { ILogService } from '#/_base/log/log';
 import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
 import { IAgentConversationUndoParticipantRegistry } from '#/agent/contextMemory/conversationUndoParticipants';
@@ -54,7 +56,7 @@ declare module '#/app/event/eventBus' {
 }
 
 export class AgentConversationUndoService
-  extends Disposable
+  extends Service
   implements IAgentConversationUndoService
 {
   declare readonly _serviceBrand: undefined;
@@ -174,8 +176,6 @@ export class AgentConversationUndoService
     }
     const { depth, model } = this.checkpointDepth();
     if (depth >= turns) return;
-    // A compaction explains missing checkpoints (they are cleared at the
-    // boundary); without one, a checkpointed model failed to track an anchor.
     const fullCut = computeUndoCut(this.context.get(), Number.MAX_SAFE_INTEGER);
     const reason = fullCut.stoppedAtCompaction ? 'compaction_boundary' : 'checkpoint_lost';
     throw new Error2(

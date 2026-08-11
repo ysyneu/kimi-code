@@ -1,5 +1,5 @@
 /**
- * `workspaceProcess` domain (L2) — `ISessionProcessRunner` implementation.
+ * `workspaceProcess` domain — `ISessionProcessRunner` implementation.
  *
  * Resolves the default cwd from the handler's `IWorkspaceContext` (chdir is
  * gone, so the workspace root is the one fixed default) and delegates the
@@ -10,13 +10,13 @@
  * omitted we pass `undefined` so the child inherits `process.env` verbatim.
  *
  * Bound at Workspace scope — one runner per handler, shared by every session
- * of the workspace. The contract (`ISessionProcessRunner`) stays in the
- * session domain so Session/Agent consumers keep importing it without
- * crossing the Workspace-tier import ban; the Workspace-scope registration
- * reaches them through ordinary parent-scope resolution.
+ * of the workspace.
  */
 
-import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
+import { LifecycleScope } from '#/app/scopes';
+
+import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
+import { BugIndicatingError } from '#/errors';
 import { IHostProcessService } from '#/os/interface/hostProcess';
 import { type IProcess, ISessionProcessRunner, type ProcessExecOptions } from '#/session/process/processRunner';
 import { IWorkspaceContext } from '#/workspace/workspaceContext/workspaceContext';
@@ -32,7 +32,7 @@ export class WorkspaceProcessRunnerService implements ISessionProcessRunner {
   async exec(args: readonly string[], options?: ProcessExecOptions): Promise<IProcess> {
     const command = args[0];
     if (command === undefined) {
-      throw new Error(
+      throw new BugIndicatingError(
         'WorkspaceProcessRunnerService.exec(): at least one argument (the command to run) is required.',
       );
     }

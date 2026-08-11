@@ -17,7 +17,7 @@ import {
   ISessionIndex,
   ISessionInteractionService,
   ISessionMetadata,
-  IWorkspaceHandlerService,
+  ISessionLifecycleService,
   IWorkspaceLifecycleService,
   LifecycleScope,
   SessionInteractionService,
@@ -417,6 +417,30 @@ describe('AgentTranscriptProjector', () => {
     expect(step.frames).toContainEqual(
       expect.objectContaining({ kind: 'text', text: 'partial' }),
     );
+  });
+
+  it('marks a user-cancelled turn with an interruption marker, but not programmatic aborts', () => {
+    const projector = new AgentTranscriptProjector('main');
+    const tx = new AgentTranscript('main');
+    const feed = (event: DomainEvent): void => void tx.apply(projector.map(event));
+
+    feed(ev({ type: 'turn.started', turnId: 0, origin: { kind: 'user' }, prompt: 'hi' }));
+    feed(
+      ev({ type: 'turn.ended', turnId: 0, reason: 'cancelled', interruptReason: 'user_cancelled' }),
+    );
+    feed(ev({ type: 'turn.started', turnId: 1, origin: { kind: 'user' }, prompt: 'again' }));
+    feed(ev({ type: 'turn.ended', turnId: 1, reason: 'cancelled', interruptReason: 'aborted' }));
+    feed(ev({ type: 'turn.started', turnId: 2, origin: { kind: 'user' }, prompt: 'legacy' }));
+    feed(ev({ type: 'turn.ended', turnId: 2, reason: 'cancelled' }));
+
+    const markers = tx
+      .getItems()
+      .filter((item): item is Extract<typeof item, { kind: 'marker' }> => item.kind === 'marker');
+    expect(markers).toHaveLength(1);
+    expect(markers[0]).toMatchObject({
+      marker: 'interruption',
+      payload: { turnId: 0, reason: 'user_cancelled' },
+    });
   });
 
   it('carries usage / finishReason / the full timing breakdown on turn.step.completed', () => {
@@ -1885,7 +1909,7 @@ describe('bindSessionTranscript', () => {
   }
 
   function fakeCoreWithAgents(interactions: SessionInteractionService, agents: FakeAgents): Scope {
-    const handlerService = {
+    const sessionLifecycle = {
       onDidCloseSession: () => ({ dispose: () => undefined }),
       onDidArchiveSession: () => ({ dispose: () => undefined }),
       get: (sid: string) => (sid === 's1' ? fakeSession(interactions, agents) : undefined),
@@ -1894,7 +1918,7 @@ describe('bindSessionTranscript', () => {
       id: 'ws',
       kind: LifecycleScope.Workspace,
       accessor: {
-        get: (t: unknown) => (t === IWorkspaceHandlerService ? handlerService : undefined),
+        get: (t: unknown) => (t === ISessionLifecycleService ? sessionLifecycle : undefined),
       },
       dispose: () => undefined,
     };

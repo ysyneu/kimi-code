@@ -50,9 +50,11 @@ describe('update preference commands', () => {
       theme: 'auto',
       editorCommand: null,
       disablePasteBurst: false,
+      cacheExpiryHint: true,
       notifications: { enabled: true, condition: 'unfocused' },
       upgrade: { autoInstall: false },
       agentsView: { groupMode: 'state' },
+      statusLine: { items: null, command: null },
     });
     expect(setAppState).toHaveBeenCalledWith({ upgrade: { autoInstall: false } });
     expect(track).toHaveBeenCalledWith('upgrade_preference_changed', { auto_install: false });

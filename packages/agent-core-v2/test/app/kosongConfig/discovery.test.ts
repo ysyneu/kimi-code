@@ -28,6 +28,8 @@ import { createScopedTestHost } from '#/_base/di/test';
 import { isError2 } from '#/_base/errors/errors';
 import { ILogService, type LogPayload } from '#/_base/log/log';
 import { IOAuthService } from '#/app/auth/auth';
+import { IAgentIdentity } from '#/app/agentIdentity/agentIdentity';
+import { IBootstrapService } from '#/app/bootstrap/bootstrap';
 import { IConfigService } from '#/app/config/config';
 import { ConfigRegistry } from '#/app/config/configService';
 import { IEventService } from '#/app/event/event';
@@ -37,7 +39,6 @@ import { MODEL_CATALOG_SECTION } from '#/app/kosongConfig/configSection';
 import { IKosongConfigService } from '#/app/kosongConfig/kosongConfig';
 import '#/app/kosongConfig/kosongConfigService';
 import '#/kosong/model/errors';
-import { HostRequestHeaders, IHostRequestHeaders } from '#/kosong/model/hostRequestHeaders';
 import {
   IModelService,
   type ModelRecord,
@@ -52,6 +53,8 @@ import '#/kosong/provider/providers/kimi/kimi.contrib';
 import '#/kosong/provider/providers/standard.contrib';
 
 import { StubConfigService, stubOAuthService, stubTokenProvider } from '../../kosong/stubs';
+import { stubBootstrap } from '../bootstrap/stubs';
+import { stubAgentIdentity } from '../agentIdentity/stubs';
 
 function stubEvents(): IEventService & { published: Array<{ type: string; payload: unknown }> } {
   const published: Array<{ type: string; payload: unknown }> = [];
@@ -100,14 +103,17 @@ async function createHost(
     [IOAuthService, oauth],
     [IEventService, events],
     [ILogService, stubLogService()],
-    [IHostRequestHeaders, new HostRequestHeaders({ 'User-Agent': 'kimi-test/1.0' })],
+    [
+      IBootstrapService,
+      stubBootstrap('/tmp/kimi-home', {}, { requestHeaders: { 'User-Agent': 'kimi-test/1.0' } }),
+    ],
+    [
+      IAgentIdentity,
+      stubAgentIdentity({ hostRequestHeaders: { 'User-Agent': 'kimi-test/1.0' } }),
+    ],
   ]);
   const providers = host.app.accessor.get(IProviderService);
   const models = host.app.accessor.get(IModelService);
-  // The real persistence bridge (DI-activated): refresh writes land in
-  // config, and the bridge's config → kosong sync is what carries them into
-  // the registries (exactly like production). Await its initialization so
-  // the event subscriptions are in place before the test refreshes.
   const bridge = host.app.accessor.get(IKosongConfigService);
   await bridge.ready;
   return {
@@ -197,7 +203,6 @@ describe('refreshProviderModels modelSource short-circuit', () => {
     });
     try {
       const result = await discovery.refreshProviderModels({ scope: 'all' });
-      // The registry provider refreshed; the static one is nowhere in the result.
       expect(result.changed).toEqual([
         { provider_id: 'acme', provider_name: 'Acme', added: 1, removed: 0 },
       ]);
@@ -207,10 +212,6 @@ describe('refreshProviderModels modelSource short-circuit', () => {
         expect.objectContaining({ type: 'event.model_catalog.changed' }),
       ]);
 
-      // Static provider, its model, the default selection, and its thinking
-      // all survived the orchestrator's whole-section writes. Providers and
-      // models land in the in-memory registries (the persistence bridge owns
-      // the config write-back); defaultModel/thinking go through config.
       const providerRecords = providers.list();
       expect(Object.keys(providerRecords).toSorted()).toEqual(['acme', 'static-p']);
       expect(providerRecords['static-p']).toEqual({ type: 'openai', modelSource: 'static', apiKey: 'sk-static' });
@@ -385,7 +386,6 @@ describe('refreshProviderModels write behavior', () => {
           headers: expect.objectContaining({ Authorization: 'Bearer sk-distributed-key' }),
         }),
       );
-      // The user-owned provider record survives; only model aliases are merged.
       expect(providers.list()['my-kimi']).toEqual({
         type: 'kimi',
         baseUrl,
@@ -394,7 +394,6 @@ describe('refreshProviderModels write behavior', () => {
       const modelRecords = models.list();
       expect(modelRecords['my-kimi/kimi-k2']?.displayName).toBe('Fresh K2');
       expect(modelRecords['my-kimi/kimi-k2.5']).toBeDefined();
-      // The surviving default selection is written back, not cleared.
       expect(config.get<string>('defaultModel')).toBe('my-kimi/kimi-k2');
     } finally {
       host.dispose();
@@ -437,10 +436,6 @@ describe('refreshProviderModels write behavior', () => {
       expect(result.changed).toEqual([
         { provider_id: 'my-kimi', provider_name: 'my-kimi', added: 1, removed: 1 },
       ]);
-      // The dropped alias was the default: an explicit undefined in the patch
-      // must clear the section instead of leaving the default dangling. It has
-      // to go through a replacing write — `set()`'s deepMerge would resolve
-      // undefined back to the stale base value.
       expect(config.get('defaultModel')).toBeUndefined();
       expect(config.get('thinking')).toBeUndefined();
       const modelRecords = models.list();
@@ -487,11 +482,6 @@ describe('refreshProviderModels write behavior', () => {
       defaultModel: 'acme/m1',
     });
     try {
-      // The orchestrator's host contract is two-phase (removeProvider, then
-      // setConfig). By the time the atomic write happens, the removal phase
-      // must NOT have touched the runtime registries — a reader (e.g. a
-      // profile bind racing the refresh) only ever sees the old catalog or
-      // the new one, never a half-removed one.
       let seenDuringWrite: { providers: readonly string[]; models: readonly string[] } | undefined;
       const originalReplaceSections = config.replaceSections.bind(config);
       vi.spyOn(config, 'replaceSections').mockImplementation(async (sections) => {
@@ -507,8 +497,6 @@ describe('refreshProviderModels write behavior', () => {
       expect(result.failed).toEqual([]);
       expect(seenDuringWrite).toEqual({ providers: ['acme'], models: ['acme/m1'] });
       expect(vi.mocked(config.replaceSections).mock.calls.length).toBe(1);
-      // After the write, config and the registries converge on the new state:
-      // the dropped alias (and its default selection) is gone everywhere.
       expect(providers.list()['acme']).toBeDefined();
       expect(models.list()['acme/m2']).toBeDefined();
       expect(models.list()['acme/m1']).toBeUndefined();

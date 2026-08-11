@@ -1,32 +1,27 @@
 /**
- * `workspaceSkillCatalog` domain (L3) — workspace-root `ISkillSource`
+ * `workspaceSkillCatalog` domain — workspace-root `ISkillSource`
  * producer.
  *
  * Discovers project skills from the handler's workspace root
  * (`workspaceContext.cwd`) through `ISkillDiscovery`, contributing them at
- * priority 30 (above user / extra / plugin / builtin). Watches the project
- * skill-root candidates (`.kimi-code/skills`, `.agents/skills` under the
- * project root, watched whether or not they exist yet) through
- * `hostFsWatch` and re-fires `onDidChange` debounced, so the catalog
- * re-scans THIS source only when project skill files change. Renamed from
- * the Session-scope `IWorkspaceFileSkillSource` (now
- * `IWorkspaceRootSkillSource`) to avoid the collision called out in the
- * workspace-domain plan. Bound at Workspace scope so every session of the
- * handler shares one scan.
+ * priority 30. Watches project skill-root candidates through `hostFsWatch`
+ * and emits debounced invalidations for source reloads. Bound at Workspace
+ * scope so every session of the handler shares one scan.
  */
 
 import { createDecorator, type ServiceIdentifier } from '#/_base/di/instantiation';
-import { Disposable } from '#/_base/di/lifecycle';
+import { Disposable, DisposableStore } from '#/_base/di/lifecycle';
 import { Emitter, type Event } from '#/_base/event';
-import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
+import { LifecycleScope } from '#/app/scopes';
+import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { TimeoutTimer } from '#/_base/utils/timer';
 import { subtreeWatchFilter } from '#/_base/utils/paths';
 import { IConfigService } from '#/app/config/config';
+import { IBootstrapService } from '#/app/bootstrap/bootstrap';
 import {
   MERGE_ALL_AVAILABLE_SKILLS_SECTION,
   type MergeAllAvailableSkillsConfig,
 } from '#/app/skillCatalog/configSection';
-import { ISkillCatalogRuntimeOptions } from '#/app/skillCatalog/skillCatalogRuntimeOptions';
 import { ISkillDiscovery } from '#/app/skillCatalog/skillDiscovery';
 import { projectRoots, projectSkillRootCandidates } from '#/app/skillCatalog/skillRoots';
 import {
@@ -48,6 +43,7 @@ export interface IWorkspaceRootSkillSource extends ISkillSource {
 export const IWorkspaceRootSkillSource: ServiceIdentifier<IWorkspaceRootSkillSource> =
   createDecorator<IWorkspaceRootSkillSource>('workspaceRootSkillSource');
 
+// NOTE: stays Disposable — its own 'config' collides with the Fiber
 export class WorkspaceRootSkillSource extends Disposable implements IWorkspaceRootSkillSource {
   declare readonly _serviceBrand: undefined;
 
@@ -56,13 +52,16 @@ export class WorkspaceRootSkillSource extends Disposable implements IWorkspaceRo
   private readonly onDidChangeEmitter = this._register(new Emitter<void>());
   readonly onDidChange: Event<void> = this.onDidChangeEmitter.event;
   private readonly watchDebounce = this._register(new TimeoutTimer());
+  private readonly watchResources = this._register(new DisposableStore());
   private readonly watchReady: Promise<void>;
+  private activeWatchResources: DisposableStore | undefined;
+  private watchSignature: string | undefined;
 
   constructor(
     @ISkillDiscovery private readonly discovery: ISkillDiscovery,
     @IWorkspaceContext private readonly workspace: IWorkspaceContext,
     @IConfigService private readonly config: IConfigService,
-    @ISkillCatalogRuntimeOptions private readonly runtimeOptions: ISkillCatalogRuntimeOptions,
+    @IBootstrapService private readonly bootstrap: IBootstrapService,
     @IHostFsWatchService private readonly fsWatch: IHostFsWatchService,
   ) {
     super();
@@ -71,38 +70,60 @@ export class WorkspaceRootSkillSource extends Disposable implements IWorkspaceRo
         if (event.domain === MERGE_ALL_AVAILABLE_SKILLS_SECTION) this.onDidChangeEmitter.fire();
       }),
     );
-    this.watchReady = this.watchProjectSkillRoots();
+    this.watchReady = this.updateProjectSkillRootWatch([]).then(() => undefined);
   }
 
   async load(): Promise<SkillContribution> {
-    // The watch attaches before the first scan returns, so a change landing
-    // right after the scan cannot slip between the two.
     await this.watchReady;
-    if ((this.runtimeOptions.explicitDirs?.length ?? 0) > 0) {
+    if ((this.bootstrap.args.skillDirs?.length ?? 0) > 0) {
       return { skills: [] };
     }
     await this.config.ready;
     const mergeAllAvailableSkills =
       this.config.get<MergeAllAvailableSkillsConfig>(MERGE_ALL_AVAILABLE_SKILLS_SECTION) ?? true;
-    return this.discovery.discover(
-      await projectRoots(this.workspace.cwd, { mergeAllAvailableSkills }),
-    );
+    const discover = async () =>
+      this.discovery.discover(
+        await projectRoots(this.workspace.cwd, { mergeAllAvailableSkills }),
+      );
+    let contribution = await discover();
+    while (await this.updateProjectSkillRootWatch(contribution.scannedDirectories)) {
+      contribution = await discover();
+    }
+    return contribution;
   }
 
-  private async watchProjectSkillRoots(): Promise<void> {
-    // Watch the project root recursively, pruned to the skill-root
-    // candidates: watching a candidate directory directly never fires when
-    // its parent (`.kimi-code` / `.agents`) does not exist yet either.
+  private async updateProjectSkillRootWatch(
+    scannedDirectories: readonly string[],
+  ): Promise<boolean> {
     const { projectRoot, candidates } = await projectSkillRootCandidates(this.workspace.cwd);
+    const signature = [...scannedDirectories].toSorted().join('\0');
+    if (signature === this.watchSignature) return false;
+    const resources = this.watchResources.add(new DisposableStore());
     const handle = this.fsWatch.watch(projectRoot, {
-      ignored: subtreeWatchFilter(projectRoot, candidates),
+      ignored: subtreeWatchFilter(projectRoot, candidates, {
+        scannedDirectories,
+        keepEntryFile: 'SKILL.md',
+      }),
+      signal: true,
     });
-    this._register(handle);
-    this._register(
+    resources.add(handle);
+    resources.add(
       handle.onDidChange(() => {
         this.watchDebounce.cancelAndSet(() => this.onDidChangeEmitter.fire(), WATCH_DEBOUNCE_MS);
       }),
     );
+    try {
+      await handle.ready;
+    } catch (error) {
+      this.watchResources.delete(resources);
+      throw error;
+    }
+    if (this.watchResources.isDisposed) return false;
+    const previous = this.activeWatchResources;
+    this.activeWatchResources = resources;
+    this.watchSignature = signature;
+    if (previous !== undefined) this.watchResources.delete(previous);
+    return true;
   }
 }
 
