@@ -1361,8 +1361,10 @@ describe('SDKRpcClientWire degrade surface', () => {
     await rpc.start();
     const created = await rpc.createSession({ workDir: cwd });
     // A schema rejection would surface here as an envelope error.
-    await rpc.setPermission({ sessionId: created.id, mode: 'manual' });
-    await rpc.setPlanMode({ sessionId: created.id, enabled: true });
+    await expect(
+      rpc.setPermission({ sessionId: created.id, mode: 'manual' }),
+    ).resolves.toBeUndefined();
+    await expect(rpc.setPlanMode({ sessionId: created.id, enabled: true })).resolves.toBeUndefined();
     await rpc.close();
   });
 });

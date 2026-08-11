@@ -3920,12 +3920,16 @@ describe('AgentsViewController — workspace trust', () => {
         probe = p;
       },
     });
-    for (let i = 0; i < 100 && (resolveTrust === undefined || resolveWarm === undefined); i++) {
-      await flush();
-    }
     // Both warm-ups are in flight — nothing may be mounted or painted yet.
-    expect(resolveTrust).toBeDefined();
-    expect(resolveWarm).toBeDefined();
+    // Poll instead of counting flushes: the wire boot does real fs I/O and a
+    // server bind whose turn count varies with machine load (CI).
+    await vi.waitFor(
+      () => {
+        expect(resolveTrust).toBeDefined();
+        expect(resolveWarm).toBeDefined();
+      },
+      { timeout: 5000, interval: 20 },
+    );
     expect(probe?.state.agentsView).toBeUndefined();
     expect(probe?.ui.setFocus).not.toHaveBeenCalled();
     resolveTrust!(true);

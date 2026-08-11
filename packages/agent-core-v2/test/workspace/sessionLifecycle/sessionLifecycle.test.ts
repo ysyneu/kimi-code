@@ -1348,7 +1348,7 @@ describe('SessionLifecycleService', () => {
     await svc.close('s1');
   });
 
-  it('hides a session from get/list until its resume finishes', async () => {
+  it('hides a session from get/list until the main agent materializes', async () => {
     let releaseMainAgent: ((handle: IAgentScopeHandle) => void) | undefined;
     const mainAgent = new Promise<IAgentScopeHandle>((resolve) => {
       releaseMainAgent = resolve;

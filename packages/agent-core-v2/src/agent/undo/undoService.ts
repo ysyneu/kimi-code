@@ -81,7 +81,9 @@ export class AgentConversationUndoService
   ) {
     super();
     this._register(
-      this.eventBus.subscribe('turn.ended', () => this.reconcileLastAssistantTextSafely()),
+      this.eventBus.subscribe('turn.ended', () => {
+        void this.reconcileLastAssistantTextSafely();
+      }),
     );
   }
 

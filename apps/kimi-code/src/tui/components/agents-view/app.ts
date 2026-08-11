@@ -489,7 +489,7 @@ export class AgentsViewApp extends Container implements Focusable {
         this.rename = undefined;
         this.props.onRenameSubmit(rename.id, rename.original);
       } else if (matchesKey(data, Key.backspace)) {
-        rename.text = [...rename.text].slice(0, -1).join('');
+        rename.text = Array.from(rename.text).slice(0, -1).join('');
       } else if (isPrintableChar(k)) {
         rename.text += k;
       }
