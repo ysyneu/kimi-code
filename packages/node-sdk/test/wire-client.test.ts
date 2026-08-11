@@ -1255,8 +1255,8 @@ describe('SDKRpcClientWire exportSession', () => {
 
 // ---------------------------------------------------------------------------
 // SDKRpcClientWire degrade surface: empty collections for surfaces kap-server
-// has no routes for, deferred
-// setPermission riding the next prompt/steer, and model/profile passthrough.
+// has no routes for, immediate profile-route setPermission/setPlanMode, and
+// model/profile passthrough.
 // Body assertions stub at the WireHttpClient.submitPrompt boundary — the body
 // object it receives is stringified verbatim into the HTTP request
 // (WireHttpClient.request), so recording it IS inspecting the HTTP body.
@@ -1292,78 +1292,35 @@ describe('SDKRpcClientWire degrade surface', () => {
     await rpc.close();
   });
 
-  it('defers setPermission onto the next prompt body, then clears it', async () => {
+  it('setPermission posts the session profile agent_config immediately', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = vi
+      .spyOn(WireHttpClient.prototype, 'setPermission')
+      .mockResolvedValue({} as never);
+    await rpc.setPermission({ sessionId: 's1', mode: 'yolo' });
+    expect(spy).toHaveBeenCalledWith('s1', 'yolo');
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('setPlanMode posts the session profile agent_config immediately', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = vi.spyOn(WireHttpClient.prototype, 'setPlanMode').mockResolvedValue({} as never);
+    await rpc.setPlanMode({ sessionId: 's1', enabled: true });
+    expect(spy).toHaveBeenCalledWith('s1', true);
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('prompt and steer bodies carry no permission/plan mode', async () => {
     const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
     const { bodies, spy } = stubSubmitPrompt();
-    await rpc.setPermission({ sessionId: 's1', mode: 'yolo' });
     await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'first' }] });
-    expect(bodies[0]?.permission_mode).toBe('yolo');
-    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'second' }] });
+    await rpc.steer({ sessionId: 's1', input: [{ type: 'text', text: 'second' }] });
+    expect(bodies[0]?.permission_mode).toBeUndefined();
+    expect(bodies[0]?.plan_mode).toBeUndefined();
     expect(bodies[1]?.permission_mode).toBeUndefined();
-    spy.mockRestore();
-    await rpc.close();
-  });
-
-  it('scopes the deferred permission per session', async () => {
-    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
-    const { bodies, spy } = stubSubmitPrompt();
-    await rpc.setPermission({ sessionId: 's1', mode: 'yolo' });
-    await rpc.prompt({ sessionId: 's2', input: [{ type: 'text', text: 'other' }] });
-    expect(bodies[0]?.permission_mode).toBeUndefined();
-    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'mine' }] });
-    expect(bodies[1]?.permission_mode).toBe('yolo');
-    spy.mockRestore();
-    await rpc.close();
-  });
-
-  it('defers setPermission onto steer submissions too', async () => {
-    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
-    const { bodies, spy } = stubSubmitPrompt();
-    await rpc.setPermission({ sessionId: 's1', mode: 'manual' });
-    await rpc.steer({ sessionId: 's1', input: [{ type: 'text', text: 'steered' }] });
-    expect(bodies[0]?.permission_mode).toBe('manual');
-    await rpc.steer({ sessionId: 's1', input: [{ type: 'text', text: 'again' }] });
-    expect(bodies[1]?.permission_mode).toBeUndefined();
-    spy.mockRestore();
-    await rpc.close();
-  });
-
-  it('keeps the deferred permission when the submission fails', async () => {
-    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
-    const { bodies, spy } = stubSubmitPrompt();
-    spy.mockRejectedValueOnce(new Error('boom'));
-    await rpc.setPermission({ sessionId: 's1', mode: 'yolo' });
-    await expect(
-      rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'fails' }] }),
-    ).rejects.toThrow('boom');
-    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'retry' }] });
-    expect(bodies[0]?.permission_mode).toBe('yolo');
-    spy.mockRestore();
-    await rpc.close();
-  });
-
-  it('I9: closeSession (local detach) clears a deferred permission override — it does not silently ride a later reattach', async () => {
-    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
-    const { bodies, spy } = stubSubmitPrompt();
-    await rpc.setPermission({ sessionId: 's1', mode: 'yolo' });
-    await rpc.closeSession({ sessionId: 's1' });
-    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'after reattach' }] });
-    expect(bodies[0]?.permission_mode).toBeUndefined();
-    spy.mockRestore();
-    await rpc.close();
-  });
-
-  it('I9: deleteSession clears a deferred permission override too', async () => {
-    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
-    const { bodies, spy } = stubSubmitPrompt();
-    const sessionActionSpy = vi
-      .spyOn(WireHttpClient.prototype, 'sessionAction')
-      .mockResolvedValue(undefined);
-    await rpc.setPermission({ sessionId: 's1', mode: 'yolo' });
-    await rpc.deleteSession({ sessionId: 's1' });
-    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'after delete' }] });
-    expect(bodies[0]?.permission_mode).toBeUndefined();
-    sessionActionSpy.mockRestore();
+    expect(bodies[1]?.plan_mode).toBeUndefined();
     spy.mockRestore();
     await rpc.close();
   });
@@ -1399,99 +1356,25 @@ describe('SDKRpcClientWire degrade surface', () => {
     await rpc.close();
   });
 
-  it('the live prompt route accepts a deferred permission_mode body', async () => {
+  it('the live profile route accepts permission/plan agent_config changes', async () => {
     const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
     await rpc.start();
     const created = await rpc.createSession({ workDir: cwd });
-    // Call-through spy: asserts the exact body the live server accepted.
-    const live = vi.spyOn(WireHttpClient.prototype, 'submitPrompt');
-    await rpc.setPermission({ sessionId: created.id, mode: 'manual' });
     // A schema rejection would surface here as an envelope error.
-    await rpc.prompt({ sessionId: created.id, input: [{ type: 'text', text: 'perm live' }] });
-    expect(live.mock.calls[0]?.[1].permission_mode).toBe('manual');
-    live.mockRestore();
-    await rpc.close();
-  });
-
-  it('defers setPlanMode onto the next prompt body, then clears it', async () => {
-    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
-    const { bodies, spy } = stubSubmitPrompt();
-    await rpc.setPlanMode({ sessionId: 's1', enabled: true });
-    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'first' }] });
-    expect(bodies[0]?.plan_mode).toBe(true);
-    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'second' }] });
-    expect(bodies[1]?.plan_mode).toBeUndefined();
-    spy.mockRestore();
-    await rpc.close();
-  });
-
-  it('defers setPlanMode onto steer submissions too', async () => {
-    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
-    const { bodies, spy } = stubSubmitPrompt();
-    await rpc.setPlanMode({ sessionId: 's1', enabled: false });
-    await rpc.steer({ sessionId: 's1', input: [{ type: 'text', text: 'steered' }] });
-    expect(bodies[0]?.plan_mode).toBe(false);
-    spy.mockRestore();
-    await rpc.close();
-  });
-
-  it('keeps the deferred plan mode when the submission fails', async () => {
-    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
-    const { bodies, spy } = stubSubmitPrompt();
-    spy.mockRejectedValueOnce(new Error('boom'));
-    await rpc.setPlanMode({ sessionId: 's1', enabled: true });
-    await expect(
-      rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'fails' }] }),
-    ).rejects.toThrow('boom');
-    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'retry' }] });
-    expect(bodies[0]?.plan_mode).toBe(true);
-    spy.mockRestore();
-    await rpc.close();
-  });
-
-  it('I9: closeSession (local detach) clears a deferred plan mode override too', async () => {
-    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
-    const { bodies, spy } = stubSubmitPrompt();
-    await rpc.setPlanMode({ sessionId: 's1', enabled: true });
-    await rpc.closeSession({ sessionId: 's1' });
-    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'after reattach' }] });
-    expect(bodies[0]?.plan_mode).toBeUndefined();
-    spy.mockRestore();
-    await rpc.close();
-  });
-
-  // setPermission and setPlanMode share one pending-override entry per
-  // session (not two parallel maps): a mode set on each rides the SAME next
-  // submission together, and clearing one does not touch the other.
-  it('rides a pending permission mode and a pending plan mode on the same next submission', async () => {
-    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
-    const { bodies, spy } = stubSubmitPrompt();
-    await rpc.setPermission({ sessionId: 's1', mode: 'yolo' });
-    await rpc.setPlanMode({ sessionId: 's1', enabled: true });
-    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'both' }] });
-    expect(bodies[0]).toMatchObject({ permission_mode: 'yolo', plan_mode: true });
-    // Both cleared: a second submission carries neither.
-    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'after' }] });
-    expect(bodies[1]?.permission_mode).toBeUndefined();
-    expect(bodies[1]?.plan_mode).toBeUndefined();
-    spy.mockRestore();
+    await rpc.setPermission({ sessionId: created.id, mode: 'manual' });
+    await rpc.setPlanMode({ sessionId: created.id, enabled: true });
     await rpc.close();
   });
 });
 
 // ---------------------------------------------------------------------------
-// SDKRpcClientWire getStatus mode overlay — half 1 of the wire pending-state
-// task: getStatus reads the SERVER's view, which between a setPermission /
-// setPlanMode stash and the next prompt still reports the OLD mode. The wire
-// client owns the pending value, so its getStatus must overlay it — reporting
-// what WILL be in force for the next turn, which is what a status caller
-// (e.g. the TUI's syncRuntimeState on every attach/session-switch) is
-// actually asking about. `getSessionStatus` is stubbed directly rather than
-// going through a live turn: nothing server-side ever needs to run for this
-// to matter, only the deferred value the wire client itself holds.
+// SDKRpcClientWire getStatus — a straight pass-through of the server's status
+// read. Permission/plan mode changes go through the profile route immediately
+// (see the degrade-surface block above), so the client holds no pending value
+// to overlay.
 // ---------------------------------------------------------------------------
 
-describe('SDKRpcClientWire getStatus mode overlay', () => {
+describe('SDKRpcClientWire getStatus', () => {
   const SERVER_STATUS: WireSessionStatus = {
     busy: false,
     thinking_level: 'medium',
@@ -1507,49 +1390,7 @@ describe('SDKRpcClientWire getStatus mode overlay', () => {
     return vi.spyOn(WireHttpClient.prototype, 'getSessionStatus').mockResolvedValue(status);
   }
 
-  it('overlays a pending permission mode onto getStatus, not the server value', async () => {
-    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
-    const spy = stubGetSessionStatus(SERVER_STATUS);
-    await rpc.setPermission({ sessionId: 's1', mode: 'yolo' });
-    const status = await rpc.getStatus({ sessionId: 's1' });
-    expect(status.permission).toBe('yolo');
-    spy.mockRestore();
-    await rpc.close();
-  });
-
-  it('overlays a pending plan mode onto getStatus, not the server value', async () => {
-    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
-    const spy = stubGetSessionStatus(SERVER_STATUS);
-    await rpc.setPlanMode({ sessionId: 's1', enabled: true });
-    const status = await rpc.getStatus({ sessionId: 's1' });
-    expect(status.planMode).toBe(true);
-    spy.mockRestore();
-    await rpc.close();
-  });
-
-  it('overlays both a pending permission mode and a pending plan mode together', async () => {
-    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
-    const spy = stubGetSessionStatus(SERVER_STATUS);
-    await rpc.setPermission({ sessionId: 's1', mode: 'yolo' });
-    await rpc.setPlanMode({ sessionId: 's1', enabled: true });
-    const status = await rpc.getStatus({ sessionId: 's1' });
-    expect(status.permission).toBe('yolo');
-    expect(status.planMode).toBe(true);
-    spy.mockRestore();
-    await rpc.close();
-  });
-
-  it('scopes the overlay per session — a pending mode on one session never leaks onto another', async () => {
-    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
-    const spy = stubGetSessionStatus(SERVER_STATUS);
-    await rpc.setPermission({ sessionId: 's1', mode: 'yolo' });
-    const status = await rpc.getStatus({ sessionId: 's2' });
-    expect(status.permission).toBe('manual');
-    spy.mockRestore();
-    await rpc.close();
-  });
-
-  it('reports the server value once nothing is pending', async () => {
+  it('reports the server permission/plan values verbatim', async () => {
     const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
     const spy = stubGetSessionStatus(SERVER_STATUS);
     const status = await rpc.getStatus({ sessionId: 's1' });
@@ -1559,18 +1400,19 @@ describe('SDKRpcClientWire getStatus mode overlay', () => {
     await rpc.close();
   });
 
-  it('the overlay is self-limiting: once a prompt carries the pending mode, getStatus reports the server value again', async () => {
+  it('does not overlay a just-set mode — the profile route owns applying it', async () => {
     const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
     const statusSpy = stubGetSessionStatus(SERVER_STATUS);
-    const { spy: promptSpy } = stubSubmitPrompt();
+    const permSpy = vi
+      .spyOn(WireHttpClient.prototype, 'setPermission')
+      .mockResolvedValue({} as never);
     await rpc.setPermission({ sessionId: 's1', mode: 'yolo' });
-    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'go' }] });
-    // The stash is gone; getStatus now reflects whatever the server reports —
-    // simulated here as still 'manual' (a real server would have applied
-    // the mode by now, but the overlay itself must no longer override it).
+    // The client keeps no local copy of the mode: getStatus reflects whatever
+    // the server reports (stubbed here as still 'manual'; a real server has
+    // applied the mode by the time the setPermission call resolves).
     const status = await rpc.getStatus({ sessionId: 's1' });
     expect(status.permission).toBe('manual');
-    promptSpy.mockRestore();
+    permSpy.mockRestore();
     statusSpy.mockRestore();
     await rpc.close();
   });

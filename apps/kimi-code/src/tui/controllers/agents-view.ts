@@ -146,13 +146,6 @@ export interface AgentsViewState {
    * component without a reload.
    */
   detached: boolean;
-  /**
-   * One-time-per-attach flag for the deferred-permission hint: the
-   * wire transport carries a stashed setPermission on the NEXT prompt, so the
-   * first user-initiated mode change per attach earns a status hint. Reset by
-   * detachForAttach. Read via {@link hintDeferredPermissionOnce}.
-   */
-  permissionHintShown: boolean;
   /** Focus split between the roster list and the dispatch editor. */
   dispatchFocused: boolean;
   /**
@@ -752,7 +745,6 @@ export class AgentsViewController {
       seenAt,
       dispatch,
       detached: false,
-      permissionHintShown: false,
       dispatchFocused: false,
       replyTargetId: undefined,
       pendingReplyIds: new Set(),
@@ -860,8 +852,6 @@ export class AgentsViewController {
     const view = state.agentsView;
     if (view === undefined || view.detached) return;
     view.detached = true;
-    // Each attach re-arms the one-time deferred-permission hint.
-    view.permissionHintShown = false;
     if (view.flashTimer !== undefined) {
       clearTimeout(view.flashTimer);
       view.flashTimer = undefined;
@@ -2212,23 +2202,4 @@ export class AgentsViewController {
     if (options.error === true) this.host.showError(message);
     else this.host.showStatus(message);
   }
-}
-
-/**
- * Deferred-permission hint: on the wire transport setPermission is
- * stashed and rides the NEXT prompt's submission body, so the first
- * user-initiated permission-mode change per attach earns a one-time status
- * hint. The per-attach flag lives on {@link AgentsViewState.permissionHintShown}
- * (reset by detachForAttach). `detached` is the "attached to a session"
- * marker — `isOpen` stays true while detached, so mount
- * checks must look at `detached`, not at the state's presence.
- */
-export function hintDeferredPermissionOnce(host: {
-  readonly state: { readonly agentsView: AgentsViewState | undefined };
-  showStatus(msg: string): void;
-}): void {
-  const view = host.state.agentsView;
-  if (view === undefined || !view.detached || view.permissionHintShown) return;
-  view.permissionHintShown = true;
-  host.showStatus('Permission mode applies to the next prompt.');
 }

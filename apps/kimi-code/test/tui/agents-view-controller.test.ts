@@ -17,7 +17,6 @@ import type { CustomEditor } from '@/tui/components/editor/custom-editor';
 import {
   AgentsViewController,
   dispatchSlashCommands,
-  hintDeferredPermissionOnce,
   LOAD_TRUST_CONCURRENCY,
   replyRpcTimeoutMs,
   type AgentsViewHost,
@@ -4446,64 +4445,6 @@ describe('AgentsViewController — attach badge feed', () => {
     expect(b.view().detached).toBe(false);
     expect(b.setAttachBadge).toHaveBeenCalledTimes(1);
     expect(b.setAttachBadge).toHaveBeenLastCalledWith(undefined);
-  });
-});
-
-describe('hintDeferredPermissionOnce', () => {
-  let dir: string | undefined;
-  afterEach(async () => {
-    if (dir !== undefined) {
-      // maxRetries: a fire-and-forget persistState can still be mid-write
-      // (ENOTEMPTY on rmdir) when the test body returns.
-      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
-    }
-    dir = undefined;
-  });
-
-  it('stays silent while the view is mounted (not attached)', async () => {
-    const b = await boot([summary('s1')]);
-    dir = b.homeDir;
-
-    hintDeferredPermissionOnce(b.host);
-
-    expect(b.showStatus).not.toHaveBeenCalled();
-  });
-
-  it('shows the hint once per attach, then never again for that attach', async () => {
-    const b = await boot([summary('s1')]);
-    dir = b.homeDir;
-    b.controller.detachForAttach('s1');
-
-    hintDeferredPermissionOnce(b.host);
-    hintDeferredPermissionOnce(b.host);
-
-    expect(b.showStatus).toHaveBeenCalledTimes(1);
-    expect(b.showStatus).toHaveBeenCalledWith('Permission mode applies to the next prompt.');
-  });
-
-  it('re-arms on the next attach (detachForAttach resets the flag)', async () => {
-    const b = await boot([summary('s1')]);
-    dir = b.homeDir;
-    b.controller.detachForAttach('s1');
-    hintDeferredPermissionOnce(b.host);
-    expect(b.showStatus).toHaveBeenCalledTimes(1);
-
-    // Return to the view, then attach again.
-    await b.controller.show();
-    b.controller.detachForAttach('s1');
-    hintDeferredPermissionOnce(b.host);
-
-    expect(b.showStatus).toHaveBeenCalledTimes(2);
-  });
-
-  it('stays silent when there is no agents view at all', async () => {
-    const b = await boot([summary('s1')]);
-    dir = b.homeDir;
-    b.controller.close();
-
-    hintDeferredPermissionOnce(b.host);
-
-    expect(b.showStatus).not.toHaveBeenCalled();
   });
 });
 

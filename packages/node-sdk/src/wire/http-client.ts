@@ -326,6 +326,30 @@ export class WireHttpClient {
     );
   }
 
+  /**
+   * Apply a permission-mode change via the session profile's `agent_config`.
+   * Server-side this broadcasts the mode to every live agent in the session,
+   * so it takes effect immediately — including mid-turn.
+   */
+  setPermission(id: string, mode: 'manual' | 'yolo' | 'auto'): Promise<WireSession> {
+    return this.request(
+      'POST',
+      `/sessions/${id}/profile`,
+      { agent_config: { permission_mode: mode } },
+      wireSessionSchema,
+    );
+  }
+
+  /** Apply a plan-mode change via the session profile's `agent_config`. */
+  setPlanMode(id: string, enabled: boolean): Promise<WireSession> {
+    return this.request(
+      'POST',
+      `/sessions/${id}/profile`,
+      { agent_config: { plan_mode: enabled } },
+      wireSessionSchema,
+    );
+  }
+
   /** Delete a provider and its model aliases — `DELETE /providers/{provider_id}` (204, no body). */
   deleteProvider(providerId: string): Promise<void> {
     return this.request('DELETE', `/providers/${providerId}`, undefined, z.void());
