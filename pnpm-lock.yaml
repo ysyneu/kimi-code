@@ -911,7 +911,7 @@ importers:
         specifier: workspace:^
         version: link:../kosong
       '@types/ws':
-        specifier: ^8
+        specifier: ^8.18.0
         version: 8.18.1
       '@types/yazl':
         specifier: ^2.4.6
