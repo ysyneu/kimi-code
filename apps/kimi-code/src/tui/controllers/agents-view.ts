@@ -92,10 +92,10 @@ export interface AgentsViewHost {
   /**
    * Fills the skill half of `agentsViewActivatableCommands`'s cold-start
    * gap (no session attached this run yet) via whatever session-independent
-   * route the host has for it — the controller calls this once at view
-   * mount and re-reads `agentsViewActivatableCommands()` when it resolves;
-   * it never inspects this method's return value. No plugin-command
-   * equivalent exists to warm the same way (see `KimiTUI.
+   * route the host has for it — the controller awaits this in show()'s
+   * pre-paint cold-start wait, so the first autocomplete install already
+   * reflects it; it never inspects this method's return value. No
+   * plugin-command equivalent exists to warm the same way (see `KimiTUI.
    * warmAgentsViewSkillMenu`'s doc comment), so the plugin half of the gap
    * is unaffected by this call.
    */
@@ -318,11 +318,11 @@ const REPLY_RPC_TIMEOUT_MARGIN_MS = 2_000;
  * Bounds {@link AgentsViewController.loadTrust}'s fan-out. A roster
  * accumulated over a long-lived home can hold hundreds of rows; firing one
  * `getWorkspaceTrustForSession` RPC per row unconditionally would put that
- * many concurrent HTTP round-trips in flight the moment the roster paints —
- * all landing on the same event loop the terminal uses for keypress
- * dispatch and render. A small worker pool pulling from a shared cursor
- * (same shape as `feedback/upload.ts`'s `uploadParts`) keeps steady
- * progress without the unbounded burst.
+ * many concurrent HTTP round-trips in flight during show()'s pre-paint
+ * cold-start wait — all landing on the same event loop the terminal uses
+ * for keypress dispatch and render. A small worker pool pulling from a
+ * shared cursor (same shape as `feedback/upload.ts`'s `uploadParts`) keeps
+ * steady progress without the unbounded burst.
  */
 export const LOAD_TRUST_CONCURRENCY = 8;
 
@@ -547,8 +547,20 @@ export class AgentsViewController {
     if (wireRows !== undefined) roster.setAllRows(wireRows.filter((row) => viewSessions.has(row.id)));
     else if (summaries !== undefined) roster.setAll(summaries.filter((row) => viewSessions.has(row.id)));
 
+    // Cold-start loads finish BEFORE the first paint: the trust fan-out and
+    // the skill-menu warm-up land per-workspace work on the server
+    // (first-hit workspace materialization included), and on an embedded
+    // server that work shares the event loop the terminal renders and
+    // dispatches keys on — fired after mount it freezes the freshly-painted
+    // view. Bounded by replyRpcTimeoutMs: a deadline miss opens without the
+    // late badges, the same tolerance per-row trust failures get.
+    await this.awaitColdStart(roster, (wireRows ?? summaries ?? []).map((row) => row.id));
+    if (state.agentsView !== undefined) return;
+
     // The dispatch editor is built before the component: it renders into the
     // component's bottom box, so the initial props already reference it.
+    // The skill menu was warmed in the cold-start wait above, so this first
+    // autocomplete install already reflects it.
     const dispatch = new AgentsViewDispatch(
       state.ui,
       this.host.agentsViewWorkDir(),
@@ -778,12 +790,6 @@ export class AgentsViewController {
       }),
     });
 
-    // Trust badges load after mount: the roster is already useful without
-    // them, and the per-row reads must never block or break show().
-    void this.loadTrust((wireRows ?? summaries ?? []).map((row) => row.id));
-    // Skill cold-start gap (R6 review): the composer is already usable
-    // without the warmed menu, so this must never block show() either.
-    void this.warmSkillMenu(dispatch);
     // A seeded busy row must start the spinner ticker without waiting for an event.
     this.syncBusyTicker();
   }
@@ -922,15 +928,45 @@ export class AgentsViewController {
   // ---------------------------------------------------------------------------
 
   /**
+   * show()'s cold-start barrier: the trust fan-out and the skill-menu
+   * warm-up settle here, BEFORE the component mounts, so the
+   * event-loop-heavy server work they trigger (first-hit workspace
+   * materialization included) never lands on a freshly-painted view —
+   * embedded server or not, that loop also dispatches keypresses and
+   * renders. Bounded by replyRpcTimeoutMs: past the deadline the view
+   * opens anyway and whatever landed is in the first frame; late trust
+   * arrivals still push their badges when the fan-out drains (loadTrust's
+   * tail).
+   */
+  private async awaitColdStart(roster: AgentsRoster, ids: readonly string[]): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        // loadTrust tolerates per-row failures and the warm no-ops on
+        // failure; the catch is belt-and-suspenders — show() must open.
+        Promise.all([this.loadTrust(roster, ids), this.host.warmAgentsViewSkillMenu()]).catch(
+          () => undefined,
+        ),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, replyRpcTimeoutMs());
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  /**
    * One-shot trust read at roster load (no live refresh): the
    * wire transport resolves each row's workspace trust and the badge rides
    * `roster.setTrusted`. A per-row failure leaves `trusted` undefined — no
    * badge, no error surface; non-wire transports have no trust route and are
-   * skipped by the narrowing.
+   * skipped by the narrowing. Runs before the first paint (show()'s
+   * cold-start barrier); if it outlives that wait, the completion still
+   * pushes the badges onto the mounted view.
    */
-  private async loadTrust(ids: readonly string[]): Promise<void> {
-    const view = this.host.state.agentsView;
-    if (view === undefined) return;
+  private async loadTrust(roster: AgentsRoster, ids: readonly string[]): Promise<void> {
     const rpc = this.host.harness.wireRpc();
     if (rpc === undefined) return;
     let changed = false;
@@ -942,44 +978,23 @@ export class AgentsViewController {
         const id = ids[index];
         if (id === undefined) return;
         // Archived sessions never entered the roster; setTrusted would no-op.
-        if (view.roster.get(id) === undefined) continue;
+        if (roster.get(id) === undefined) continue;
         let trusted: boolean | undefined;
         try {
           trusted = await rpc.getWorkspaceTrustForSession(id);
         } catch {
           continue;
         }
-        if (this.host.state.agentsView !== view) return;
-        view.roster.setTrusted(id, trusted);
+        roster.setTrusted(id, trusted);
         changed = true;
       }
     };
     const workerCount = Math.min(LOAD_TRUST_CONCURRENCY, ids.length);
     await Promise.all(Array.from({ length: workerCount }, () => worker()));
-    if (changed && this.host.state.agentsView === view) this.pushProps();
-  }
-
-  /**
-   * Closes the dispatch composer's skill cold-start gap (R6 review):
-   * `agentsViewActivatableCommands()` only reflects skills once a session
-   * has attached this run, so the menu built at mount time can miss them.
-   * Same "load after mount, never block show()" shape as `loadTrust` —
-   * awaits the host's warming call, then re-installs the dispatch
-   * autocomplete so the on-screen `/` menu picks up whatever the host
-   * filled in, without the user needing to reopen the view. No-ops if the
-   * view closed or was replaced by a fresh `show()` while awaiting.
-   */
-  private async warmSkillMenu(dispatch: AgentsViewDispatch): Promise<void> {
-    const view = this.host.state.agentsView;
-    if (view === undefined) return;
-    await this.host.warmAgentsViewSkillMenu();
-    if (this.host.state.agentsView !== view) return;
-    dispatch.installAutocomplete(
-      dispatchSlashCommands(
-        () => this.host.agentsViewModelCompletions(),
-        () => this.host.agentsViewActivatableCommands(),
-      ),
-    );
+    // Pre-paint there is no mounted view to push to; a post-deadline
+    // completion finds it (a fresh show() would have built a NEW roster,
+    // which this identity check rejects).
+    if (changed && this.host.state.agentsView?.roster === roster) this.pushProps();
   }
 
   /**

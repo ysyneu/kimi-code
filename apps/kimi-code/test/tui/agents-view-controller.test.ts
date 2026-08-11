@@ -335,11 +335,20 @@ async function boot(
     /**
      * Override for `host.warmAgentsViewSkillMenu()` itself — lets a test
      * hold the warm-up open (e.g. `() => new Promise(() => {})`, never
-     * resolving) to prove `show()`'s paint doesn't wait on it. Defaults to
-     * the same "apply `warmedActivatableCommands` and resolve" behavior as
-     * before this option existed.
+     * resolving) to drive show()'s cold-start wait from the outside.
+     * Defaults to the same "apply `warmedActivatableCommands` and resolve"
+     * behavior as before this option existed.
      */
     warmAgentsViewSkillMenu?: () => Promise<void>;
+    /**
+     * Called with the harness internals right before `controller.show()` is
+     * awaited — lets a test observe mount/paint state WHILE show()'s
+     * cold-start wait is still in flight (boot itself only returns after).
+     */
+    beforeShow?: (probe: {
+      ui: FakeUI;
+      state: { agentsView: AgentsViewState | undefined };
+    }) => void;
     /** Seeds `agentsViewGroupMode()`'s return value; defaults to `'state'`. */
     groupMode?: AgentsGroupMode;
     /** Override for `host.agentsViewGroupMode()` itself — sync, like the
@@ -431,6 +440,7 @@ async function boot(
     sessions: new Set(opts.registered ?? summaries.map((s) => s.id)),
     seenAt: new Map(),
   });
+  opts.beforeShow?.({ ui, state });
   await controller.show();
   return {
     homeDir,
@@ -3849,13 +3859,15 @@ describe('AgentsViewController — workspace trust', () => {
   // than any single boot's session count here — `loadTrust` must never fire
   // more than LOAD_TRUST_CONCURRENCY trust RPCs at once, however large `ids`
   // is, so the burst can't compete unbounded with the terminal's own
-  // keypress-dispatch/render work on the same event loop.
+  // keypress-dispatch/render work on the same event loop. show() now awaits
+  // the fan-out before painting, so the boot promise is driven from the
+  // outside: flush until the first workers fire, then release one by one.
   it('loadTrust bounds concurrent trust RPCs to LOAD_TRUST_CONCURRENCY', async () => {
     const rows = Array.from({ length: LOAD_TRUST_CONCURRENCY * 3 }, (_, i) => summary(`s${i}`));
     let inFlight = 0;
     let maxInFlight = 0;
     const pending: Array<() => void> = [];
-    const b = await boot(rows, {
+    const bootPromise = boot(rows, {
       wire: true,
       trust: () =>
         new Promise<boolean>((resolve) => {
@@ -3867,8 +3879,7 @@ describe('AgentsViewController — workspace trust', () => {
           });
         }),
     });
-    dir = b.homeDir;
-    await flush();
+    for (let i = 0; i < 100 && pending.length === 0; i++) await flush();
     // Every worker's first RPC is already in flight — the bound holds from
     // the very first tick, not just "eventually" after some backlog drains.
     expect(pending.length).toBe(LOAD_TRUST_CONCURRENCY);
@@ -3880,30 +3891,73 @@ describe('AgentsViewController — workspace trust', () => {
       await flush();
       expect(maxInFlight).toBeLessThanOrEqual(LOAD_TRUST_CONCURRENCY);
     }
+    const b = await bootPromise;
+    dir = b.homeDir;
     expect(b.view().roster.get(`s${rows.length - 1}`)?.trusted).toBe(true);
   });
 
-  // A4: pins the mechanism `show()`'s own doc comments already promise —
-  // trust/skill warm-up "must never block or break show()". Holding both
-  // warm-up calls open (never resolving) and asserting the roster still
-  // painted proves `show()` doesn't await either one, and that focus lands
-  // on the roster before any warm-up work could possibly have finished —
-  // the exact ordering this task's brief calls out as the regression shape
-  // to guard against ("input handler registered late").
-  it('show() paints the roster and sets focus without waiting on trust/skill warm-up', async () => {
-    const b = await boot([summary('s1'), summary('s2')], {
+  // The cold-start contract: trust badges and the skill menu are part of
+  // the FIRST frame — show() must not paint while its warm-ups are still in
+  // flight (a post-paint fan-out froze the freshly-mounted view: the server
+  // work it triggers shares the event loop with keypress dispatch/render).
+  it('show() waits for trust/skill warm-up before the first paint', async () => {
+    let resolveTrust: ((value: boolean) => void) | undefined;
+    let resolveWarm: (() => void) | undefined;
+    let probe:
+      | { ui: FakeUI; state: { agentsView: AgentsViewState | undefined } }
+      | undefined;
+    const bootPromise = boot([summary('s1')], {
       wire: true,
-      trust: () => new Promise<boolean>(() => {}), // never resolves
-      warmAgentsViewSkillMenu: () => new Promise<void>(() => {}), // never resolves
+      trust: () =>
+        new Promise<boolean>((resolve) => {
+          resolveTrust = resolve;
+        }),
+      warmAgentsViewSkillMenu: () =>
+        new Promise<void>((resolve) => {
+          resolveWarm = resolve;
+        }),
+      beforeShow: (p) => {
+        probe = p;
+      },
     });
+    for (let i = 0; i < 100 && (resolveTrust === undefined || resolveWarm === undefined); i++) {
+      await flush();
+    }
+    // Both warm-ups are in flight — nothing may be mounted or painted yet.
+    expect(resolveTrust).toBeDefined();
+    expect(resolveWarm).toBeDefined();
+    expect(probe?.state.agentsView).toBeUndefined();
+    expect(probe?.ui.setFocus).not.toHaveBeenCalled();
+    resolveTrust!(true);
+    resolveWarm!();
+    const b = await bootPromise;
     dir = b.homeDir;
-    // controller.show() has already returned inside boot() at this point —
-    // both warm-up promises above are still pending (they can never
-    // resolve), yet the paint must already have happened.
+    // The badge landed BEFORE the first frame, not after it.
+    expect(b.view().roster.get('s1')?.trusted).toBe(true);
     expect(b.ui.setFocus).toHaveBeenCalledWith(b.component());
-    expect(b.ui.requestRender).toHaveBeenCalledWith(true);
-    expect(b.render()).toContain('s1 title');
-    expect(b.render()).toContain('s2 title');
+    expect(b.render()).not.toContain('untrusted');
+  });
+
+  // The wait is bounded by replyRpcTimeoutMs (driven here through
+  // KIMI_SNAPSHOT_TIMEOUT_MS): warm-ups that never settle must not wedge
+  // the open — past the deadline the roster still paints and takes focus,
+  // opening without the late badges exactly like a per-row trust failure.
+  it('show() paints within the cold-start deadline even if trust/skill warm-up never settle', async () => {
+    vi.stubEnv('KIMI_SNAPSHOT_TIMEOUT_MS', '100');
+    try {
+      const b = await boot([summary('s1'), summary('s2')], {
+        wire: true,
+        trust: () => new Promise<boolean>(() => {}), // never resolves
+        warmAgentsViewSkillMenu: () => new Promise<void>(() => {}), // never resolves
+      });
+      dir = b.homeDir;
+      expect(b.ui.setFocus).toHaveBeenCalledWith(b.component());
+      expect(b.ui.requestRender).toHaveBeenCalledWith(true);
+      expect(b.render()).toContain('s1 title');
+      expect(b.render()).toContain('s2 title');
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });
 
