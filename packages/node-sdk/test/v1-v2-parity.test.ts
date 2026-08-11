@@ -4066,9 +4066,28 @@ describe('v1↔v2 event & interaction parity', () => {
       // pinned wording family as setModel / generateAgentsMd).
       const projectFailure = (events: readonly Event[]): unknown[] =>
         projectEventStream(events, input.sessionId).flatMap((projected) => {
-          const entry = projected as { type: string; code?: string };
+          const entry = projected as {
+            type: string;
+            code?: string;
+            title?: string;
+            lastPrompt?: string;
+          };
           if (entry.type === 'turn.step.interrupted') return [];
           if (entry.type === 'error') return { type: entry.type, code: entry.code };
+          // Another pinned v2-only emission: v2 reconciles the session's
+          // lastAssistantText on every turn.ended and publishes
+          // session.meta.updated even when the failed turn produced no
+          // assistant text at all (both projected fields undefined) — v1 has
+          // no such reconcile, so the bare update is projected out like
+          // turn.step.interrupted above. The real prompt-metadata update
+          // (with values) stays, keeping the comparison non-vacuous.
+          if (
+            entry.type === 'session.meta.updated' &&
+            entry.title === undefined &&
+            entry.lastPrompt === undefined
+          ) {
+            return [];
+          }
           return entry;
         });
       const v1Projected = projectFailure(v1Events);
