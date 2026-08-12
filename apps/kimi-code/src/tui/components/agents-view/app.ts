@@ -101,6 +101,7 @@
 
 import {
   Container,
+  CURSOR_MARKER,
   Key,
   matchesKey,
   type MouseClickEvent,
@@ -980,6 +981,12 @@ export class AgentsViewApp extends Container implements Focusable {
         currentTheme.fg(selected ? 'primary' : 'textDim', selected ? '▸ ' : '  ') +
         currentTheme.fg('accent', '✎ ') +
         currentTheme.fg('text', draft) +
+        // Zero-width hardware-cursor marker right at the caret: without it
+        // the IME candidate window anchors to wherever the terminal cursor
+        // last rested (end of the painted line) instead of the edit point —
+        // the same CURSOR_MARKER contract pi-tui's own input component
+        // follows. Zero width, so fitExactly's width math is unaffected.
+        (this.focused ? CURSOR_MARKER : '') +
         currentTheme.fg('textDim', '▌');
       // Rename can only begin on the currently-selected row, so `selected`
       // is always true for the duration of editing — same fill every other

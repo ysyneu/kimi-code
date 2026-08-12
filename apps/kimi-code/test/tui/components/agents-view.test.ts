@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { Terminal, TUI } from '@moonshot-ai/pi-tui';
+import { CURSOR_MARKER, type Terminal, type TUI } from '@moonshot-ai/pi-tui';
 import chalk from 'chalk';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
@@ -1121,6 +1121,24 @@ describe('AgentsViewApp — rename', () => {
     app.handleInput('z');
     app.handleInput('\u001B');
     expect(onRenameSubmit).toHaveBeenCalledWith('s1', 'abc');
+  });
+
+  it('emits the zero-width cursor marker at the caret while focused, so the IME candidate window anchors to the edit point', () => {
+    const app = makeApp({ groups, selectedId: 's1' });
+    app.handleInput('\u0012');
+    app.handleInput('d');
+    // Unfocused (the test default): no marker anywhere in the frame.
+    expect(renderRaw(app)).not.toContain(CURSOR_MARKER);
+
+    app.focused = true;
+    const row = renderRaw(app)
+      .split('\n')
+      .find((l) => l.includes(CURSOR_MARKER));
+    expect(row).toBeDefined();
+    // The marker sits between the typed draft and the fake ▌ cursor glyph —
+    // exactly where the next character would land.
+    expect(row!.indexOf('d')).toBeLessThan(row!.indexOf(CURSOR_MARKER));
+    expect(row!.indexOf(CURSOR_MARKER)).toBeLessThan(row!.indexOf('▌'));
   });
 
   it('renders a controller-driven rename draft from props', () => {
