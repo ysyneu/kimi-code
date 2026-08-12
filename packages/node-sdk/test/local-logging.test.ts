@@ -5,7 +5,7 @@ import * as zlib from 'node:zlib';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createKimiHarness, log } from '#/index';
+import { createKimiHarness, log, SDKRpcClientWire } from '#/index';
 import { __resetRootLoggerForTest, getRootLogger } from '../../agent-core/src/logging/logger';
 import { TEST_IDENTITY } from './test-identity';
 
@@ -387,5 +387,25 @@ describe('Local logging — harness integration', () => {
     const globalPath = join(homeDir, 'logs', 'kimi-code.log');
     const text = await readFile(globalPath, 'utf-8');
     expect(text).toContain('untagged before close');
+  });
+
+  it('wire transport configures the root logger — host diagnostics are not silent noops', async () => {
+    // Regression: SDKRpcClientWire never called getRootLogger().configure, so
+    // on the wire transport (agents mode) every host-side log.* call was
+    // dropped by `emit`'s unconfigured guard — including the TUI's
+    // attach/archive failure records.
+    const homeDir = await makeTempDir('kimi-log-wire-home-');
+    const wire = new SDKRpcClientWire({
+      identity: TEST_IDENTITY,
+      homeDir,
+      serverUrl: 'http://127.0.0.1:1',
+      token: 'test-token',
+    });
+    expect(getRootLogger().isConfigured()).toBe(true);
+    log.warn('wire host diagnostic');
+    await getRootLogger().flushGlobal();
+    const text = await readOptionalFile(join(homeDir, 'logs', 'kimi-code.log'));
+    expect(text).toContain('wire host diagnostic');
+    await wire.close();
   });
 });

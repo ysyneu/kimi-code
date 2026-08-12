@@ -44,8 +44,10 @@ import { pipeline } from 'node:stream/promises';
 import {
   AGENT_WIRE_PROTOCOL_VERSION,
   ErrorCodes,
+  getRootLogger,
   KimiError,
   noopTelemetryClient,
+  resolveLoggingConfig,
 } from '@moonshot-ai/agent-core';
 import type { AgentContextData } from '@moonshot-ai/agent-core';
 import { ensureKimiHome, resolveConfigPath, resolveKimiHome } from '@moonshot-ai/agent-core-v2';
@@ -399,6 +401,12 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
       identity: this.identity,
       onRefresh: options.onOAuthRefresh,
     });
+
+    // Same root-logger wiring as SDKRpcClient (the in-process transport): on
+    // the wire transport nothing else configures it, so host-side diagnostic
+    // logging (e.g. the TUI's attach/archive failure records) would silently
+    // no-op (`emit` drops everything while unconfigured).
+    void getRootLogger().configure(resolveLoggingConfig({ homeDir: this.homeDir }));
 
     const token = options.token ?? readServerToken(this.homeDir);
     this.http = new WireHttpClient({ baseUrl: options.serverUrl, token });
