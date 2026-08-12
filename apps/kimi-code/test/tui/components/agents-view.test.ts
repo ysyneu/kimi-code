@@ -913,10 +913,11 @@ describe('AgentsViewApp — left-click a roster row (pi-tui mouse support)', () 
     const s2Line = lineIndexOf(app, 's2 title');
     app.handleMouse({ row: s2Line, column: 0 });
     expect(onOpen).not.toHaveBeenCalled();
-    // The stray click must not have abandoned the rename in progress.
+    // The stray click must not have abandoned the rename in progress (the
+    // editor starts blank now, so the typed char IS the whole new title).
     app.handleInput('x');
     app.handleInput('\r');
-    expect(onRenameSubmit).toHaveBeenCalledWith('s1', 's1 titlex');
+    expect(onRenameSubmit).toHaveBeenCalledWith('s1', 'x');
   });
 
   it('a click while the help overlay is up does not open the clicked row (defect B)', () => {
@@ -1091,23 +1092,26 @@ describe('AgentsViewApp — rename', () => {
     expect(onRenameBegin).toHaveBeenCalledWith('s1');
   });
 
-  it('typed characters extend the draft and Enter submits it', () => {
+  it('typed characters fill the (initially blank) draft and Enter submits it', () => {
     const onRenameSubmit = vi.fn();
     const app = makeApp({ groups, selectedId: 's1', onRenameSubmit });
-    app.handleInput('\u0012'); // begin, draft = 'abc'
+    app.handleInput('\u0012'); // begin, draft = ''
+    expect(render(app)).toContain('✎ ▌'); // blank start, just the cursor
     app.handleInput('d');
-    expect(render(app)).toContain('abcd');
+    expect(render(app)).toContain('✎ d▌');
     app.handleInput('\r');
-    expect(onRenameSubmit).toHaveBeenCalledWith('s1', 'abcd');
+    expect(onRenameSubmit).toHaveBeenCalledWith('s1', 'd');
   });
 
   it('backspace shrinks the draft', () => {
     const onRenameSubmit = vi.fn();
     const app = makeApp({ groups, selectedId: 's1', onRenameSubmit });
     app.handleInput('\u0012');
-    app.handleInput('\u007F'); // delete 'c'
+    app.handleInput('a');
+    app.handleInput('b');
+    app.handleInput('\u007F'); // delete 'b'
     app.handleInput('\r');
-    expect(onRenameSubmit).toHaveBeenCalledWith('s1', 'ab');
+    expect(onRenameSubmit).toHaveBeenCalledWith('s1', 'a');
   });
 
   it('Esc cancels by submitting the original title', () => {
@@ -1211,20 +1215,20 @@ describe('AgentsViewApp — pin / help / quit', () => {
     expect(render(app)).not.toContain('? to close');
   });
 
-  it('Esc quits from the plain list', () => {
+  it('Esc on the plain list is a no-op — it never quits the view', () => {
     const onQuit = vi.fn();
     makeApp({ onQuit }).handleInput('\u001B');
-    expect(onQuit).toHaveBeenCalledTimes(1);
+    expect(onQuit).not.toHaveBeenCalled();
   });
 
-  // ── R9 Q3: Esc closes the innermost overlay, otherwise quits — no origin-return ──
+  // ── Esc closes the innermost overlay, otherwise a no-op — never a quit ──
 
-  it('Esc quits even when an origin is set — no origin-return (R9 Q3)', () => {
+  it('Esc is still a no-op when an origin is set — no quit, no origin-return', () => {
     const onQuit = vi.fn();
     const onOpen = vi.fn();
     const app = makeApp({ onQuit, onOpen, originId: 'ses-origin' });
     app.handleInput(ESC);
-    expect(onQuit).toHaveBeenCalledTimes(1);
+    expect(onQuit).not.toHaveBeenCalled();
     expect(onOpen).not.toHaveBeenCalled();
   });
 
