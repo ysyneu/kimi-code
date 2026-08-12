@@ -7022,6 +7022,19 @@ describe('transcript step and assistant folding', () => {
       expect(driver.state.appState.streamingStartApprox).toBe(false);
     });
 
+    it('also resets a stale live pane — a leftover waiting mode kept the old spinner ticking over an idle attach', async () => {
+      const { driver } = await makeDriver();
+      // The state a detach leaves behind when the session's turn was in
+      // flight: livePane.mode survives the roster, and without a reset the
+      // next (idle) attach resolves the stale 'waiting' mode and never
+      // stops the old spinner (updateActivityPane's mode-key early return).
+      driver.state.livePane.mode = 'waiting';
+
+      (driver as unknown as KimiTUI).resetSessionRuntime();
+
+      expect(driver.state.livePane.mode).toBe('idle');
+    });
+
     it('holds one elapsed-clock origin across phase changes within the same turn', async () => {
       vi.useFakeTimers();
       try {

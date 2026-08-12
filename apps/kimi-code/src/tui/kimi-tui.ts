@@ -2470,6 +2470,15 @@ export class KimiTUI {
     // attach to an already-busy session doesn't inherit the same gap from a
     // different trigger.)
     this.setAppState({ mcpServersSummary: null, streamingPhase: 'idle' });
+    // The live pane is per-session UI state too (every writer is a turn
+    // event or beginSessionRequest) — resetting only streamingPhase leaves
+    // a stale livePane.mode='waiting' behind, and updateActivityPane's
+    // mode-key early return then keeps the PREVIOUS session's spinner (and
+    // its approximate elapsed clock) ticking over the newly attached idle
+    // session. Wire reattach re-presents pending interactions via
+    // replayPending, so dropping pendingApproval/pendingQuestion here is
+    // consistent with the M7 deferred-slot discard above.
+    this.resetLivePane();
     this.streamingUI.setStep(0);
     this.streamingUI.resetLiveText();
     this.updateQueueDisplay();
