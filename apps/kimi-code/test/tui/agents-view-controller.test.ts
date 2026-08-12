@@ -566,13 +566,16 @@ describe('AgentsViewController — mount / unmount', () => {
     expect(b.fake.listSessions).toHaveBeenCalledTimes(1);
   });
 
-  it('Esc unmounts, restores the saved children and refocuses the editor', async () => {
+  it('Esc on the focused roster is a no-op — it never closes the view', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
     b.component().handleInput(ESC);
-    expect(b.controller.isOpen).toBe(false);
-    expect(b.ui.children).toEqual([SENTINEL_A, SENTINEL_B]);
-    expect(b.ui.setFocus).toHaveBeenLastCalledWith(b.host.state.editor);
+    b.component().handleInput(ESC);
+    // Esc quits nothing (too easy to hit by accident): the view stays
+    // mounted with its rows, leaving is Ctrl+C's two-stage confirm or the
+    // exit command.
+    expect(b.controller.isOpen).toBe(true);
+    expect(b.render()).toContain('s1 title');
   });
 
   it('close unsubscribes the global event feed', async () => {
@@ -1412,17 +1415,33 @@ describe('AgentsViewController — rename', () => {
     dir = undefined;
   });
 
-  it('Ctrl+R + edit + Enter renames the session via the SDK', async () => {
+  it('Ctrl+R opens an EMPTY editor — the typed text is the whole new title, not an append', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
     b.component().handleInput(DOWN);
     b.component().handleInput(CTRL_R);
-    b.component().handleInput('X');
+    // The draft starts blank: the row renders just the ✎ cursor, none of
+    // the old title as a pre-fill.
+    expect(b.render()).toContain('✎');
+    expect(b.view().renameDraft).toEqual({ sessionId: 's1', text: '' });
+    for (const ch of 'renamed') b.component().handleInput(ch);
     b.component().handleInput(ENTER);
     await flush();
-    expect(b.fake.renameSession).toHaveBeenCalledWith({ id: 's1', title: 's1 titleX' });
+    expect(b.fake.renameSession).toHaveBeenCalledWith({ id: 's1', title: 'renamed' });
     expect(b.view().renameDraft).toBeUndefined();
-    expect(b.render()).toContain('s1 titleX');
+    expect(b.render()).toContain('renamed');
+  });
+
+  it('Enter on a still-blank rename draft cancels — no SDK call, title unchanged', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    b.component().handleInput(CTRL_R);
+    b.component().handleInput(ENTER);
+    await flush();
+    expect(b.fake.renameSession).not.toHaveBeenCalled();
+    expect(b.view().renameDraft).toBeUndefined();
+    expect(b.render()).toContain('s1 title');
   });
 
   it('Esc-cancel submits the original title and skips the SDK call', async () => {
@@ -1443,7 +1462,7 @@ describe('AgentsViewController — rename', () => {
     b.fake.renameSession.mockRejectedValueOnce(new Error('rename broke'));
     b.component().handleInput(DOWN);
     b.component().handleInput(CTRL_R);
-    b.component().handleInput('X');
+    for (const ch of 'brandnew') b.component().handleInput(ch);
     b.component().handleInput(ENTER);
     await flush();
     // The roster owns the screen here — the error must land on its own
@@ -1451,7 +1470,7 @@ describe('AgentsViewController — rename', () => {
     expect(b.view().flashMessage).toContain('rename broke');
     expect(b.showError).not.toHaveBeenCalled();
     expect(b.render()).toContain('s1 title');
-    expect(b.render()).not.toContain('s1 titleX');
+    expect(b.render()).not.toContain('brandnew');
   });
 
   it('Ctrl+R while the dispatch composer is focused renames the selected row — the key never reaches the editor', async () => {
@@ -1462,13 +1481,13 @@ describe('AgentsViewController — rename', () => {
     expect(b.view().dispatchFocused).toBe(true);
 
     b.component().handleInput(CTRL_R);
-    expect(b.view().renameDraft).toEqual({ sessionId: 's1', text: 's1 title' });
+    expect(b.view().renameDraft).toEqual({ sessionId: 's1', text: '' });
     expect(b.view().dispatch.editor.getText()).toBe('fix'); // composer draft untouched
 
-    b.component().handleInput('X'); // edits the rename draft, not the composer
+    for (const ch of 'fresh') b.component().handleInput(ch); // edits the rename draft, not the composer
     b.component().handleInput(ENTER);
     await flush();
-    expect(b.fake.renameSession).toHaveBeenCalledWith({ id: 's1', title: 's1 titleX' });
+    expect(b.fake.renameSession).toHaveBeenCalledWith({ id: 's1', title: 'fresh' });
     expect(b.view().renameDraft).toBeUndefined();
     expect(b.view().dispatch.editor.getText()).toBe('fix');
   });
@@ -4049,7 +4068,7 @@ describe('AgentsViewController — dispatch editor mount', () => {
     expect(b.view().dispatch.editor.getText()).toBe('do');
   });
 
-  it('Esc returns focus to the list; a second Esc closes the view', async () => {
+  it('Esc returns focus to the list; a second Esc is a no-op, it never closes the view', async () => {
     const b = await boot([summary('s1')]);
     dir = b.homeDir;
     b.component().handleInput('d');
@@ -4059,7 +4078,7 @@ describe('AgentsViewController — dispatch editor mount', () => {
     expect(b.view().dispatch.editor.focused).toBe(false);
     expect(b.controller.isOpen).toBe(true);
     b.component().handleInput(ESC);
-    expect(b.controller.isOpen).toBe(false);
+    expect(b.controller.isOpen).toBe(true);
   });
 
   it('Enter in the focused dispatch editor submits the dispatch and unfocuses', async () => {

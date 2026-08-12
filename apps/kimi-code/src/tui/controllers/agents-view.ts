@@ -1857,7 +1857,10 @@ export class AgentsViewController {
         }
         const row = view.roster.get(id);
         if (row === undefined) return;
-        view.renameDraft = { sessionId: id, text: row.title };
+        // Empty draft: the rename editor starts blank (the user types the
+        // new name from scratch), so the only thing the draft must carry is
+        // WHICH row is being renamed.
+        view.renameDraft = { sessionId: id, text: '' };
         this.pushProps();
       },
       onRenameSubmit: (id, text) => {

@@ -34,9 +34,12 @@
  *   callback, on its own `DELETE_ARM_WINDOW_MS` auto-expire, and if a
  *   roster refresh removes the armed row outright. Mutually exclusive with
  *   `confirmDeleteId` — never both set at once.
- * - Rename cancel: Esc during rename submits the ORIGINAL title via
- *   `onRenameSubmit`; the controller treats an unchanged title as a cancel
- *   (clears `renameDraft`, skips the SDK call).
+ * - Rename: the inline editor starts EMPTY — the user types the new name
+ *   from scratch instead of editing a pre-filled copy of the old title
+ *   (`beginRename` keeps the original only for cancel). Esc during rename
+ *   submits the ORIGINAL title via `onRenameSubmit`; the controller treats
+ *   an unchanged (or blank) title as a cancel (clears `renameDraft`, skips
+ *   the SDK call).
  * - Dispatch editor: the mounted `dispatchEditor` renders into the bottom
  *   box. While `dispatchFocused`, every key routes to the editor with two
  *   exceptions: Esc is the editor's own `onEscape` (the controller wires it
@@ -72,12 +75,13 @@
  * - Reorder: `shift+↑↓` fires `onReorderPinned` only for a PINNED row;
  *   the callback is a no-op signal for anything else, so the controller
  *   need not re-check `pinned` itself.
- * - Esc closes the innermost overlay (rename/dispatch-focused/help/delete
- *   confirm/delete arm each already absorb it above the branch below); past
- *   that it calls `onQuit()`, full stop — same as the exit command path. It
- *   never re-attaches to `props.originId`: that field only drives the row's
- *   bold "came from" styling now (see its own doc comment), a cosmetic
- *   marker independent of Esc/quit.
+ * - Esc closes the innermost overlay (rename/dispatch-focused/help each
+ *   absorb it in their own branches above; a pending delete arm/confirm is
+ *   cancelled via `onQuit`, the controller's shared cancel path). Past that
+ *   Esc is a NO-OP — it never quits the view, it is far too easy to hit by
+ *   accident; leaving is Ctrl+C's two-stage confirm or the exit command.
+ *   `props.originId` only drives the row's bold "came from" styling (see
+ *   its own doc comment), a cosmetic marker independent of quit.
  * - Ctrl+C is a genuine two-stage confirm-to-exit, independent of Esc/origin:
  *   every press just reports `onCtrlC()` — the component makes no arm/quit
  *   decision itself and holds no timer. The controller owns the actual
@@ -476,10 +480,13 @@ export class AgentsViewApp extends Container implements Focusable {
 
     // Rename is a modal inline editor: all keys edit / submit / cancel.
     if (this.rename === undefined && this.props.renameDraft !== undefined) {
+      // Same empty-start rule as `beginRename`: a remount mid-rename (the
+      // draft lives in view state, this component's local `rename` does
+      // not) still opens on a blank editor.
       this.rename = {
         id: this.props.renameDraft.sessionId,
-        original: this.findRow(this.props.renameDraft.sessionId)?.title ?? this.props.renameDraft.text,
-        text: this.props.renameDraft.text,
+        original: this.findRow(this.props.renameDraft.sessionId)?.title ?? '',
+        text: '',
       };
     }
     if (this.rename !== undefined) {
@@ -569,11 +576,14 @@ export class AgentsViewApp extends Container implements Focusable {
     }
 
     if (matchesKey(data, Key.escape)) {
-      // A pending delete confirm is itself the innermost thing to dismiss —
-      // onQuit is how it cancels (the controller clears confirmDeleteId
-      // instead of closing); every other case just quits (R9 Q3: no
-      // origin-return — see the class docstring).
-      this.props.onQuit();
+      // Esc never quits the view — it is far too easy to hit by accident.
+      // Leaving is Ctrl+C (two-stage, above) or the exit command only. Esc
+      // still cancels a pending delete arm/confirm: `onQuit` is the
+      // controller's shared cancel path for those (it clears the overlay
+      // instead of closing when one is set).
+      if (this.props.armedDeleteId !== undefined || this.props.confirmDeleteId !== undefined) {
+        this.props.onQuit();
+      }
       return;
     }
 
@@ -743,7 +753,10 @@ export class AgentsViewApp extends Container implements Focusable {
    */
   private beginRename(item: ViewItem | undefined): void {
     if (item === undefined || item.kind !== 'row' || item.row === undefined) return;
-    this.rename = { id: item.id, original: item.row.title, text: item.row.title };
+    // The editor starts EMPTY: the user types the new name from scratch
+    // instead of editing a pre-filled copy of the old title (the original is
+    // kept only so Esc-cancel has something unchanged to resubmit).
+    this.rename = { id: item.id, original: item.row.title, text: '' };
     this.props.onRenameBegin(item.id);
     this.invalidate();
   }
