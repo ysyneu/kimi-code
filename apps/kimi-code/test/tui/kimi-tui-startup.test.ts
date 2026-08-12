@@ -2488,9 +2488,10 @@ describe('KimiTUI agents-view attach', () => {
 
   async function bootAgentsView(
     harness: ReturnType<typeof makeAgentsHarness>['harness'],
+    cliOptions: Parameters<typeof makeStartupInput>[0] = {},
   ): Promise<AttachDriver> {
     const driver = makeDriver(harness, {
-      ...makeStartupInput(),
+      ...makeStartupInput(cliOptions),
       startupAgentsView: true,
     }) as unknown as AttachDriver;
     await driver.init();
@@ -2530,6 +2531,20 @@ describe('KimiTUI agents-view attach', () => {
     expect(view?.roster.counts().working).toBe(1);
   });
 
+  it('attach under `--auto --plan` applies the startup modes to the resumed session (same contract as a startup resume)', async () => {
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness, { auto: true, plan: true });
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(session.setPermission).toHaveBeenCalledWith('auto');
+    expect(session.setPlanMode).toHaveBeenCalledWith(true);
+  });
+
   it('a failed attach leaves the view mounted and shows the error on its own visible flash, not the (detached) host surface', async () => {
     const session = makeAttachSession('ses-attached');
     const { harness } = makeAgentsHarness(session);
@@ -2539,8 +2554,11 @@ describe('KimiTUI agents-view attach', () => {
 
     driver.onOpenSession('ses-attached');
 
+    // The in-flight "Attaching session…" flash lands first, so waiting on
+    // the flash being DEFINED is no longer enough — wait for the error
+    // itself to replace it.
     await vi.waitFor(() => {
-      expect(driver.state.agentsView?.flashMessage).toBeDefined();
+      expect(driver.state.agentsView?.flashMessage).toContain('server exploded');
     });
     // detachForAttach never ran (the resume failed before it) — the view is
     // still mounted, so host.showError (which renders into the UI-tree
@@ -2600,9 +2618,11 @@ describe('KimiTUI agents-view attach', () => {
       expect(harness.resumeSession).toHaveBeenCalled();
     });
     // Mid-wait: the roster is still the mounted tree — the stale chat never
-    // got a frame.
+    // got a frame — and the attach is announced on the roster's own flash
+    // line, so a slow resume no longer reads as a frozen UI.
     expect(driver.state.agentsView?.detached).toBe(false);
     expect(driver.session).toBeUndefined();
+    expect(driver.state.agentsView?.flashMessage).toBe('Attaching session…');
 
     release!();
     await vi.waitFor(() => {
@@ -2610,6 +2630,9 @@ describe('KimiTUI agents-view attach', () => {
     });
     expect(driver.state.agentsView?.detached).toBe(true);
     expect(driver.session?.id).toBe('ses-attached');
+    // detachForAttach cleared the progress flash with the detach — nothing
+    // stale greets the user on the next return to the roster.
+    expect(driver.state.agentsView?.flashMessage).toBeUndefined();
   });
 
   it('a second open during an in-flight attach is refused — no second resume, and the guard resets afterwards', async () => {

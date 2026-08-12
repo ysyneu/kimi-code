@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { Event, KimiHarness, Session, SessionSummary, WireSession } from '@moonshot-ai/kimi-code-sdk';
+import type { Event, KimiHarness, PermissionMode, Session, SessionSummary, WireSession } from '@moonshot-ai/kimi-code-sdk';
 import { SDKRpcClientWire } from '@moonshot-ai/kimi-code-sdk';
 import type { Component, Container, ProcessTerminal, Terminal, TUI } from '@moonshot-ai/pi-tui';
 import chalk from 'chalk';
@@ -365,6 +365,9 @@ async function boot(
     /** I6: `host.agentsViewSessionsSurviveExit()`; defaults to `true` (the
      *  non-embedded, common case). Set `false` to simulate embedded mode. */
     sessionsSurviveExit?: boolean;
+    /** Seeds `host.agentsViewStartupPermission()`; defaults to `undefined`
+     *  (no `--auto`/`--yolo` on the command line). */
+    startupPermission?: PermissionMode;
   } = {},
 ): Promise<Boot> {
   const homeDir = await mkdtemp(join(tmpdir(), 'agents-view-controller-'));
@@ -410,6 +413,7 @@ async function boot(
     agentsViewServerLabel: () => 'test-server',
     agentsViewSessionsSurviveExit: () => opts.sessionsSurviveExit ?? true,
     agentsViewWorkDir: () => opts.workDir ?? '/home/user/project',
+    agentsViewStartupPermission: () => opts.startupPermission ?? undefined,
     agentsViewGroupMode: opts.agentsViewGroupMode ?? (() => opts.groupMode ?? 'state'),
     saveAgentsViewGroupMode:
       opts.saveAgentsViewGroupMode ??
@@ -1449,6 +1453,41 @@ describe('AgentsViewController — rename', () => {
     expect(b.render()).toContain('s1 title');
     expect(b.render()).not.toContain('s1 titleX');
   });
+
+  it('Ctrl+R while the dispatch composer is focused renames the selected row — the key never reaches the editor', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN); // select row s1
+    for (const ch of 'fix') b.component().handleInput(ch); // focus the composer, with text
+    expect(b.view().dispatchFocused).toBe(true);
+
+    b.component().handleInput(CTRL_R);
+    expect(b.view().renameDraft).toEqual({ sessionId: 's1', text: 's1 title' });
+    expect(b.view().dispatch.editor.getText()).toBe('fix'); // composer draft untouched
+
+    b.component().handleInput('X'); // edits the rename draft, not the composer
+    b.component().handleInput(ENTER);
+    await flush();
+    expect(b.fake.renameSession).toHaveBeenCalledWith({ id: 's1', title: 's1 titleX' });
+    expect(b.view().renameDraft).toBeUndefined();
+    expect(b.view().dispatch.editor.getText()).toBe('fix');
+  });
+
+  it('Esc cancels a rename started from the focused composer — no SDK call, composer draft kept', async () => {
+    const b = await boot([summary('s1')]);
+    dir = b.homeDir;
+    b.component().handleInput(DOWN);
+    for (const ch of 'fix') b.component().handleInput(ch);
+
+    b.component().handleInput(CTRL_R);
+    b.component().handleInput('X');
+    b.component().handleInput(ESC);
+    await flush();
+    expect(b.fake.renameSession).not.toHaveBeenCalled();
+    expect(b.view().renameDraft).toBeUndefined();
+    expect(b.view().dispatch.editor.getText()).toBe('fix');
+    expect(b.view().dispatchFocused).toBe(true); // composer keeps focus afterwards
+  });
 });
 
 describe('AgentsViewController — arrow keys open the selected session', () => {
@@ -2403,6 +2442,17 @@ describe('AgentsViewController — dispatch', () => {
     await waitForViewState(b.homeDir, {
       pins: new Set(),
       sessions: new Set(['s1', 'new-session']),
+    });
+  });
+
+  it('a dispatch under `kimi --auto agents` stamps the startup permission on createSession', async () => {
+    const b = await boot([summary('s1')], { startupPermission: 'auto' });
+    dir = b.homeDir;
+    b.view().dispatch.editor.onSubmit?.('fix the flaky test');
+    await flush();
+    expect(b.fake.createSession).toHaveBeenCalledWith({
+      workDir: '/home/user/project',
+      permission: 'auto',
     });
   });
 

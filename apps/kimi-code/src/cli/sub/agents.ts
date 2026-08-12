@@ -10,16 +10,25 @@
 
 import type { Command } from 'commander';
 
-import { runAgents } from './agents-run';
+import { runAgents, type AgentsStartupFlags } from './agents-run';
 
 export function registerAgentsCommand(
   parent: Command,
-  run: () => Promise<void> = runAgents,
+  run: (startupFlags: AgentsStartupFlags) => Promise<void> = runAgents,
 ): void {
   parent
     .command('agents')
     .description('Open the agents view: dispatch new sessions and monitor running ones.')
     .action(async () => {
-      await run();
+      // `--auto`/`--yolo`/`--plan` are program-level options, so `kimi --auto
+      // agents` lands them on the parent — forward them or the view would
+      // silently fall back to manual permission mode. Same hidden-alias
+      // folding the main command handler applies to `--yes`/`--auto-approve`.
+      const opts = parent.opts<Record<string, unknown>>();
+      await run({
+        auto: opts['auto'] === true,
+        yolo: opts['yolo'] === true || opts['yes'] === true || opts['autoApprove'] === true,
+        plan: opts['plan'] === true,
+      });
     });
 }

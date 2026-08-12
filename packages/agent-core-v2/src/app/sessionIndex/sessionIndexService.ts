@@ -81,6 +81,7 @@ import {
 import {
   PARENT_INDEX_NAME,
   SESSION_INDEX_MANIFEST,
+  aggregateErrorDetails,
   recencyColumn,
   sessionCollection,
   sessionCountersCollection,
@@ -282,7 +283,10 @@ export class FileSessionIndex extends Disposable implements ISessionIndex {
       await this.projector.reconcile(manifest.seq);
     } catch (error) {
       // A failed reconcile leaves reads intact; it retries on the next tick.
-      this.log.warn('session index reconciliation failed', { error: String(error) });
+      this.log.warn('session index reconciliation failed', {
+        error: String(error),
+        ...aggregateErrorDetails(error),
+      });
     }
   }
 

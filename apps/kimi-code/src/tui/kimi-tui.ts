@@ -114,7 +114,7 @@ import {
 } from './constant/kimi-tui';
 import { CHROME_GUTTER } from './constant/rendering';
 import { MAX_TERMINAL_TITLE_LENGTH } from './constant/terminal';
-import { AgentsViewController, attachRpcTimeoutMs, raceTimeout } from './controllers/agents-view';
+import { AgentsViewController, attachRpcTimeoutMs, raceTimeout, replyRpcTimeoutMs } from './controllers/agents-view';
 import type { DispatchActivatableCommands } from './controllers/agents-view-dispatch';
 import type { AgentsGroupMode } from './controllers/agents-view-groups';
 import { AuthFlowController } from './controllers/auth-flow';
@@ -1803,6 +1803,16 @@ export class KimiTUI {
   }
 
   /**
+   * AgentsViewHost: startup permission mode (`--auto`/`--yolo`) for sessions
+   * dispatched from the view — same precedence as the startup session's
+   * `createSessionOptions` in init() (`auto` over `yolo`).
+   */
+  agentsViewStartupPermission(): PermissionMode | undefined {
+    const { startup } = this.options;
+    return startup.auto ? 'auto' : startup.yolo ? 'yolo' : undefined;
+  }
+
+  /**
    * Display label for the model new sessions dispatch with, when no
    * `/model` override is staged. Same alias-resolution the welcome panel and
    * footer use for the active session's model.
@@ -2112,6 +2122,24 @@ export class KimiTUI {
     this.setAppState(patch);
   }
 
+  /**
+   * The model the engine would bind at an unbound session's first turn:
+   * `--model` wins, then `defaultModel` from config — the same precedence
+   * `hydrateLazyConfigDefaults` seeds into appState. Best-effort: an
+   * unreadable config yields '', leaving the client's LLM-not-set guard in
+   * place (which is correct when there is genuinely no default to bind).
+   */
+  private async configDefaultModel(): Promise<string> {
+    const { startup } = this.options;
+    if (startup.model !== undefined) return startup.model;
+    try {
+      const config = await this.harness.getConfig();
+      return config.defaultModel ?? '';
+    } catch {
+      return '';
+    }
+  }
+
   private async createSessionFromCurrentState(bindStartupAgent = false): Promise<Session> {
     // Background warm-up of the cache-hint config on every new session.
     this.cacheHint.refreshConfigInBackground();
@@ -2239,6 +2267,15 @@ export class KimiTUI {
 
   async syncRuntimeState(session: Session = this.requireSession()): Promise<void> {
     const [status, goalResult] = await Promise.all([session.getStatus(), session.getGoal()]);
+    // A not-yet-bound session (v2/wire create is model-less by design; the
+    // engine binds `defaultModel` at the first turn's profile bind) reports
+    // no model. Mirror that turn-start fallback here: syncing `''` would wipe
+    // the hydrated default and trip the client's own LLM-not-set guard on the
+    // session's very first prompt. Cheap: one config read, only in this case.
+    const fallbackModel =
+      status.model === undefined || status.model.length === 0
+        ? await this.configDefaultModel()
+        : undefined;
     // R9 I1: every switch/attach path calls this right after resetSessionRuntime
     // forced streamingPhase to 'idle' — so on a session that is ALREADY busy
     // (attaching to a live spinner row is a primary agents-view use case, not
@@ -2270,7 +2307,7 @@ export class KimiTUI {
     }
     this.setAppState({
       sessionId: session.id,
-      model: status.model ?? '',
+      model: status.model || fallbackModel || '',
       thinkingEffort: status.thinkingEffort,
       permissionMode: status.permission,
       planMode: status.planMode,
@@ -2498,6 +2535,10 @@ export class KimiTUI {
    * the server-side materialization chain has unbounded `.ready` waits and
    * the client HTTP layer no timeout of its own, so without a bound here a
    * wedged resume means the Enter does nothing, forever, with zero feedback.
+   * The wait is announced up front via the roster's own flash ("Attaching
+   * session…") so a slow-but-alive attach no longer reads as a frozen UI;
+   * detachForAttach clears it on success, the error flash replaces it on
+   * failure.
    * The streaming/replay guards of {@link resumeSession}
    * are intentionally absent: on the wire transport the switch is a local
    * detach, so an in-flight turn on either session keeps running.
@@ -2524,6 +2565,15 @@ export class KimiTUI {
     }
     this.agentsViewAttachInFlight = true;
     try {
+      // Immediate visible feedback for the whole bounded wait below (the
+      // roster stays mounted and otherwise looks frozen for up to
+      // attachRpcTimeoutMs). Cleared on success by detachForAttach's own
+      // flash reset; replaced by the error flash on failure — the duration
+      // only backstops a wait that never reaches either (reply barrier +
+      // resume can stack, hence the sum).
+      this.agentsViewController.notifyUser(this.state.agentsView, 'Attaching session…', {
+        durationMs: replyRpcTimeoutMs() + attachRpcTimeoutMs(),
+      });
       // R9 Q1a: a reply just fired at this row from the roster is
       // fire-and-forget — wait for it to settle (success or the bounded
       // give-up) before taking the attach snapshot, so the snapshot can never
@@ -2549,6 +2599,10 @@ export class KimiTUI {
         return;
       }
       try {
+        // Same startup-flag contract as a startup resume (`--auto`/`--yolo`/
+        // `--plan` apply to the session being entered); a no-op when none
+        // were passed.
+        await this.applyStartupModesToResumedSession(session);
         await this.prepareSessionSwitch(session);
       } catch (error) {
         const msg = formatErrorMessage(error);

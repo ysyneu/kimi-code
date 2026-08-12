@@ -34,4 +34,28 @@ describe('kimi agents — registration', () => {
     expect(run).toHaveBeenCalledOnce();
     expect(onMain).not.toHaveBeenCalled();
   });
+
+  it('forwards program-level --auto/--yolo/--plan to the runner', async () => {
+    const run = vi.fn(async () => {});
+    const program = new Command('kimi');
+    program
+      .option('-y, --yolo', 'yolo', false)
+      .option('--auto', 'auto', false)
+      .option('--plan', 'plan', false);
+    registerAgentsCommand(program, run);
+
+    await program.parseAsync(['node', 'kimi', '--auto', '--plan', 'agents']);
+    expect(run).toHaveBeenCalledWith({ auto: true, yolo: false, plan: true });
+
+    const yoloRun = vi.fn(async () => {});
+    const yoloProgram = new Command('kimi');
+    yoloProgram
+      .option('-y, --yolo', 'yolo', false)
+      .option('--auto', 'auto', false)
+      .option('--plan', 'plan', false);
+    registerAgentsCommand(yoloProgram, yoloRun);
+
+    await yoloProgram.parseAsync(['node', 'kimi', '-y', 'agents']);
+    expect(yoloRun).toHaveBeenCalledWith({ auto: false, yolo: true, plan: false });
+  });
 });

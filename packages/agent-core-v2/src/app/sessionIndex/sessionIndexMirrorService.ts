@@ -37,6 +37,7 @@ import { IQueryStore } from '#/persistence/interface/queryStore';
 import { ISessionIndexMirror, type SessionSummary } from './sessionIndex';
 import {
   SESSION_INDEX_MANIFEST,
+  aggregateErrorDetails,
   recencyColumn,
   sessionCollection,
   sessionCountersCollection,
@@ -212,6 +213,7 @@ export class SessionIndexMirror extends Disposable implements ISessionIndexMirro
         pending: this.pendingMap.size,
         failures: this.consecutiveFailures,
         error: String(error),
+        ...aggregateErrorDetails(error),
       });
       if (this.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
         this.log.warn('session index mirror giving up until the next record; reconciliation will heal', {

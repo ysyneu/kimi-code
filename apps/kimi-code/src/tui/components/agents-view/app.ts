@@ -38,8 +38,11 @@
  *   `onRenameSubmit`; the controller treats an unchanged title as a cancel
  *   (clears `renameDraft`, skips the SDK call).
  * - Dispatch editor: the mounted `dispatchEditor` renders into the bottom
- *   box. While `dispatchFocused`, every key routes to the editor — Esc is
- *   the editor's own `onEscape` (the controller wires it to unfocus).
+ *   box. While `dispatchFocused`, every key routes to the editor with two
+ *   exceptions: Esc is the editor's own `onEscape` (the controller wires it
+ *   to unfocus), and Ctrl+R — meaningless inside a text editor — renames
+ *   the selected roster row instead (same rename flow as the list-focused
+ *   Ctrl+R; the modal branch above owns every key from there).
  *   List-focused, a printable char focuses the editor and feeds it the
  *   text; the sole printable shortcut (`?`) only acts while the editor is
  *   EMPTY, once it holds text every printable char belongs to it.
@@ -504,6 +507,14 @@ export class AgentsViewApp extends Container implements Focusable {
     // onEscape (the controller wires it to close the panel); Enter-with-text
     // is the editor's own submit.
     if (this.props.dispatchFocused) {
+      // Ctrl+R has no meaning inside a text editor, so it always renames
+      // the selected roster row — even while the composer owns every other
+      // key. The rename modal branch above takes over from the next
+      // keypress on, so Esc/Enter semantics match a list-focused rename.
+      if (matchesKey(data, Key.ctrl('r'))) {
+        this.beginRename(this.deriveItems()[this.selectedIndex]);
+        return;
+      }
       if (this.props.replyTargetId !== undefined && this.handleReplyPanelKey(data, k)) {
         return;
       }
@@ -641,11 +652,7 @@ export class AgentsViewApp extends Container implements Focusable {
         return;
       }
       if (matchesKey(data, Key.ctrl('r'))) {
-        if (item.kind === 'row' && item.row !== undefined) {
-          this.rename = { id: item.id, original: item.row.title, text: item.row.title };
-          this.props.onRenameBegin(item.id);
-          this.invalidate();
-        }
+        this.beginRename(item);
         return;
       }
       if (matchesKey(data, Key.ctrl('t'))) {
@@ -725,6 +732,19 @@ export class AgentsViewApp extends Container implements Focusable {
   private routeToDispatch(data: string): void {
     this.props.dispatchEditor.handleInput(data);
     this.props.onDispatchFocusChange(true);
+    this.invalidate();
+  }
+
+  /**
+   * Ctrl+R's single rename entry point, shared by the list-focused branch
+   * and the dispatch-focused intercept (the key means the same thing in
+   * both focus states). Only a `row` item can be renamed — anything else
+   * (header, `more`, nothing selected) just consumes the key.
+   */
+  private beginRename(item: ViewItem | undefined): void {
+    if (item === undefined || item.kind !== 'row' || item.row === undefined) return;
+    this.rename = { id: item.id, original: item.row.title, text: item.row.title };
+    this.props.onRenameBegin(item.id);
     this.invalidate();
   }
 

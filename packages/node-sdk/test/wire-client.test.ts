@@ -3,7 +3,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { AGENT_WIRE_PROTOCOL_VERSION, ErrorCodes } from '@moonshot-ai/agent-core';
-import { ISessionMetadata, getLiveSessionById } from '@moonshot-ai/agent-core-v2';
+import {
+  IAgentLifecycleService,
+  IAgentPermissionModeService,
+  IAgentProfileService,
+  ISessionMetadata,
+  getLiveSessionById,
+} from '@moonshot-ai/agent-core-v2';
 import {
   startServer,
   type RunningServer,
@@ -704,6 +710,46 @@ describe('SDKRpcClientWire lifecycle', () => {
       origin: 'wire-sdk-test',
       attempt: 2,
     });
+    await rpc.close();
+  });
+
+  it('forwards explicit model/permission on create to the main agent', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    // The REST create route drops every option outside metadata/title; the
+    // client must apply the explicit ones through the agent_config profile
+    // patch, mirroring the in-process transports' create-time bind.
+    const created = await rpc.createSession({
+      workDir: cwd,
+      model: 'stub',
+      permission: 'auto',
+    });
+    const live = getLiveSessionById(server.core.accessor, created.id);
+    const main = live?.accessor.get(IAgentLifecycleService).get('main');
+    expect(main?.accessor.get(IAgentProfileService).data().modelAlias).toBe('stub');
+    expect(main?.accessor.get(IAgentPermissionModeService).mode).toBe('auto');
+    await rpc.close();
+  });
+
+  it('binds the config default_model on the first prompt of a model-less session', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    // No model at create (the agents-view dispatch shape): the session is
+    // created model-less…
+    const created = await rpc.createSession({ workDir: cwd });
+    const live = getLiveSessionById(server.core.accessor, created.id);
+    expect(live?.accessor.get(IAgentLifecycleService).get('main')).toBeUndefined();
+    // …and the first prompt binds the default profile with the server
+    // config's default_model — the fallback the in-process createSession
+    // applies eagerly (kap-server's `ensureMainAgentBound`).
+    await rpc.prompt({ sessionId: created.id, input: [{ type: 'text', text: 'hi' }] });
+    const profile = live?.accessor.get(IAgentLifecycleService).get('main')?.accessor
+      .get(IAgentProfileService).data();
+    expect(profile?.profileName).toBe('agent');
+    expect(profile?.modelAlias).toBe('stub');
+    // The stub provider's turn retries against an unreachable endpoint —
+    // abort it so the test leaves nothing running.
+    await rpc.cancel({ sessionId: created.id });
     await rpc.close();
   });
 

@@ -133,7 +133,15 @@ export class WireHttpClient {
 
   updateSessionProfile(
     id: string,
-    body: { title?: string; metadata?: Record<string, unknown> },
+    body: {
+      title?: string;
+      metadata?: Record<string, unknown>;
+      agent_config?: {
+        model?: string;
+        thinking?: string;
+        permission_mode?: 'manual' | 'yolo' | 'auto';
+      };
+    },
   ): Promise<WireSession> {
     return this.request('POST', `/sessions/${id}/profile`, body, wireSessionSchema);
   }

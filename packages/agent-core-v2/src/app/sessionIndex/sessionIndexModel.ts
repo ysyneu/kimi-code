@@ -60,3 +60,19 @@ export function stripRecencyField(generation: number, record: SessionSummary): S
   delete rest[key];
   return rest as unknown as SessionSummary;
 }
+
+/**
+ * Flatten an `AggregateError` (e.g. the query-store batch fan-out's
+ * "batch failed on N/M shard(s)") into log fields: `String()` on the
+ * aggregate alone hides the per-shard causes, which are the only part that
+ * says WHY (lock timeout, corruption, …). Non-aggregate errors yield no
+ * fields. Causes are capped so a pathological fan-out cannot flood the log.
+ */
+export function aggregateErrorDetails(error: unknown): { causes?: string[] } {
+  if (!(error instanceof AggregateError)) return {};
+  return {
+    causes: error.errors
+      .slice(0, 8)
+      .map((cause) => (cause instanceof Error ? cause.message : String(cause))),
+  };
+}

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { parseIntegerEnv } from '@moonshot-ai/agent-core-v2';
-import type { Event, KimiHarness, PromptPart, Unsubscribe, WireSession } from '@moonshot-ai/kimi-code-sdk';
+import type { Event, KimiHarness, PermissionMode, PromptPart, Unsubscribe, WireSession } from '@moonshot-ai/kimi-code-sdk';
 import type { Component, Container, ProcessTerminal, TUI } from '@moonshot-ai/pi-tui';
 
 import { AgentsRoster, type AgentsGroup, type AgentsRosterRow } from '../agents/roster';
@@ -62,6 +62,14 @@ export interface AgentsViewHost {
   agentsViewSessionsSurviveExit(): boolean;
   /** Dispatch target: every session created from the view opens in this cwd. */
   agentsViewWorkDir(): string;
+  /**
+   * Startup permission mode (`kimi --auto/--yolo agents`) stamped onto every
+   * session dispatched from the view — same precedence the main shell's
+   * startup `createSession` applies (`auto` over `yolo`). `undefined` leaves
+   * the server-side default in effect. Read at dispatch time, same "read
+   * once, no I/O on the read path" footing as `agentsViewWorkDir`.
+   */
+  agentsViewStartupPermission(): PermissionMode | undefined;
   /**
    * Initial roster grouping mode for a fresh `show()` mount — read from the
    * host's already-loaded startup config (same "read once, keep in memory"
@@ -1168,6 +1176,7 @@ export class AgentsViewController {
     try {
       session = await this.host.harness.createSession({
         workDir: this.host.agentsViewWorkDir(),
+        permission: this.host.agentsViewStartupPermission(),
       });
     } catch (error) {
       if (this.host.state.agentsView !== view) return;
@@ -2225,11 +2234,19 @@ export class AgentsViewController {
    * this class (`KimiTUI.attachAgentsViewSession`'s pre-`detachForAttach`
    * resume failure) holds no `AgentsViewState` reference of its own and
    * reads `this.state.agentsView` (the same object, via `AgentsViewHost`)
-   * fresh at the call site instead.
+   * fresh at the call site instead. `options.durationMs` overrides the
+   * flash's default auto-expiry — used by the attach-in-progress indicator,
+   * which must outlast the whole bounded attach wait (a success clears the
+   * flash via `detachForAttach`, a failure replaces it with the error
+   * flash, so the timer is only a backstop there).
    */
-  notifyUser(view: AgentsViewState | undefined, message: string, options: { error?: boolean } = {}): void {
+  notifyUser(
+    view: AgentsViewState | undefined,
+    message: string,
+    options: { error?: boolean; durationMs?: number } = {},
+  ): void {
     if (view !== undefined && !view.detached) {
-      this.flash(message);
+      this.flash(message, options.durationMs);
       return;
     }
     if (options.error === true) this.host.showError(message);

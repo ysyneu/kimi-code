@@ -518,6 +518,26 @@ export class SDKRpcClientWire extends SDKRpcClientBase {
     if (input.metadata !== undefined && Object.keys(input.metadata).length > 0) {
       await this.http.updateSessionProfile(created.id, { metadata: { ...input.metadata } });
     }
+    // The explicit agent options are dropped by the create route the same
+    // way; apply them through the `agent_config` profile patch `setModel` /
+    // `setPermission` already use, mirroring the in-process transports that
+    // bind the requested model/thinking/permission at create time. Options
+    // left unset keep the server-side defaults: the config `default_model`
+    // binds at the first turn (kap-server's `ensureMainAgentBound`) and the
+    // config default permission mode applies at agent materialization.
+    if (
+      input.model !== undefined ||
+      input.thinking !== undefined ||
+      input.permission !== undefined
+    ) {
+      await this.http.updateSessionProfile(created.id, {
+        agent_config: {
+          model: input.model,
+          thinking: input.thinking,
+          permission_mode: input.permission,
+        },
+      });
+    }
     // No subscription: an empty session produces no events; resume/prompt
     // attaches the cursor when there is something to stream.
     // v1/v2 return the caller's metadata verbatim on create (not the merged

@@ -7178,6 +7178,53 @@ describe('transcript step and assistant folding', () => {
       }
     });
 
+    it('falls back to the config default model when the attached session has not bound one yet', async () => {
+      // v2/wire create is model-less by design — the engine binds
+      // `defaultModel` at the first turn's profile bind. Syncing that empty
+      // model verbatim would wipe appState and trip the client's own
+      // LLM-not-set guard on the session's first prompt.
+      const unbound = makeSession({
+        getStatus: vi.fn(async () => ({
+          model: undefined,
+          thinkingEffort: 'off',
+          permission: 'manual',
+          planMode: false,
+          contextTokens: 0,
+          maxContextTokens: 100,
+          contextUsage: 0,
+          busy: false,
+        })),
+      });
+      const { driver } = await makeDriver(unbound, {
+        getConfig: vi.fn(async () => ({ defaultModel: 'k3', models: {} })),
+      });
+
+      await (driver as unknown as KimiTUI).syncRuntimeState(unbound as never);
+
+      expect(driver.state.appState.model).toBe('k3');
+    });
+
+    it('keeps the empty model (and its LLM-not-set guard) when neither the session nor the config has a model', async () => {
+      const unbound = makeSession({
+        getStatus: vi.fn(async () => ({
+          model: undefined,
+          thinkingEffort: 'off',
+          permission: 'manual',
+          planMode: false,
+          contextTokens: 0,
+          maxContextTokens: 100,
+          contextUsage: 0,
+          busy: false,
+        })),
+      });
+      // The default harness getConfig carries no defaultModel.
+      const { driver } = await makeDriver(unbound);
+
+      await (driver as unknown as KimiTUI).syncRuntimeState(unbound as never);
+
+      expect(driver.state.appState.model).toBe('');
+    });
+
     it('shows a spinner with the approximate elapsed suffix on the activity pane when attaching mid-turn with zero events delivered', async () => {
       vi.useFakeTimers();
       try {

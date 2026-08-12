@@ -34,22 +34,27 @@ import type { CLIOptions } from '#/cli/options';
 import { createCliTelemetryBootstrap } from '#/cli/telemetry';
 import { createKimiCodeHostIdentity, getVersion } from '#/cli/version';
 
-/** A neutral CLIOptions value — `kimi agents` never opens a chat session. */
-const AGENTS_CLI_OPTIONS: CLIOptions = {
-  session: undefined,
-  continue: false,
-  yolo: false,
-  auto: false,
-  plan: false,
-  model: undefined,
-  outputFormat: undefined,
-  prompt: undefined,
-  skillsDirs: [],
-  agent: undefined,
-  agentFiles: [],
-};
+/** Startup permission/plan flags forwarded from the parent command (`kimi --auto agents`). */
+export type AgentsStartupFlags = Pick<CLIOptions, 'auto' | 'yolo' | 'plan'>;
 
-export async function runAgents(): Promise<void> {
+export async function runAgents(startupFlags: AgentsStartupFlags): Promise<void> {
+  // `kimi agents` never opens a startup chat session itself — only the
+  // permission/plan flags are real, so sessions dispatched from the view
+  // (and ones attached to) honor `--auto`/`--yolo`/`--plan` like the shell.
+  const cliOptions: CLIOptions = {
+    session: undefined,
+    continue: false,
+    yolo: startupFlags.yolo,
+    auto: startupFlags.auto,
+    plan: startupFlags.plan,
+    model: undefined,
+    outputFormat: undefined,
+    prompt: undefined,
+    skillsDirs: [],
+    agent: undefined,
+    agentFiles: [],
+  };
+
   const version = getVersion();
 
   let tuiConfig: TuiConfig;
@@ -93,12 +98,17 @@ export async function runAgents(): Promise<void> {
     homeDir,
     identity,
     telemetry,
-    sessionStartedProperties: { yolo: false, auto: false, plan: false, afk: false },
+    sessionStartedProperties: {
+      yolo: startupFlags.yolo,
+      auto: startupFlags.auto,
+      plan: startupFlags.plan,
+      afk: false,
+    },
   });
   await harness.ensureConfigFile();
 
   const tui = new KimiTUI(harness, {
-    cliOptions: AGENTS_CLI_OPTIONS,
+    cliOptions,
     tuiConfig,
     version,
     workDir: process.cwd(),

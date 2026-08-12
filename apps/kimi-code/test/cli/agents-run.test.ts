@@ -32,6 +32,12 @@ const mocks = vi.hoisted(() => ({
     shutdown: vi.fn(async () => {}),
   })),
   countRunningSessions: vi.fn(async () => 0),
+  createKimiHarnessWire: vi.fn(
+    async (_input: { sessionStartedProperties?: Record<string, boolean> }) => ({
+      ensureConfigFile: mocks.harnessEnsureConfigFile,
+      close: mocks.harnessClose,
+    }),
+  ),
   harnessClose: vi.fn(async () => {}),
   harnessEnsureConfigFile: vi.fn(async () => {}),
   kimiTuiConstructor: vi.fn(),
@@ -47,10 +53,7 @@ vi.mock('@moonshot-ai/kimi-code-sdk', async (importOriginal) => {
     ...actual,
     flushDiagnosticLogsSync: mocks.flushDiagnosticLogsSync,
     log: { error: mocks.logError },
-    createKimiHarnessWire: vi.fn(async () => ({
-      ensureConfigFile: mocks.harnessEnsureConfigFile,
-      close: mocks.harnessClose,
-    })),
+    createKimiHarnessWire: mocks.createKimiHarnessWire,
   };
 });
 
@@ -91,6 +94,8 @@ vi.mock('../../src/utils/terminal-restore', () => ({
   restoreTerminalModes: mocks.restoreTerminalModes,
 }));
 
+const NEUTRAL_FLAGS = { auto: false, yolo: false, plan: false };
+
 describe('runAgents crash handlers', () => {
   afterEach(() => {
     vi.clearAllMocks();
@@ -103,7 +108,7 @@ describe('runAgents crash handlers', () => {
     const exitSpy = mockProcessExit();
 
     try {
-      await runAgents();
+      await runAgents(NEUTRAL_FLAGS);
 
       const rejectionHandler = processOnSpy.mock.calls.find(
         ([event]) => event === 'unhandledRejection',
@@ -139,7 +144,7 @@ describe('runAgents crash handlers', () => {
     const exitSpy = mockProcessExit();
 
     try {
-      await runAgents();
+      await runAgents(NEUTRAL_FLAGS);
 
       const tui = mocks.kimiTuiConstructor.mock.calls[0]![0] as {
         onExit?: (exitCode?: number) => Promise<void>;
@@ -168,5 +173,30 @@ describe('runAgents crash handlers', () => {
       exitSpy.mockRestore();
       stderr.restore();
     }
+  });
+});
+
+describe('runAgents startup flags', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('forwards --auto/--yolo/--plan into the TUI cliOptions and the harness session-started telemetry', async () => {
+    await runAgents({ auto: true, yolo: false, plan: true });
+
+    // Without this, `kimi --auto agents` silently boots the view in manual
+    // permission mode: the flags must reach both the TUI (dispatched/attached
+    // sessions) and the session-started telemetry properties.
+    const startupInput = mocks.kimiTuiConstructor.mock.calls[0]![2] as {
+      cliOptions: { auto: boolean; yolo: boolean; plan: boolean };
+    };
+    expect(startupInput.cliOptions).toMatchObject({ auto: true, yolo: false, plan: true });
+
+    expect(mocks.createKimiHarnessWire.mock.calls[0]![0].sessionStartedProperties).toEqual({
+      yolo: false,
+      auto: true,
+      plan: true,
+      afk: false,
+    });
   });
 });
