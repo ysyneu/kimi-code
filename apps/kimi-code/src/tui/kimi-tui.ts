@@ -2599,6 +2599,10 @@ export class KimiTUI {
         );
       } catch (error) {
         const msg = formatErrorMessage(error);
+        // The roster flash truncates the reason on narrow terminals — keep the
+        // full error (stack included) in the diagnostic log so a wedged
+        // resume is diagnosable after the fact.
+        log.error('agents-view attach resume failed', { sessionId: targetSessionId, error });
         // The view is still mounted here (detachForAttach hasn't run yet) —
         // this.showError would render into the UI-tree child `show()` already
         // detached, so it must go through the controller's own visible
@@ -2615,6 +2619,8 @@ export class KimiTUI {
         await this.prepareSessionSwitch(session);
       } catch (error) {
         const msg = formatErrorMessage(error);
+        // Same full-error logging as the resume failure above.
+        log.error('agents-view attach switch failed', { sessionId: targetSessionId, error });
         // Same mounted-view error channel as the resume failure above —
         // detachForAttach still hasn't run, so the roster never left the
         // screen and there is nothing to remount.

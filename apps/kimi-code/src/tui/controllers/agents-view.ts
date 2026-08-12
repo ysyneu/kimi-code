@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { parseIntegerEnv } from '@moonshot-ai/agent-core-v2';
+import { log } from '@moonshot-ai/kimi-code-sdk';
 import type { Event, KimiHarness, PermissionMode, PromptPart, Unsubscribe, WireSession } from '@moonshot-ai/kimi-code-sdk';
 import type { Component, Container, ProcessTerminal, TUI } from '@moonshot-ai/pi-tui';
 
@@ -2041,23 +2042,38 @@ export class AgentsViewController {
 
     let failed = 0;
     let removed = 0;
+    let firstFailureMessage: string | undefined;
     for (const sessionId of ids) {
       try {
-        await this.host.harness.deleteSession(sessionId);
+        // Bounded like the reply/attach RPCs: the wire archive can wedge
+        // server-side (a live session's drain waits for its turn to settle),
+        // and the client HTTP layer carries no timeout of its own — an
+        // unbounded await here used to hang the delete silently, leaving the
+        // row in place with zero feedback. The losing RPC keeps running in
+        // the background (same semantics as handleReply).
+        await raceTimeout(this.host.harness.deleteSession(sessionId), replyRpcTimeoutMs());
         view.roster.remove(sessionId);
         view.viewSessions.delete(sessionId);
         this.forgetSession(view, sessionId);
         removed += 1;
         if (view.selectedId === sessionId) view.selectedId = undefined;
-      } catch {
+      } catch (error) {
         failed += 1;
+        firstFailureMessage ??= error instanceof Error ? error.message : String(error);
+        // Full error (stack included) to the diagnostic log — the flash
+        // below only carries the short message.
+        log.error('agents-view archive failed', { sessionId, error });
       }
       if (this.host.state.agentsView !== view) return;
       this.pushProps();
     }
     if (removed > 0) void this.persistState(view);
     if (failed > 0) {
-      this.flash(`Failed to archive ${String(failed)} of ${String(ids.length)} session(s)`);
+      this.flash(
+        ids.length === 1
+          ? `Failed to archive session: ${firstFailureMessage ?? 'unknown error'}`
+          : `Failed to archive ${String(failed)} of ${String(ids.length)} session(s)`,
+      );
     } else if (ids.length > 1) {
       this.flash(`Archived ${String(ids.length)} sessions`);
     }

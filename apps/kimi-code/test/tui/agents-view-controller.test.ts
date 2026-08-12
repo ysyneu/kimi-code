@@ -155,7 +155,7 @@ interface FakeHarness {
   harness: KimiHarness;
   listSessions: ReturnType<typeof vi.fn>;
   resumeSession: ReturnType<typeof vi.fn>;
-  deleteSession: ReturnType<typeof vi.fn>;
+  deleteSession: ReturnType<typeof vi.fn<(...args: unknown[]) => Promise<void>>>;
   // B1: the roster's Ctrl+X arm calls this (not `deleteSession`) to stop a
   // BUSY row's turn without archiving it. Explicitly Promise-returning —
   // same reason as `wirePrompt`/`createSession` below: the staleness-guard
@@ -1004,6 +1004,41 @@ describe('AgentsViewController — row delete arm (B1)', () => {
     expect(b.render()).toContain('s2 title');
     // Archiving also drops the session from the persisted view registry.
     await waitForViewState(b.homeDir, { pins: new Set(), sessions: new Set(['s2']) });
+  });
+
+  it('a wedged archive RPC fails the delete after the bounded wait instead of hanging silently — row stays, flash carries the reason', async () => {
+    const b = await boot([summary('s1'), summary('s2')]);
+    dir = b.homeDir;
+    // Never settles — the server-side archive drain can wedge on a live
+    // session's unsettled turn, and the client HTTP layer has no timeout.
+    b.fake.deleteSession.mockImplementationOnce(() => new Promise<void>(() => {}));
+    vi.useFakeTimers();
+    try {
+      b.component().handleInput(DOWN); // onto s1
+      b.component().handleInput(CTRL_X);
+      b.component().handleInput(CTRL_X);
+      await vi.advanceTimersByTimeAsync(replyRpcTimeoutMs());
+
+      // The row survives (nothing was archived server-side that we know of),
+      // and the failure is visible with the bounded-wait reason.
+      expect(b.render()).toContain('s1 title');
+      expect(b.render()).toContain('Failed to archive session: timed out after');
+    } finally {
+      vi.useRealTimers();
+      b.controller.close(); // clear the pending flash timer
+    }
+  });
+
+  it('a single archive rejection flashes the server reason, not just a count', async () => {
+    const b = await boot([summary('s1'), summary('s2')]);
+    dir = b.homeDir;
+    b.fake.deleteSession.mockRejectedValueOnce(new Error('boom'));
+    b.component().handleInput(DOWN); // onto s1
+    b.component().handleInput(CTRL_X);
+    b.component().handleInput(CTRL_X);
+    await flush();
+    expect(b.render()).toContain('s1 title');
+    expect(b.render()).toContain('Failed to archive session: boom');
   });
 
   it('Esc while armed cancels the arm instead of quitting', async () => {
