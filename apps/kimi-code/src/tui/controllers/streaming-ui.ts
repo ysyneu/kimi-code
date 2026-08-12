@@ -569,6 +569,8 @@ export class StreamingUIController {
       // queued-goal promotion, which would otherwise see an empty queue and an
       // idle phase and start a goal ahead of this message.
       state.queuedMessageDispatchPending = true;
+      // setAppState clears the turn-elapsed clock for any 'idle' transition —
+      // no need to repeat streamingStartTime/streamingStartApprox here.
       this.host.setAppState({ streamingPhase: 'idle' });
       this.host.resetLivePane();
       setTimeout(() => {
@@ -578,6 +580,8 @@ export class StreamingUIController {
       return;
     }
 
+    // setAppState clears the turn-elapsed clock for any 'idle' transition —
+    // no need to repeat streamingStartTime/streamingStartApprox here.
     this.host.setAppState({ streamingPhase: 'idle' });
     this.host.resetLivePane();
     notifyTerminalOnce(state, `turn-complete:${completedTurnKey}`, {
@@ -641,6 +645,8 @@ export class StreamingUIController {
         true,
         'live',
         state.ui,
+        state.appState.streamingStartTime,
+        state.appState.streamingStartApprox === true,
       );
       if (state.toolOutputExpanded) this._activeThinkingComponent.setExpanded(true);
       state.transcriptContainer.addChild(this._activeThinkingComponent);

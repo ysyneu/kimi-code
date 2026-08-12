@@ -16,6 +16,7 @@ import {
 import { STATUS_BULLET } from '#/tui/constant/symbols';
 import { currentTheme } from '#/tui/theme';
 import { isRenderCacheEnabled } from '#/tui/utils/render-cache';
+import { formatTurnElapsedSuffix } from '#/tui/utils/turn-elapsed';
 
 export type ThinkingRenderMode = 'live' | 'finalized';
 
@@ -27,6 +28,12 @@ export class ThinkingComponent implements Component {
   private readonly ui: TUI | undefined;
   private spinnerFrame = 0;
   private spinnerInterval: ReturnType<typeof setInterval> | undefined;
+  // Start of the TURN this live block belongs to (not this component's own
+  // mount time), so the elapsed suffix keeps counting from turn start across
+  // phase changes. Undefined renders no suffix — always the case once
+  // finalized, and whenever the caller has no turn clock to give us.
+  private readonly turnStartMs: number | undefined;
+  private readonly turnStartApprox: boolean;
   // Hold a single Text instance so pi-tui's (text, width) → lines cache
   // actually survives across renders. Re-constructing per render destroys
   // the cache and forces full re-wrap on every frame, which dominates CPU
@@ -40,11 +47,15 @@ export class ThinkingComponent implements Component {
     showMarker: boolean = true,
     mode: ThinkingRenderMode = 'finalized',
     ui?: TUI,
+    turnStartMs?: number,
+    turnStartApprox: boolean = false,
   ) {
     this.text = text;
     this.showMarker = showMarker;
     this.mode = mode;
     this.ui = ui;
+    this.turnStartMs = turnStartMs;
+    this.turnStartApprox = turnStartApprox;
     this.textComponent = new Text(this.styled(text), 0, 0);
     if (mode === 'live') {
       this.startSpinner();
@@ -109,9 +120,13 @@ export class ThinkingComponent implements Component {
         'textDim',
         `${BRAILLE_SPINNER_FRAMES[this.spinnerFrame] ?? BRAILLE_SPINNER_FRAMES[0]} `,
       );
+      const elapsedSuffix =
+        this.turnStartMs === undefined
+          ? ''
+          : formatTurnElapsedSuffix(Date.now() - this.turnStartMs, this.turnStartApprox);
       rendered = [
         '',
-        spinner + currentTheme.fg('textDim', 'thinking...'),
+        spinner + currentTheme.fg('textDim', 'thinking...' + elapsedSuffix),
         ...visibleLines.map((line) => MESSAGE_INDENT + line),
       ];
     } else {

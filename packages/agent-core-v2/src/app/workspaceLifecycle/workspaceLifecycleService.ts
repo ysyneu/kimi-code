@@ -1,5 +1,5 @@
 /**
- * `workspaceLifecycle` domain (L6) — `IWorkspaceLifecycleService` implementation.
+ * `workspaceLifecycle` domain — `IWorkspaceLifecycleService` implementation.
  *
  * Holds the live handler registry (`Map<workspaceId, IWorkspaceScopeHandle>`)
  * and materializes handlers through the DI scope tree, seeding each
@@ -17,12 +17,12 @@
  */
 
 import { IInstantiationService } from '#/_base/di/instantiation';
-import { Disposable } from '#/_base/di/lifecycle';
+import { Service } from '#/_base/di/service';
 import { Emitter, type Event } from '#/_base/event';
+import { LifecycleScope } from '#/app/scopes';
 import {
   createScopedChildHandle,
   type IWorkspaceScopeHandle,
-  LifecycleScope,
   ScopeActivation,
   registerScopedService,
 } from '#/_base/di/scope';
@@ -36,8 +36,8 @@ import {
   workspaceContextSeed,
   type IWorkspaceContext,
 } from '#/workspace/workspaceContext/workspaceContext';
-import { IWorkspaceHandlerService } from '#/workspace/workspaceHandler/workspaceHandler';
-import { workspacePersistenceScope } from '#/workspace/workspaceHandler/addressing';
+import { ISessionLifecycleService } from '#/workspace/sessionLifecycle/sessionLifecycle';
+import { workspacePersistenceScope } from '#/workspace/sessionLifecycle/internal/addressing';
 
 import {
   IWorkspaceLifecycleService,
@@ -46,12 +46,9 @@ import {
   type WorkspaceSessionRegistry,
 } from './workspaceLifecycle';
 
-export class WorkspaceLifecycleService extends Disposable implements IWorkspaceLifecycleService {
+export class WorkspaceLifecycleService extends Service implements IWorkspaceLifecycleService {
   declare readonly _serviceBrand: undefined;
   private readonly live = new Map<string, IWorkspaceScopeHandle>();
-  /** In-flight materializations, keyed by workspaceId. Concurrent
-   *  `handlerFor` calls for the same workspace join the in-flight one
-   *  (never a duplicate handler). */
   private readonly materializing = new Map<string, Promise<IWorkspaceScopeHandle>>();
   private readonly _onDidMaterializeHandler = this._register(
     new Emitter<IWorkspaceScopeHandle>(),
@@ -68,7 +65,7 @@ export class WorkspaceLifecycleService extends Disposable implements IWorkspaceL
       const handler = this.live.get(workspaceId);
       if (handler === undefined) return [];
       return handler.accessor
-        .get(IWorkspaceHandlerService)
+        .get(ISessionLifecycleService)
         .list()
         .map((session) => session.id);
     },
@@ -96,10 +93,6 @@ export class WorkspaceLifecycleService extends Disposable implements IWorkspaceL
       }
       return this.joinMaterialization(ref.workspaceId, root);
     }
-    // Resolve the id through the catalog first (registry folding may reuse an
-    // id minted for another spelling) so alias spellings join one
-    // materialization; the resolved record doubles as the seed metadata, so
-    // the catalog is written exactly once per handler.
     const workspace = await this.workspaces.createOrTouch(ref.root);
     const existing = this.live.get(workspace.id);
     if (existing !== undefined) return existing;
@@ -125,9 +118,6 @@ export class WorkspaceLifecycleService extends Disposable implements IWorkspaceL
     root: string,
     known?: Workspace,
   ): Promise<IWorkspaceScopeHandle> {
-    // Refresh the catalog record (re-creating it when the caller addressed
-    // the handler by id + root hint and the record is gone) and seed the
-    // canonical root the registry resolved.
     const workspace = known ?? (await this.workspaces.createOrTouch(root));
     const ctx: IWorkspaceContext = {
       _serviceBrand: undefined,
@@ -144,7 +134,7 @@ export class WorkspaceLifecycleService extends Disposable implements IWorkspaceL
       this.instantiation,
       LifecycleScope.Workspace,
       workspaceId,
-      { extra: workspaceContextSeed(ctx) },
+      { seeds: workspaceContextSeed(ctx) },
     ) as IWorkspaceScopeHandle;
     this.live.set(workspaceId, handle);
     this._onDidMaterializeHandler.fire(handle);

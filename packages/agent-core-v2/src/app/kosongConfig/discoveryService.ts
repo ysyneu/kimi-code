@@ -1,13 +1,16 @@
 /**
- * `kosongConfig` domain (L3) — `IProviderDiscoveryService` implementation.
+ * `kosongConfig` domain — `IProviderDiscoveryService` implementation.
  *
- * Owns the all-provider model refresh: delegates to the shared
- * `@moonshot-ai/kimi-code-oauth` orchestrator (managed OAuth + open
- * platforms + custom registries), writes the discovered providers/models
- * into config through ONE atomic `replaceSections` transition (the
- * persistence bridge then syncs them into kosong's in-memory registries),
- * and publishes `event.model_catalog.changed` on change. Bound at App
- * scope.
+ * Owns the all-provider model refresh: delegates to the shared OAuth
+ * orchestrator (managed OAuth + open platforms + custom registries), writes
+ * the discovered providers/models into config through ONE atomic
+ * `replaceSections` transition (the persistence bridge then syncs them into
+ * kosong's in-memory registries), and publishes `event.model_catalog.changed`
+ * on change. Bound at App scope.
+ *
+ * Custom registries are third-party endpoints, so the refresh User-Agent
+ * carries the configured custom identity's product token, matching what chat
+ * requests send.
  *
  * `modelSource: 'static'` short-circuits refresh: a provider whose effective
  * model source is `static` (config-declared, or declared by its vendor
@@ -32,8 +35,7 @@
  *    also go through config (like the OAuth flows), since the env overlay
  *    may pin the runtime default and only the config effective view knows.
  *
- * Credential detection goes through the provider-definition registry
- * (`resolveProviderEndpoint` against the provider's config env bag), not a
+ * Credential detection goes through the provider-definition registry, not a
  * per-protocol env table.
  */
 
@@ -44,14 +46,15 @@ import {
   type RefreshProviderHost,
   type RefreshResult,
 } from '@moonshot-ai/kimi-code-oauth';
-
-import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
+import { LifecycleScope } from '#/app/scopes';
+import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { Error2 } from '#/_base/errors/errors';
 import { IOAuthService } from '#/app/auth/auth';
+import { AuthErrors } from '#/app/auth/errors';
+import { IAgentIdentity } from '#/app/agentIdentity/agentIdentity';
 import { IConfigService } from '#/app/config/config';
 import { IEventService } from '#/app/event/event';
 import { ModelCatalogErrors } from '#/kosong/model/errors';
-import { IHostRequestHeaders } from '#/kosong/model/hostRequestHeaders';
 import { type ModelRecord } from '#/kosong/model/model';
 import {
   IProviderService,
@@ -73,11 +76,6 @@ import {
   type RefreshProviderModelsResponse,
 } from './discovery';
 
-/**
- * Statically-sourced providers (and their bound models) hidden from the
- * refresh orchestrator, plus the user's default selection when it points at
- * an excluded model.
- */
 interface StaticExclusion {
   readonly providers: Readonly<Record<string, ProviderConfig>>;
   readonly models: Readonly<Record<string, ModelRecord>>;
@@ -97,7 +95,7 @@ export class ProviderDiscoveryService implements IProviderDiscoveryService {
     @IConfigService private readonly config: IConfigService,
     @IOAuthService private readonly oauth: IOAuthService,
     @IEventService private readonly events: IEventService,
-    @IHostRequestHeaders private readonly hostRequestHeaders: IHostRequestHeaders,
+    @IAgentIdentity private readonly identity: IAgentIdentity,
   ) {}
 
   refreshProviderModels(
@@ -123,15 +121,14 @@ export class ProviderDiscoveryService implements IProviderDiscoveryService {
           `provider ${options.providerId} does not exist`,
         );
       }
-      // Static short-circuit: the provider's models come from the static
-      // `[models.*]` section — discovery is a no-op by declaration.
       if (this.effectiveModelSource(provider) === 'static') {
         return { changed: [], unchanged: [options.providerId], failed: [] };
       }
     }
 
     const exclusion = this.computeStaticExclusion();
-    const result = await refreshProviderModels(this.buildRefreshHost(exclusion), {
+    const { outboundUserAgent } = await this.identity.resolved();
+    const result = await refreshProviderModels(this.buildRefreshHost(exclusion, outboundUserAgent), {
       scope: options.scope,
       providerId: options.providerId,
     });
@@ -149,11 +146,6 @@ export class ProviderDiscoveryService implements IProviderDiscoveryService {
     );
   }
 
-  /**
-   * The statically-sourced slice of the user config: hidden from the
-   * orchestrator so it can neither refresh nor rewrite those entries, and
-   * merged back verbatim on every write.
-   */
   private computeStaticExclusion(): StaticExclusion {
     const providers =
       this.config.inspect<Record<string, ProviderConfig>>(PROVIDERS_SECTION).userValue ?? {};
@@ -189,13 +181,13 @@ export class ProviderDiscoveryService implements IProviderDiscoveryService {
     };
   }
 
-  private buildRefreshHost(exclusion: StaticExclusion): RefreshProviderHost {
+  private buildRefreshHost(exclusion: StaticExclusion, userAgent: string): RefreshProviderHost {
     return {
       getConfig: async () => this.readUserConfigShape(exclusion),
       removeProvider: (providerId) => this.shapeWithoutProvider(providerId),
       setConfig: (patch) => this.applyRefreshPatch(patch, exclusion),
       resolveOAuthToken: (providerName, oauthRef) => this.resolveOAuthToken(providerName, oauthRef),
-      userAgent: this.hostRequestHeaders.headers['User-Agent'],
+      userAgent,
     };
   }
 
@@ -215,16 +207,6 @@ export class ProviderDiscoveryService implements IProviderDiscoveryService {
     };
   }
 
-  /**
-   * The orchestrator's host contract is two-phase (removeProvider, then
-   * setConfig) because its original merge-semantics host could not delete
-   * keys through a patch. This host writes with replace semantics and the
-   * patch always carries the FULL providers/models records, so the removal
-   * is already expressed by the patch itself — computing it here in memory
-   * keeps the runtime registries untouched until the single atomic write in
-   * {@link applyRefreshPatch} (a halfway-removed catalog is what used to
-   * produce the "provider/model not configured" startup race).
-   */
   private shapeWithoutProvider(providerId: string): Promise<ManagedKimiConfigShape> {
     const current = this.readUserConfigShape();
     const providers = current.providers as Record<string, ProviderConfig>;
@@ -250,12 +232,6 @@ export class ProviderDiscoveryService implements IProviderDiscoveryService {
       this.config.inspect<Record<string, ProviderConfig>>(PROVIDERS_SECTION).userValue ?? {};
     const userModels =
       this.config.inspect<Record<string, ModelRecord>>(MODELS_SECTION).userValue ?? {};
-    // All four sections land in ONE config transition: a single disk write,
-    // then one effective rebuild whose change events synchronously push the
-    // new records into the kosong registries — no reader can observe a
-    // half-applied refresh. The env-synthesized slice (`__kimi_env__` etc.)
-    // is NOT written here: it lives in the effective overlay, and the
-    // bridge's event-driven sync carries it into the registries on its own.
     const sections: Record<string, unknown> = {};
     if (patch.providers !== undefined) {
       sections[PROVIDERS_SECTION] = {
@@ -266,22 +242,9 @@ export class ProviderDiscoveryService implements IProviderDiscoveryService {
     if (patch.models !== undefined) {
       sections[MODELS_SECTION] = {
         ...exclusion.models,
-        // The orchestrator's alias shape is a structural superset of
-        // ModelRecord at runtime (its protocol union additionally allows
-        // vendor spellings the records never actually carry); the legacy
-        // config.write path took `unknown`, so cast here.
         ...(patch.models as Record<string, ModelRecord>),
       };
     }
-    // The refresh orchestrator always sends all four keys, so key presence is
-    // the write intent and an explicit `undefined` means CLEAR, not "leave
-    // alone" — `replaceSections` deletes the section on undefined. Otherwise
-    // a default model (and its thinking setting) whose alias the upstream
-    // dropped would dangle in the user config forever.
-    //
-    // Exception: when the user's default points at a statically-sourced model
-    // the orchestrator could not see, its clamp/restore logic would silently
-    // clear or re-point the selection (and its thinking) — restore both.
     const restoreDefault = exclusion.defaultModel !== undefined;
     if ('defaultModel' in patch) {
       sections[DEFAULT_MODEL_SECTION] = restoreDefault
@@ -292,8 +255,6 @@ export class ProviderDiscoveryService implements IProviderDiscoveryService {
       sections[THINKING_SECTION] = restoreDefault ? exclusion.thinking : patch.thinking;
     }
     await this.config.replaceSections(sections);
-    // The write above landed in config (and, through the bridge's synchronous
-    // event sync, the registries); compute the post-patch shape in memory.
     return {
       providers:
         patch.providers !== undefined
@@ -327,13 +288,14 @@ export class ProviderDiscoveryService implements IProviderDiscoveryService {
       oauthRef as unknown as OAuthRef | undefined,
     );
     if (tokenProvider === undefined) {
-      throw new Error('OAuth token provider is not configured.');
+      throw new Error2(AuthErrors.codes.AUTH_TOKEN_MISSING, 'OAuth token provider is not configured.', {
+        details: { provider_id: providerName },
+      });
     }
     return tokenProvider.getAccessToken();
   }
 }
 
-/** The record with the excluded record's keys removed. */
 function withoutKeys<T>(
   record: Readonly<Record<string, T>>,
   excluded: Readonly<Record<string, unknown>>,

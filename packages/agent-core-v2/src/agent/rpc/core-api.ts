@@ -1,16 +1,16 @@
 /**
- * `rpc` domain (L7) — v2 native RPC contract.
+ * `rpc` domain — v2 native RPC contract.
  *
  * Request/response payloads and event types for the engine's native RPC
  * surface. `PromptPayload.disabledTools` is the client-managed session
- * denylist, applied via `IAgentProfileService.setSessionDisabledTools` before
- * the prompt is enqueued: full-replace semantics, the profile's own
+ * denylist, applied before the prompt is enqueued: full-replace semantics, the profile's own
  * `disallowedTools` always survive, omitting the field keeps the persisted
  * value, and `[]` clears the client portion. It is ignored by engines without
  * profile support.
  */
 
 import type { AgentContextData } from '#/agent/contextMemory/types';
+import type { AgentCommandInfo } from '#/agent/command/agentCommand';
 import type {
   GoalBudgetLimits,
   GoalBudgetReport,
@@ -212,10 +212,15 @@ export interface ActivatePluginCommandPayload {
   readonly args?: string | undefined;
 }
 
+export interface RunCommandPayload {
+  readonly name: string;
+  readonly args?: string | undefined;
+}
+
 export interface McpServerInfo {
   readonly name: string;
   readonly transport: 'stdio' | 'http' | 'sse';
-  readonly status: 'pending' | 'connected' | 'failed' | 'disabled' | 'needs-auth';
+  readonly status: 'pending' | 'connected' | 'failed' | 'disabled' | 'needs-auth' | 'removed';
   readonly toolCount: number;
   readonly error?: string;
 }
@@ -302,8 +307,10 @@ export interface AgentAPI {
   undoHistory: (payload: UndoHistoryPayload) => Promise<number>;
   setPermission: (payload: SetPermissionPayload) => void;
   cancelCompaction: (payload: EmptyPayload) => void;
-  activateSkill: (payload: ActivateSkillPayload) => void;
+  activateSkill: (payload: ActivateSkillPayload) => PromptLaunchResult | undefined;
   activatePluginCommand: (payload: ActivatePluginCommandPayload) => void;
+  listCommands: (payload: EmptyPayload) => readonly AgentCommandInfo[];
+  runCommand: (payload: RunCommandPayload) => Promise<void>;
   getContext: (payload: EmptyPayload) => AgentContextData;
   getTools: (payload: EmptyPayload) => readonly ToolInfo[];
 }

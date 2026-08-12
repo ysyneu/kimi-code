@@ -4,6 +4,7 @@ import { Command, InvalidArgumentError, Option } from 'commander';
 
 import type { CLIOptions } from './options';
 import { registerAcpCommand } from './sub/acp';
+import { registerAgentsCommand } from './sub/agents';
 import { registerDoctorCommand } from './sub/doctor';
 import { registerExportCommand } from './sub/export';
 import { registerLoginCommand } from './sub/login';
@@ -117,6 +118,7 @@ export function createProgram(
   registerProviderCommand(program);
   registerAcpCommand(program);
   registerWebCommand(program);
+  registerAgentsCommand(program);
   registerLoginCommand(program);
   registerDoctorCommand(program);
   registerVisCommand(program);

@@ -25,8 +25,8 @@ import type { TuiConfig } from '#/tui/config';
 import { loadTuiConfig, TuiConfigParseError } from '#/tui/config';
 import { CHROME_GUTTER } from '#/tui/constant/rendering';
 import { KimiTUI } from '#/tui/index';
+import { startupTrace } from '#/utils/startup-trace';
 import { currentTheme, getColorPalette } from '#/tui/theme';
-import { combineStartupNotice } from '#/tui/utils/startup';
 import { toTerminalHyperlink } from '#/utils/terminal-hyperlink';
 import { restoreTerminalModes } from '#/utils/terminal-restore';
 
@@ -81,12 +81,14 @@ export async function runShell(
     },
     sessionStartedProperties: { yolo: opts.yolo, auto: opts.auto, plan: opts.plan, afk: false },
   };
-  // Experimental agent-core-v2 route (same master switch as `kimi -p`): the
-  // harness is the SDK's v2-backed client, so the whole TUI runs on the
-  // agent-core-v2 engine.
-  const harness = isKimiV2Enabled()
+  // The agent-core-v2 route is the default (same engine gate as `kimi -p`):
+  // the harness is the SDK's v2-backed client, so the whole TUI runs on the
+  // agent-core-v2 engine unless the legacy flag is set.
+  const engineV2 = isKimiV2Enabled();
+  const harness = engineV2
     ? createKimiHarnessV2(harnessOptions)
     : createKimiHarness(harnessOptions);
+  startupTrace('harness:created');
   log.info('kimi-code starting', {
     version,
     uiMode: CLI_UI_MODE,
@@ -107,9 +109,10 @@ export async function runShell(
     return;
   }
   const config = await harness.getConfig();
-  for (const warning of (await harness.getConfigDiagnostics()).warnings) {
-    configWarning = combineStartupNotice(configWarning, warning);
-  }
+  startupTrace('config:loaded');
+  // Config diagnostics (deprecated keys, invalid sections, ...) are surfaced
+  // by the TUI itself at `finishStartup` via `showConfigWarningsIfAny` —
+  // folded into the dim startup notice they were too easy to miss.
   const configMs = Date.now() - configStartedAt;
   // Resolve --agent/--agent-file once for the startup session; validateOptions
   // has already rejected them alongside --session/--continue.
@@ -124,6 +127,7 @@ export async function runShell(
     startupNotice: configWarning,
     migrationPlan,
     migrateOnly: runOptions.migrateOnly,
+    engineV2,
   });
 
   initializeCliTelemetry({
@@ -151,17 +155,22 @@ export async function runShell(
   };
 
   let savedStty: string | undefined;
-  try {
-    // stty operates on the terminal behind stdin, so stdin must be the TTY —
-    // piping /dev/null (ignore) makes stty fail with "not a tty".
-    const saved = execSync('stty -g', {
-      encoding: 'utf8',
-      stdio: ['inherit', 'pipe', 'ignore'],
-    });
-    savedStty = typeof saved === 'string' ? saved.trim() : undefined;
-    execSync('stty -ixon', { stdio: ['inherit', 'ignore', 'ignore'] });
-  } catch {
-    /* ignore */
+  // stty is a POSIX command and never works on Windows; skip it there instead
+  // of relying on the catch — a bare command name would resolve a planted
+  // `stty.exe` from the current directory before the workspace trust gate.
+  if (process.platform !== 'win32') {
+    try {
+      // stty operates on the terminal behind stdin, so stdin must be the TTY —
+      // piping /dev/null (ignore) makes stty fail with "not a tty".
+      const saved = execSync('stty -g', {
+        encoding: 'utf8',
+        stdio: ['inherit', 'pipe', 'ignore'],
+      });
+      savedStty = typeof saved === 'string' ? saved.trim() : undefined;
+      execSync('stty -ixon', { stdio: ['inherit', 'ignore', 'ignore'] });
+    } catch {
+      /* ignore */
+    }
   }
   const restoreStty = (): void => {
     if (savedStty === undefined) return;
@@ -242,7 +251,9 @@ export async function runShell(
   };
   try {
     const initStartedAt = Date.now();
+    startupTrace('tui.start:begin');
     await tui.start();
+    startupTrace('tui.start:end');
     const initMs = Date.now() - initStartedAt;
     const startupSessionId = tui.getCurrentSessionId();
     const mcpMs = await tui.getStartupMcpMs();

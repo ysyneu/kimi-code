@@ -19,20 +19,31 @@ import { IAgentFullCompactionService } from '#/agent/fullCompaction/fullCompacti
 import { IAgentLoopService } from '#/agent/loop/loop';
 import { MessageStepRequest } from '#/agent/loop/stepRequest';
 import { TurnModel } from '#/agent/loop/turnOps';
-import { IAgentPlanService } from '#/agent/plan/plan';
-import { PlanModel } from '#/agent/plan/planOps';
+import { IAgentPlanService } from '#/features/plan/plan';
+import { PlanModel } from '#/features/plan/planOps';
 import { IAgentPromptService } from '#/agent/prompt/prompt';
 import { IAgentConversationUndoService } from '#/agent/undo/undo';
 import { IEventBus } from '#/app/event/eventBus';
+import { IEventService } from '#/app/event/event';
 import { IAgentTelemetryContextService } from '#/app/telemetry/agentTelemetryContext';
 import { ErrorCodes } from '#/errors';
-import { ISessionMetadata } from '#/session/sessionMetadata/sessionMetadata';
+import { ISessionMetadata, type SessionMeta } from '#/session/sessionMetadata/sessionMetadata';
 import { TodoModel, todoSet } from '#/session/todo/todoOps';
 import { defineModel } from '#/wire/model';
 import { IWireService } from '#/wire/wire';
 
 import { createTestAgent, telemetryServices, type TestAgentContext } from '../../harness';
 import { recordingTelemetry, type TelemetryRecord } from '../../app/telemetry/stubs';
+
+function waitForMetadataChange(metadata: ISessionMetadata, key: keyof SessionMeta): Promise<void> {
+  return new Promise((resolve) => {
+    const subscription = metadata.onDidChangeMetadata((event) => {
+      if (!event.changed.includes(key)) return;
+      subscription.dispose();
+      resolve();
+    });
+  });
+}
 
 describe('AgentConversationUndoService', () => {
   let ctx: TestAgentContext;
@@ -214,8 +225,6 @@ describe('AgentConversationUndoService', () => {
     setup();
     const undo = ctx.get(IAgentConversationUndoService);
     ctx.appendTurnExchange('u1', 'a1');
-    // A checkpointed model that never tracks anchors (no reducers) drags the
-    // depth to 0 without any compaction in history.
     const defective = defineModel<Checkpointed<unknown>>('testDefective', () => ({
       current: null,
       checkpoints: [],
@@ -432,6 +441,96 @@ describe('AgentConversationUndoService', () => {
     await ctx.get(IAgentConversationUndoService).undo(1);
 
     await expect(metadata.read()).resolves.toMatchObject({ lastPrompt: undefined });
+  });
+
+  it('I10: clears lastAssistantText when undo removes the only reply', async () => {
+    setup();
+    const metadata = ctx.get(ISessionMetadata);
+    await metadata.ready;
+    await metadata.update({ lastAssistantText: 'a1' });
+    ctx.appendTurnExchange('u1', 'a1');
+
+    await ctx.get(IAgentConversationUndoService).undo(1);
+
+    await expect(metadata.read()).resolves.toMatchObject({ lastAssistantText: undefined });
+  });
+
+  it("I10: reconciles lastAssistantText to the surviving turn's reply after undoing the newest turn", async () => {
+    setup();
+    const metadata = ctx.get(ISessionMetadata);
+    await metadata.ready;
+    ctx.appendTurnExchange('u1', 'a1');
+    ctx.appendTurnExchange('u2', 'a2');
+    // Stale value undo must overwrite — appendTurnExchange bypasses the
+    // turn.ended path that would normally have set this, same as the
+    // lastPrompt test above seeds its own stale value.
+    await metadata.update({ lastAssistantText: 'a2' });
+
+    await ctx.get(IAgentConversationUndoService).undo(1);
+
+    await expect(metadata.read()).resolves.toMatchObject({ lastAssistantText: 'a1' });
+  });
+
+  it('mirrors the last assistant reply into lastAssistantText on turn.ended', async () => {
+    setup();
+    const metadata = ctx.get(ISessionMetadata);
+    await metadata.ready;
+
+    ctx.mockNextResponse({ type: 'text', text: 'Hi there!' });
+    const first = waitForMetadataChange(metadata, 'lastAssistantText');
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'hi' }] });
+    await ctx.untilTurnEnd();
+    await first;
+
+    await expect(metadata.read()).resolves.toMatchObject({ lastAssistantText: 'Hi there!' });
+
+    ctx.mockNextResponse({ type: 'text', text: 'second reply' });
+    const second = waitForMetadataChange(metadata, 'lastAssistantText');
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'again' }] });
+    await ctx.untilTurnEnd();
+    await second;
+
+    await expect(metadata.read()).resolves.toMatchObject({ lastAssistantText: 'second reply' });
+  });
+
+  it('publishes session.meta.updated with the lastAssistantText patch on turn.ended', async () => {
+    setup();
+    const patches: Array<Record<string, unknown>> = [];
+    let notifyPatched: (() => void) | undefined;
+    const patched = new Promise<void>((resolve) => {
+      notifyPatched = resolve;
+    });
+    const subscription = ctx.get(IEventService).subscribe((event) => {
+      if (event.type !== 'session.meta.updated') return;
+      const payload = event.payload as { patch?: Record<string, unknown> };
+      if (payload.patch === undefined || !('lastAssistantText' in payload.patch)) return;
+      patches.push(payload.patch);
+      notifyPatched?.();
+    });
+
+    try {
+      ctx.mockNextResponse({ type: 'text', text: 'Hi there!' });
+      await ctx.rpc.prompt({ input: [{ type: 'text', text: 'hi' }] });
+      await ctx.untilTurnEnd();
+      await patched;
+
+      expect(patches).toContainEqual({ lastAssistantText: 'Hi there!' });
+    } finally {
+      subscription.dispose();
+    }
+  });
+
+  it('leaves lastAssistantText undefined when turn.ended fires before any assistant text exists', async () => {
+    setup();
+    const metadata = ctx.get(ISessionMetadata);
+    await metadata.ready;
+    ctx.get(IAgentConversationUndoService);
+
+    const changed = waitForMetadataChange(metadata, 'lastAssistantText');
+    ctx.get(IEventBus).publish({ type: 'turn.ended', turnId: 1, reason: 'completed' });
+    await changed;
+
+    await expect(metadata.read()).resolves.toMatchObject({ lastAssistantText: undefined });
   });
 
   it('uses the newest pending prompt as lastPrompt after undo', async () => {

@@ -1,15 +1,13 @@
 /**
- * `agentProfileCatalog` domain (L3) — the agent-profile Contribution shape and
+ * `agentProfileCatalog` domain — the agent-profile Contribution shape and
  * source priorities.
  *
  * `AgentProfileContribution` is the Contribution of the agent-profile
- * extension point: the plain data structure a loader registers into the
- * App-scope `IAgentProfileRegistry` under its source id. It is pure payload —
- * the source id and priority are registration metadata passed to `register`,
- * never part of the contribution. Name-level dedup is NOT done here or in the
- * registry; it is the Session catalog's projection job. The shape lives beside
- * the registry (not beside any loader) because it is the registry's contract
- * with every contributor, whatever scope the contributor runs in.
+ * extension point: the plain data structure a loader contributes to the
+ * `AgentProfileContribution` collection under its source id. It is pure
+ * payload — the source id and priority are record metadata carried alongside
+ * it, never part of the contribution. Name-level dedup is NOT done here or in
+ * the registry fold; it is the Session catalog's projection job.
  *
  * `AGENT_PROFILE_SOURCE_PRIORITY` orders the sources for that projection
  * (higher wins name collisions), with one deliberate deviation from the skill
@@ -18,9 +16,9 @@
  * that must always win.
  */
 
+import { collection } from '#/_base/di/collection';
 import type { AgentProfile } from './agentProfileCatalog';
 
-/** A file a discovery pass could not parse, paired with the reason. */
 export interface SkippedAgentFile {
   readonly path: string;
   readonly reason: string;
@@ -31,6 +29,15 @@ export interface AgentProfileContribution {
   readonly skipped?: readonly SkippedAgentFile[];
   readonly scannedRoots?: readonly string[];
 }
+
+export interface AgentProfileContributionRecord {
+  readonly sourceId: string;
+  readonly priority?: number;
+  readonly workspaceKey?: string;
+  readonly contribution: AgentProfileContribution;
+}
+
+export const AgentProfileContribution = collection<AgentProfileContributionRecord>('agent-profile');
 
 export const AGENT_PROFILE_SOURCE_PRIORITY = {
   builtin: 0,

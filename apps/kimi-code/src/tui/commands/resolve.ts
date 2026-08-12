@@ -42,6 +42,14 @@ export type SlashCommandIntent =
       readonly kind: 'invalid';
       readonly commandName: string;
       readonly reason: SlashCommandInvalidReason;
+    }
+  | {
+      /**
+       * The command exists but the current transport cannot serve it. Unlike
+       * `blocked`, waiting does not help — there is nothing to retry.
+       */
+      readonly kind: 'unavailable';
+      readonly commandName: string;
     };
 
 export interface ResolveSlashCommandInput {
@@ -50,6 +58,8 @@ export interface ResolveSlashCommandInput {
   readonly pluginCommandMap: ReadonlyMap<string, string>;
   readonly isStreaming: boolean;
   readonly isCompacting: boolean;
+  /** Agents view runs on the wire transport; see `unavailableInAgentsView`. */
+  readonly isAgentsView: boolean;
 }
 
 export function resolveSlashCommandInput(options: ResolveSlashCommandInput): SlashCommandIntent {
@@ -62,6 +72,9 @@ export function resolveSlashCommandInput(options: ResolveSlashCommandInput): Sla
     command !== undefined &&
     isExperimentalFlagEnabled((command as KimiSlashCommand).experimentalFlag)
   ) {
+    if (options.isAgentsView && (command as KimiSlashCommand).unavailableInAgentsView === true) {
+      return { kind: 'unavailable', commandName: parsed.name };
+    }
     const busyReason = slashCommandBusyReason(options);
     if (
       busyReason !== undefined &&
@@ -148,4 +161,12 @@ export function slashBusyMessage(
     return `Cannot /${commandName} while streaming — press Esc or Ctrl-C first.`;
   }
   return `Cannot /${commandName} while compacting — wait for compaction to finish first.`;
+}
+
+/**
+ * Wording mirrors the `!` bash-mode refusal, which is the same situation: a
+ * capability the wire transport does not carry.
+ */
+export function slashUnavailableMessage(commandName: string): string {
+  return `/${commandName} is not available in agents view.`;
 }

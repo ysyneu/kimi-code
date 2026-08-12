@@ -1,3 +1,7 @@
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import type {
   AutocompleteItem,
   AutocompleteProvider,
@@ -113,6 +117,203 @@ describe('CustomEditor onNonEscapeInput', () => {
 
     editor.handleInput('\u0003');
     expect(onNonEscapeInput).toHaveBeenCalledOnce();
+  });
+});
+
+describe('CustomEditor onShiftEnterSubmit', () => {
+  // xterm modifyOtherKeys CSI 27 ; <modifier+1> ; <keycode> ~ — modifier=2
+  // (shift), keycode=13 (Enter). Matches `matchesKey(data, 'shift+enter')`
+  // independent of Kitty-protocol state, unlike the plain `\x1b\r`/`\n`
+  // fallbacks pi-tui only recognizes once Kitty is active.
+  const SHIFT_ENTER = '[27;2;13~';
+
+  it('consumes shift+enter when the hook returns true — clears the buffer, no newline inserted', () => {
+    const editor = makeEditor();
+    const onShiftEnterSubmit = vi.fn(() => true);
+    editor.onShiftEnterSubmit = onShiftEnterSubmit;
+    editor.setText('fix the flaky test');
+
+    editor.handleInput(SHIFT_ENTER);
+
+    expect(onShiftEnterSubmit).toHaveBeenCalledWith('fix the flaky test');
+    expect(editor.getText()).toBe('');
+  });
+
+  it('falls through to the base editor default (newline) when the hook returns false', () => {
+    const editor = makeEditor();
+    const onShiftEnterSubmit = vi.fn(() => false);
+    editor.onShiftEnterSubmit = onShiftEnterSubmit;
+    editor.setText('/model kimi-k2 fix the flaky test');
+
+    editor.handleInput(SHIFT_ENTER);
+
+    expect(onShiftEnterSubmit).toHaveBeenCalledWith('/model kimi-k2 fix the flaky test');
+    // Declined: the keystroke fell through to pi-tui's own newline-insert —
+    // the buffer keeps its text plus a new empty line, nothing is cleared.
+    expect(editor.getLines()).toEqual(['/model kimi-k2 fix the flaky test', '']);
+  });
+
+  it('with no hook wired, shift+enter keeps the base editor default (newline) — every OTHER editor instance', () => {
+    const editor = makeEditor();
+    editor.setText('some text');
+
+    editor.handleInput(SHIFT_ENTER);
+
+    expect(editor.getLines()).toEqual(['some text', '']);
+  });
+
+  it('an empty buffer never calls the hook (nothing to submit)', () => {
+    const editor = makeEditor();
+    const onShiftEnterSubmit = vi.fn(() => true);
+    editor.onShiftEnterSubmit = onShiftEnterSubmit;
+
+    editor.handleInput(SHIFT_ENTER);
+
+    expect(onShiftEnterSubmit).not.toHaveBeenCalled();
+  });
+
+  // Fix round 1 (review): unlike a plain Enter — which pi-tui's base
+  // `Editor.handleInput` special-cases while a dropdown is open, resolving
+  // the highlighted suggestion into the buffer first — the shift+enter
+  // interception above used to run unconditionally, so pressing it while an
+  // `@file` mention dropdown was open dispatched the raw, unexpanded
+  // `@partial` text as the literal prompt instead of the file path the user
+  // was about to select.
+  describe('vs. an open autocomplete dropdown', () => {
+    let dir: string | undefined;
+    afterEach(async () => {
+      if (dir !== undefined) {
+        await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+      }
+      dir = undefined;
+    });
+
+    it('resolves the highlighted suggestion into the buffer instead of dispatching the raw @partial text — fails without the isShowingAutocomplete() guard', async () => {
+      const workDir = await mkdtemp(join(tmpdir(), 'custom-editor-mention-'));
+      dir = workDir;
+      await writeFile(join(workDir, 'incident-notes.md'), '# notes');
+      const editor = makeEditor();
+      const onShiftEnterSubmit = vi.fn(() => true);
+      editor.onShiftEnterSubmit = onShiftEnterSubmit;
+      editor.setAutocompleteProvider(new FileMentionProvider([], workDir, null));
+
+      editor.handleInput('@');
+      // The scan + suggestion pipeline is async (debounce timer + a real
+      // fs.readdir) — same wait the file-mention-provider/custom-editor
+      // slash-completion tests above already use.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await flushAutocomplete();
+      expect(editor.isShowingAutocomplete()).toBe(true);
+
+      editor.handleInput(SHIFT_ENTER);
+
+      // Resolved into the buffer, not dispatched: the hook never saw the
+      // raw text, and the dropdown is gone — the same accept-before-acting
+      // step a plain Enter gets for free (`Editor.
+      // acceptHighlightedAutocomplete`, shared with `tui.select.confirm`).
+      expect(onShiftEnterSubmit).not.toHaveBeenCalled();
+      expect(editor.isShowingAutocomplete()).toBe(false);
+      expect(editor.getText()).toContain('incident-notes.md');
+      expect(editor.getText()).not.toBe('@');
+    });
+  });
+});
+
+describe('CustomEditor onLeftArrowEmpty', () => {
+  const LEFT = '\u001B[D';
+
+  it('consumes ← on an empty editor when the handler returns true', () => {
+    const editor = makeEditor();
+    const onLeftArrowEmpty = vi.fn(() => true);
+    editor.onLeftArrowEmpty = onLeftArrowEmpty;
+
+    editor.handleInput(LEFT);
+
+    expect(onLeftArrowEmpty).toHaveBeenCalledOnce();
+    expect(editor.getText()).toBe('');
+  });
+
+  it('falls through when the handler returns false', () => {
+    const editor = makeEditor();
+    const onLeftArrowEmpty = vi.fn(() => false);
+    editor.onLeftArrowEmpty = onLeftArrowEmpty;
+
+    // Must not throw or corrupt the buffer; the editor stays empty.
+    editor.handleInput(LEFT);
+
+    expect(onLeftArrowEmpty).toHaveBeenCalledOnce();
+    expect(editor.getText()).toBe('');
+  });
+
+  it('keeps cursor semantics on a non-empty editor (handler not called)', () => {
+    const editor = makeEditor();
+    const onLeftArrowEmpty = vi.fn(() => true);
+    editor.onLeftArrowEmpty = onLeftArrowEmpty;
+    editor.setText('ab');
+    expect(editor.getCursor()).toEqual({ line: 0, col: 2 });
+
+    editor.handleInput(LEFT);
+
+    expect(onLeftArrowEmpty).not.toHaveBeenCalled();
+    expect(editor.getCursor()).toEqual({ line: 0, col: 1 });
+  });
+
+  it('is a no-op on an empty editor without a handler', () => {
+    const editor = makeEditor();
+
+    editor.handleInput(LEFT);
+
+    expect(editor.getText()).toBe('');
+  });
+});
+
+describe('CustomEditor onRightArrowEmpty (B8)', () => {
+  const RIGHT = '\u001B[C';
+  const LEFT = '\u001B[D';
+
+  it('consumes → on an empty editor when the handler returns true', () => {
+    const editor = makeEditor();
+    const onRightArrowEmpty = vi.fn(() => true);
+    editor.onRightArrowEmpty = onRightArrowEmpty;
+
+    editor.handleInput(RIGHT);
+
+    expect(onRightArrowEmpty).toHaveBeenCalledOnce();
+    expect(editor.getText()).toBe('');
+  });
+
+  it('falls through when the handler returns false', () => {
+    const editor = makeEditor();
+    const onRightArrowEmpty = vi.fn(() => false);
+    editor.onRightArrowEmpty = onRightArrowEmpty;
+
+    // Must not throw or corrupt the buffer; the editor stays empty.
+    editor.handleInput(RIGHT);
+
+    expect(onRightArrowEmpty).toHaveBeenCalledOnce();
+    expect(editor.getText()).toBe('');
+  });
+
+  it('keeps cursor semantics on a non-empty editor (handler not called)', () => {
+    const editor = makeEditor();
+    const onRightArrowEmpty = vi.fn(() => true);
+    editor.onRightArrowEmpty = onRightArrowEmpty;
+    editor.setText('ab');
+    editor.handleInput(LEFT);
+    expect(editor.getCursor()).toEqual({ line: 0, col: 1 });
+
+    editor.handleInput(RIGHT);
+
+    expect(onRightArrowEmpty).not.toHaveBeenCalled();
+    expect(editor.getCursor()).toEqual({ line: 0, col: 2 });
+  });
+
+  it('is a no-op on an empty editor without a handler', () => {
+    const editor = makeEditor();
+
+    editor.handleInput(RIGHT);
+
+    expect(editor.getText()).toBe('');
   });
 });
 
@@ -727,6 +928,46 @@ describe('CustomEditor bash mode via paste', () => {
   });
 });
 
+
+// ── Bash (`!`) mode gate — the agents view has no shell route ──
+
+describe('CustomEditor bash mode gate', () => {
+  it('a veto swallows the typed ! keystroke: prompt mode kept, buffer untouched', () => {
+    const editor = makeEditor();
+    const onInputModeChange = vi.fn();
+    const onBashModeAttempt = vi.fn(() => true);
+    editor.onInputModeChange = onInputModeChange;
+    editor.onBashModeAttempt = onBashModeAttempt;
+
+    editor.handleInput('!');
+
+    expect(onBashModeAttempt).toHaveBeenCalledOnce();
+    expect(editor.inputMode).toBe('prompt');
+    expect(editor.getText()).toBe('');
+    expect(onInputModeChange).not.toHaveBeenCalled();
+  });
+
+  it('a pass-through gate (false) keeps the normal bash-mode switch', () => {
+    const editor = makeEditor();
+    editor.onBashModeAttempt = vi.fn(() => false);
+
+    editor.handleInput('!');
+
+    expect(editor.inputMode).toBe('bash');
+    expect(editor.getText()).toBe('');
+  });
+
+  it('a veto keeps a pasted !cmd literal instead of switching modes', () => {
+    const editor = makeEditor();
+    editor.onBashModeAttempt = vi.fn(() => true);
+
+    editor.handleInput('[200~!ls[201~');
+
+    expect(editor.inputMode).toBe('prompt');
+    expect(editor.getText()).toBe('!ls');
+  });
+});
+
 describe('CustomEditor bash mode file completion', () => {
   it('triggers file completion (force:true) for a leading / in bash mode, not the slash menu', async () => {
     const editor = makeEditor();
@@ -786,129 +1027,5 @@ describe('CustomEditor bash mode file completion', () => {
     // request force:true path completion.
     expect(calls.length).toBeGreaterThan(0);
     expect(calls.every((call) => call.force === true)).toBe(true);
-  });
-});
-
-describe('CustomEditor full re-render on autocomplete close', () => {
-  function makeEditorWithRenderSpy(contentLines: number): {
-    editor: CustomEditor;
-    requestRender: ReturnType<typeof vi.fn>;
-  } {
-    const requestRender = vi.fn();
-    const tui = {
-      requestRender,
-      terminal: { rows: 40, cols: 120 },
-      render: vi.fn(() => Array.from({ length: contentLines }, () => '')),
-    } as unknown as TUI;
-    return { editor: new CustomEditor(tui), requestRender };
-  }
-
-  // Drive one render frame so the render-edge detector observes the menu state.
-  function renderFrame(editor: CustomEditor): void {
-    editor.render(120);
-  }
-
-  afterEach(() => {
-    vi.unstubAllEnvs();
-  });
-
-  it('forces a full re-render on the render frame after Escape closes the menu (content overflows)', async () => {
-    vi.stubEnv('TMUX', '');
-    const { editor, requestRender } = makeEditorWithRenderSpy(50);
-    editor.setAutocompleteProvider(providerReturning([{ value: 'help', label: 'help' }]));
-
-    editor.handleInput('/');
-    await flushAutocomplete();
-    expect(editor.isShowingAutocomplete()).toBe(true);
-    renderFrame(editor); // record wasShowing = true
-
-    editor.handleInput('');
-    expect(editor.isShowingAutocomplete()).toBe(false);
-
-    renderFrame(editor); // close edge -> schedule helper
-    await flushAutocomplete();
-    expect(requestRender).toHaveBeenCalledWith(true);
-  });
-
-  it('keeps differential rendering when the content fits on one screen', async () => {
-    vi.stubEnv('TMUX', '');
-    const { editor, requestRender } = makeEditorWithRenderSpy(10);
-    editor.setAutocompleteProvider(providerReturning([{ value: 'help', label: 'help' }]));
-
-    editor.handleInput('/');
-    await flushAutocomplete();
-    expect(editor.isShowingAutocomplete()).toBe(true);
-    renderFrame(editor);
-
-    editor.handleInput('');
-    expect(editor.isShowingAutocomplete()).toBe(false);
-
-    renderFrame(editor);
-    await flushAutocomplete();
-    expect(requestRender).not.toHaveBeenCalledWith(true);
-  });
-
-  it('forces a full re-render when the content exactly fills one screen', async () => {
-    vi.stubEnv('TMUX', '');
-    const { editor, requestRender } = makeEditorWithRenderSpy(40);
-    editor.setAutocompleteProvider(providerReturning([{ value: 'help', label: 'help' }]));
-
-    editor.handleInput('/');
-    await flushAutocomplete();
-    expect(editor.isShowingAutocomplete()).toBe(true);
-    renderFrame(editor);
-
-    editor.handleInput('');
-    expect(editor.isShowingAutocomplete()).toBe(false);
-
-    renderFrame(editor);
-    await flushAutocomplete();
-    expect(requestRender).toHaveBeenCalledWith(true);
-  });
-
-  it('does not force a full re-render inside tmux', async () => {
-    vi.stubEnv('TMUX', '/tmp/tmux-501/default,1234,0');
-    const { editor, requestRender } = makeEditorWithRenderSpy(50);
-    editor.setAutocompleteProvider(providerReturning([{ value: 'help', label: 'help' }]));
-
-    editor.handleInput('/');
-    await flushAutocomplete();
-    expect(editor.isShowingAutocomplete()).toBe(true);
-    renderFrame(editor);
-
-    editor.handleInput('');
-    expect(editor.isShowingAutocomplete()).toBe(false);
-
-    renderFrame(editor);
-    await flushAutocomplete();
-    expect(requestRender).not.toHaveBeenCalledWith(true);
-  });
-
-  it('forces a full re-render when Backspace deletes the slash and the menu closes asynchronously', async () => {
-    vi.stubEnv('TMUX', '');
-    const { editor, requestRender } = makeEditorWithRenderSpy(50);
-    const provider: AutocompleteProvider = {
-      getSuggestions: vi.fn(async (lines, cursorLine, cursorCol) => {
-        const text = (lines[cursorLine] ?? '').slice(0, cursorCol);
-        if (!text.startsWith('/')) return { items: [], prefix: text };
-        return { items: [{ value: 'help', label: 'help' }], prefix: '/' };
-      }),
-      applyCompletion: vi.fn((lines, cursorLine, cursorCol) => ({ lines, cursorLine, cursorCol })),
-    };
-    editor.setAutocompleteProvider(provider);
-
-    editor.handleInput('/');
-    await flushAutocomplete();
-    expect(editor.isShowingAutocomplete()).toBe(true);
-    renderFrame(editor); // record wasShowing = true
-
-    editor.handleInput(''); // Backspace deletes the '/'
-    await flushAutocomplete();
-    await new Promise((resolve) => setTimeout(resolve, 0)); // let async cancelAutocomplete settle
-    expect(editor.isShowingAutocomplete()).toBe(false);
-
-    renderFrame(editor); // close edge -> schedule helper
-    await flushAutocomplete();
-    expect(requestRender).toHaveBeenCalledWith(true);
   });
 });

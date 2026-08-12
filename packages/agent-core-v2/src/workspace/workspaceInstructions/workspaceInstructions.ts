@@ -1,5 +1,5 @@
 /**
- * `workspaceInstructions` domain (L4) — Workspace-scoped AGENTS.md service
+ * `workspaceInstructions` domain — Workspace-scoped AGENTS.md service
  * contract.
  *
  * Defines `IWorkspaceInstructionsService`, the handler-level owner of the
@@ -20,6 +20,7 @@ import type { ISessionInstructionsProvider } from '#/session/sessionInstructions
 export interface WorkspaceInstructionsSnapshot {
   readonly agentsMd: string | undefined;
   readonly agentsMdWarning: string | undefined;
+  readonly agentsMdPaths: readonly string[] | undefined;
 }
 
 export interface IWorkspaceInstructionsService {

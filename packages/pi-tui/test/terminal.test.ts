@@ -231,3 +231,70 @@ describe("ProcessTerminal dimensions", () => {
 		}
 	});
 });
+
+describe("ProcessTerminal mouse tracking", () => {
+	function withStdoutSpy(fn: (writes: string[]) => void): void {
+		const writes: string[] = [];
+		const previousWrite = process.stdout.write;
+		process.stdout.write = ((chunk: string | Uint8Array) => {
+			writes.push(String(chunk));
+			return true;
+		}) as typeof process.stdout.write;
+		try {
+			fn(writes);
+		} finally {
+			process.stdout.write = previousWrite;
+		}
+	}
+
+	it("enableMouseTracking writes the SGR + normal-tracking enable sequence", () => {
+		withStdoutSpy((writes) => {
+			const terminal = new ProcessTerminal();
+			terminal.enableMouseTracking();
+			assert.deepStrictEqual(writes, ["\x1b[?1000h\x1b[?1006h"]);
+		});
+	});
+
+	it("enableMouseTracking is idempotent", () => {
+		withStdoutSpy((writes) => {
+			const terminal = new ProcessTerminal();
+			terminal.enableMouseTracking();
+			terminal.enableMouseTracking();
+			assert.equal(writes.length, 1);
+		});
+	});
+
+	it("disableMouseTracking writes the disable sequence after being enabled", () => {
+		withStdoutSpy((writes) => {
+			const terminal = new ProcessTerminal();
+			terminal.enableMouseTracking();
+			terminal.disableMouseTracking();
+			assert.deepStrictEqual(writes, ["\x1b[?1000h\x1b[?1006h", "\x1b[?1006l\x1b[?1000l"]);
+		});
+	});
+
+	it("disableMouseTracking is a no-op when never enabled", () => {
+		withStdoutSpy((writes) => {
+			const terminal = new ProcessTerminal();
+			terminal.disableMouseTracking();
+			assert.deepStrictEqual(writes, []);
+		});
+	});
+
+	it("stop() writes the disable sequence unconditionally, even when mouse tracking was never enabled", () => {
+		withStdoutSpy((writes) => {
+			const terminal = new ProcessTerminal();
+			terminal.stop();
+			assert.ok(writes.includes("\x1b[?1006l\x1b[?1000l"));
+		});
+	});
+
+	it("stop() disables mouse tracking left on from an unmatched enableMouseTracking call", () => {
+		withStdoutSpy((writes) => {
+			const terminal = new ProcessTerminal();
+			terminal.enableMouseTracking();
+			terminal.stop();
+			assert.ok(writes.includes("\x1b[?1006l\x1b[?1000l"));
+		});
+	});
+});

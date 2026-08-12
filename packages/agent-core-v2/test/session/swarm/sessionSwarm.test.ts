@@ -2,17 +2,23 @@ import { createControlledPromise } from '@antfu/utils';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { IAgentScopeHandle } from '#/_base/di/scope';
-import { LifecycleScope } from '#/_base/di/scope';
+import { LifecycleScope } from '#/app/scopes';
 import { SyncDescriptor } from '#/_base/di/descriptors';
 import { DisposableStore } from '#/_base/di/lifecycle';
 import { TestInstantiationService } from '#/_base/di/test';
 import { Event } from '#/_base/event';
 import { userCancellationReason } from '#/_base/utils/abort';
 import { IAgentPermissionModeService } from '#/agent/permissionMode/permissionMode';
+import type { PermissionMode } from '#/agent/permissionPolicy/types';
 import { IAgentProfileService, type ProfileData } from '#/agent/profile/profile';
 import { IAgentLoopService } from '#/agent/loop/loop';
 import { IAgentUserToolService } from '#/agent/userTool/userTool';
 import { IEventBus, type DomainEvent } from '#/app/event/eventBus';
+import { IConfigService } from '#/app/config/config';
+import { IFlagService } from '#/app/flag/flag';
+import { SECONDARY_MODEL_SECTION } from '#/app/kosongConfig/configSection';
+import { SECONDARY_MODEL_FLAG_ID } from '#/session/subagent/flag';
+import { normalizeAgentProfile } from '#/app/agentProfileCatalog/agentProfileCatalog';
 import { ISessionAgentProfileCatalog } from '#/session/sessionAgentProfileCatalog/sessionAgentProfileCatalog';
 import { APIProviderRateLimitError } from '#/kosong/contract/errors';
 import { IModelCatalog, type Model } from '#/kosong/model/catalog';
@@ -52,6 +58,8 @@ import { ConfigErrors } from '#/app/config/errors';
 import { SessionSwarmService } from '#/session/swarm/sessionSwarmService';
 
 import { stubLog } from '../../_base/log/stubs';
+import { stubFlag } from '../../app/flag/stubs';
+import { StubConfigService } from '../../kosong/stubs';
 
 describe('resolveSwarmMaxConcurrency', () => {
   it('returns undefined when the variable is unset', () => {
@@ -606,6 +614,35 @@ describe('AgentRunBatch scheduling contract', () => {
     }
   });
 
+  it('a non-positive task timeout means unbounded (v1 parity)', async () => {
+    vi.useFakeTimers();
+    try {
+      const { runBatch, attempts } = createMockAgentRunBatchRunner();
+      const running = runBatch([{ ...queuedAgentRunTask(1), timeout: 0 }], {
+        signal: new AbortController().signal,
+      });
+
+      await vi.advanceTimersByTimeAsync(0);
+      attempts[0]!.markReady();
+      // Print mode fills the subagent timeout with 0 = unbounded; it must not
+      // arm an immediate abort.
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      attempts[0]!.outcome.resolve({
+        task: attempts[0]!.task,
+        agentId: 'agent-1',
+        status: 'completed',
+        result: 'done',
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      await expect(running).resolves.toMatchObject([
+        { task: { data: 1 }, agentId: 'agent-1', status: 'completed' },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('does not spend task timeout while the task is queued', async () => {
     vi.useFakeTimers();
     try {
@@ -866,9 +903,9 @@ describe('SessionSwarmService metadata compatibility', () => {
       ready: Promise.resolve(),
       get: (name: string) =>
         name === 'coder'
-          ? { name: 'coder', tools: [], systemPrompt: () => '' }
+          ? normalizeAgentProfile({ name: 'coder', tools: [], systemPrompt: () => '' })
           : undefined,
-      getDefault: () => ({ name: 'agent', tools: [], systemPrompt: () => '' }),
+      getDefault: () => normalizeAgentProfile({ name: 'agent', tools: [], systemPrompt: () => '' }),
       list: () => [],
     });
     ix.stub(
@@ -906,6 +943,8 @@ describe('SessionSwarmService metadata compatibility', () => {
       },
     });
     ix.stub(ILogService, stubLog());
+    ix.stub(IConfigService, new StubConfigService({}));
+    ix.stub(IFlagService, stubFlag(() => false));
     ix.stub(IModelCatalog, {
       _serviceBrand: undefined,
       get: (alias: string) => {
@@ -1054,6 +1093,48 @@ describe('SessionSwarmService metadata compatibility', () => {
     expect(childUserTools.inheritUserTools).toHaveBeenCalledWith(parentUserTools);
   });
 
+  it('still applies the caller current permission mode to a newly spawned child', async () => {
+    const callerPermissionMode = spyPermissionMode('auto');
+    handles.set(
+      'main',
+      agentHandle(
+        'main',
+        lifecycle,
+        eventBus,
+        {},
+        new Map([[IAgentPermissionModeService, callerPermissionMode]]),
+      ),
+    );
+    const childPermissionMode = spyPermissionMode('manual');
+    createAgent.mockImplementationOnce((opts: CreateAgentOptions = {}) => {
+      const id = opts.agentId ?? 'agent-new';
+      const handle = agentHandle(
+        id,
+        lifecycle,
+        eventBus,
+        {
+          profileName: opts.binding?.profile ?? 'coder',
+          modelAlias: opts.binding?.model ?? 'kimi-test',
+          thinkingLevel: opts.binding?.thinking ?? 'medium',
+        },
+        new Map([[IAgentPermissionModeService, childPermissionMode]]),
+      );
+      handles.set(id, handle);
+      return handle;
+    });
+    const service = ix.get(ISessionSwarmService);
+
+    await expect(
+      service.run({
+        callerAgentId: 'main',
+        tasks: [spawnSessionTask('src/a.ts')],
+      }),
+    ).resolves.toMatchObject([{ status: 'completed', agentId: 'agent-new' }]);
+
+    expect(childPermissionMode.setMode).toHaveBeenCalledWith('auto');
+    expect(childPermissionMode.mode).toBe('auto');
+  });
+
   it('keeps v1 resume ownership errors inside the per-subagent result', async () => {
     agents['other-child'] = {
       labels: { parentAgentId: 'other', swarmItem: 'src/other.ts' },
@@ -1094,13 +1175,59 @@ describe('SessionSwarmService metadata compatibility', () => {
       }),
     ).resolves.toMatchObject([{ status: 'completed', agentId: 'agent-existing' }]);
 
-    // No realign: resume must not drag the child back to the parent's model.
     expect(child.accessor.get(IAgentProfileService).data().modelAlias).toBe('stale-model');
+    expect(eventBus.publish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'subagent.spawned',
+        subagentId: 'agent-existing',
+        model: 'stale-model',
+        thinkingEffort: 'medium',
+      }),
+    );
     expect(runAgent).toHaveBeenCalledWith(
       'agent-existing',
       { kind: 'prompt', prompt: 'Continue' },
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
+  });
+
+  it('applies the caller current permission mode to a resumed child (tightening)', async () => {
+    // Parent revoked its own blanket approval (now manual) after spawning
+    // this subagent under auto; resuming it must not leave it auto-approving.
+    const callerPermissionMode = spyPermissionMode('manual');
+    handles.set(
+      'main',
+      agentHandle(
+        'main',
+        lifecycle,
+        eventBus,
+        {},
+        new Map([[IAgentPermissionModeService, callerPermissionMode]]),
+      ),
+    );
+    agents['agent-existing'] = {
+      labels: { parentAgentId: 'main' },
+    };
+    const childPermissionMode = spyPermissionMode('auto');
+    const child = agentHandle(
+      'agent-existing',
+      lifecycle,
+      eventBus,
+      { profileName: 'explore' },
+      new Map([[IAgentPermissionModeService, childPermissionMode]]),
+    );
+    handles.set('agent-existing', child);
+    const service = ix.get(ISessionSwarmService);
+
+    await expect(
+      service.run({
+        callerAgentId: 'main',
+        tasks: [resumeSessionTask('agent-existing')],
+      }),
+    ).resolves.toMatchObject([{ status: 'completed', agentId: 'agent-existing' }]);
+
+    expect(childPermissionMode.setMode).toHaveBeenCalledWith('manual');
+    expect(childPermissionMode.mode).toBe('manual');
   });
 
   it('prefers the spawn task binding over the caller model', async () => {
@@ -1125,6 +1252,46 @@ describe('SessionSwarmService metadata compatibility', () => {
           model: 'provider/secondary',
           thinking: 'low',
         },
+      }),
+    );
+    expect(eventBus.publish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'subagent.spawned',
+        subagentId: 'agent-new',
+        model: 'provider/secondary',
+        thinkingEffort: 'low',
+      }),
+    );
+  });
+
+  it('emits the recipe base alias (never the derived entry id) as the spawned display model', async () => {
+    ix.stub(
+      IConfigService,
+      new StubConfigService({
+        [SECONDARY_MODEL_SECTION]: { model: 'provider/base', defaultEffort: 'low' },
+      }),
+    );
+    ix.stub(IFlagService, stubFlag((id) => id === SECONDARY_MODEL_FLAG_ID));
+    const service = ix.get(ISessionSwarmService);
+    const spawnTask: SessionSwarmSpawnTask = {
+      ...spawnSessionTask('src/a.ts'),
+      kind: 'spawn',
+      binding: { model: '__secondary__', thinking: 'low' },
+    };
+
+    await expect(
+      service.run({
+        callerAgentId: 'main',
+        tasks: [spawnTask],
+      }),
+    ).resolves.toMatchObject([{ status: 'completed', agentId: 'agent-new' }]);
+
+    expect(eventBus.publish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'subagent.spawned',
+        subagentId: 'agent-new',
+        model: 'provider/base',
+        thinkingEffort: 'low',
       }),
     );
   });
@@ -1207,6 +1374,80 @@ describe('SessionSwarmService metadata compatibility', () => {
           .filter(([agentId]) => agentId === 'agent-retry')
           .map(([, request]) => request),
       ).toEqual([{ kind: 'prompt', prompt: 'Continue' }, { kind: 'retry' }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('applies the caller current permission mode when a rate-limited child retries', async () => {
+    vi.useFakeTimers();
+    try {
+      const callerPermissionMode = spyPermissionMode('manual');
+      handles.set(
+        'main',
+        agentHandle(
+          'main',
+          lifecycle,
+          eventBus,
+          {},
+          new Map([[IAgentPermissionModeService, callerPermissionMode]]),
+        ),
+      );
+      agents['agent-retry'] = {
+        labels: { parentAgentId: 'main' },
+      };
+      agents['agent-blocker'] = {
+        labels: { parentAgentId: 'main' },
+      };
+      const retryChildPermissionMode = spyPermissionMode('auto');
+      handles.set(
+        'agent-retry',
+        agentHandle(
+          'agent-retry',
+          lifecycle,
+          eventBus,
+          {},
+          new Map([[IAgentPermissionModeService, retryChildPermissionMode]]),
+        ),
+      );
+      handles.set('agent-blocker', agentHandle('agent-blocker', lifecycle, eventBus));
+      const rateLimited = createControlledPromise<{ summary: string }>();
+      const blocker = createControlledPromise<{ summary: string }>();
+      let retryRuns = 0;
+      runAgent.mockImplementation((agentId, request, options) => {
+        options?.onReady?.();
+        if (agentId === 'agent-retry') {
+          retryRuns += 1;
+          return {
+            agentId,
+            turn: {} as never,
+            completion:
+              retryRuns === 1
+                ? rateLimited
+                : Promise.resolve({ summary: 'recovered summary' }),
+          };
+        }
+        return { agentId, turn: {} as never, completion: blocker };
+      });
+      const service = ix.get(ISessionSwarmService);
+
+      const running = service.run({
+        callerAgentId: 'main',
+        tasks: [resumeSessionTask('agent-retry'), resumeSessionTask('agent-blocker')],
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      // The initial resume already applies the mode; clear it so the
+      // assertion below isolates what the retry attempt itself does.
+      expect(retryChildPermissionMode.setMode).toHaveBeenCalledWith('manual');
+      retryChildPermissionMode.setMode.mockClear();
+
+      rateLimited.reject(new APIProviderRateLimitError('Rate limited'));
+      await vi.advanceTimersByTimeAsync(0);
+      blocker.resolve({ summary: 'blocker summary' });
+      await vi.advanceTimersByTimeAsync(3_000);
+      await running;
+
+      expect(retryChildPermissionMode.setMode).toHaveBeenCalledWith('manual');
     } finally {
       vi.useRealTimers();
     }
@@ -1381,7 +1622,25 @@ function profileService(data: ProfileData): IAgentProfileService {
       current = { ...current, ...changed };
     },
     republishStatus: () => {},
+    getEffectiveThinkingLevel: () => current.thinkingLevel,
   } as IAgentProfileService;
+}
+
+function spyPermissionMode(initialMode: PermissionMode): IAgentPermissionModeService & {
+  readonly setMode: ReturnType<typeof vi.fn<IAgentPermissionModeService['setMode']>>;
+} {
+  let mode = initialMode;
+  const setMode = vi.fn((nextMode: PermissionMode) => {
+    mode = nextMode;
+  });
+  return {
+    _serviceBrand: undefined,
+    get mode() {
+      return mode;
+    },
+    setMode,
+    onDidChangeMode: Event.None as IAgentPermissionModeService['onDidChangeMode'],
+  };
 }
 
 function userToolServiceStub(): IAgentUserToolService {

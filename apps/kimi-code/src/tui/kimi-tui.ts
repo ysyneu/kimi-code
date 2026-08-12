@@ -2,7 +2,7 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { DeviceAuthorization } from '@moonshot-ai/kimi-code-oauth';
-import { log } from '@moonshot-ai/kimi-code-sdk';
+import { effectiveModelAlias, log, SECONDARY_DERIVED_MODEL_ALIAS } from '@moonshot-ai/kimi-code-sdk';
 import type {
   ApprovalRequest,
   ApprovalResponse,
@@ -10,8 +10,12 @@ import type {
   CreateSessionOptions,
   KimiHarness,
   PermissionMode,
+  PluginCommandDef,
   PromptPart,
   Session,
+  SkillSummary,
+  TokenUsage,
+  WorkspaceTrustInfo,
 } from '@moonshot-ai/kimi-code-sdk';
 import type { MigrationPlan } from '@moonshot-ai/migration-legacy';
 import {
@@ -45,7 +49,10 @@ import {
   type KimiSlashCommand,
   type SkillListSession,
 } from './commands';
+import type { ArgCompletionSpec } from './commands/complete-args';
 import * as slashCommands from './commands/dispatch';
+import { AgentsExitConfirmComponent } from './components/agents-view/exit-confirm';
+import { CacheHintController } from './controllers/cache-hint-controller';
 import { BannerComponent } from './components/chrome/banner';
 import { DeviceCodeBoxComponent } from './components/chrome/device-code-box';
 import { GutterContainer } from './components/chrome/gutter-container';
@@ -62,8 +69,13 @@ import {
 } from './components/dialogs/approval-preview';
 import { CompactionComponent } from './components/dialogs/compaction';
 import { HelpPanelComponent } from './components/dialogs/help-panel';
+import {
+  defaultThinkingEffortFor,
+  modelDisplayName,
+} from './components/dialogs/model-selector';
 import { QuestionDialogComponent } from './components/dialogs/question-dialog';
 import { SessionPickerComponent, type SessionRow } from './components/dialogs/session-picker';
+import { TrustPromptComponent, type TrustPromptChoice } from './components/dialogs/trust-prompt';
 import {
   FileMentionProvider,
   type SlashAutocompleteCommand,
@@ -92,15 +104,19 @@ import {
 } from './components/messages/user-message';
 import { ActivityPaneComponent, type ActivityPaneMode } from './components/panes/activity-pane';
 import { QueuePaneComponent } from './components/panes/queue-pane';
-import type { TuiConfig } from './config';
+import { DEFAULT_TUI_CONFIG, loadTuiConfig, saveTuiConfig, type TuiConfig } from './config';
 import {
   LLM_NOT_SET_MESSAGE,
   MAIN_AGENT_ID,
   NO_ACTIVE_SESSION_MESSAGE,
   PRODUCT_NAME,
+  SESSIONLESS_STARTUP_NOTICE,
 } from './constant/kimi-tui';
 import { CHROME_GUTTER } from './constant/rendering';
 import { MAX_TERMINAL_TITLE_LENGTH } from './constant/terminal';
+import { AgentsViewController, attachRpcTimeoutMs, raceTimeout, replyRpcTimeoutMs } from './controllers/agents-view';
+import type { DispatchActivatableCommands } from './controllers/agents-view-dispatch';
+import type { AgentsGroupMode } from './controllers/agents-view-groups';
 import { AuthFlowController } from './controllers/auth-flow';
 import { BtwPanelController } from './controllers/btw-panel';
 import { ClipboardImageHintController } from './controllers/clipboard-image-hint';
@@ -138,10 +154,14 @@ import { formatErrorMessage } from './utils/event-payload';
 import { pickForegroundTasks } from './utils/foreground-task';
 import { ImageAttachmentStore, type ImageAttachment } from './utils/image-attachment-store';
 import { extractMediaAttachments, rewriteMediaPlaceholders } from './utils/image-placeholder';
+import type { ExtractionResult } from './utils/image-placeholder';
+import { installInputLatencyProbe } from './utils/input-latency';
+import { startupTrace } from '#/utils/startup-trace';
 import { REPLAY_TURN_LIMIT } from './utils/message-replay';
 import { hasPatchChanges } from './utils/object-patch';
 import { sessionRowsForPicker } from './utils/session-picker-rows';
 import { formatBashOutputForDisplay } from './utils/shell-output';
+import { thinkingEffortFromConfig } from './utils/thinking-config';
 import { combineStartupNotice, isOAuthLoginRequiredError } from './utils/startup';
 import { installTerminalFocusTracking } from './utils/terminal-focus';
 import { notifyTerminalOnce } from './utils/terminal-notification';
@@ -185,6 +205,19 @@ export interface KimiTUIStartupInput {
   readonly migrationPlan?: MigrationPlan | null;
   /** When true, run only the migration screen, then exit (the `kimi migrate` command). */
   readonly migrateOnly?: boolean;
+  /** When true, skip the startup session and boot into the agents view (the `kimi agents` command). */
+  readonly startupAgentsView?: boolean;
+  /** Agents-view header label for the connected kap-server ("embedded" or host:port). */
+  readonly agentsViewServerLabel?: string;
+  /**
+   * Agents-mode exit guard (`kimi agents` on an embedded kap-server): returns
+   * how many sessions are still running server-side — stop() confirms before
+   * interrupting them. Undefined for attached servers (they outlive this
+   * process, so disconnecting needs no confirmation) and for the normal TUI.
+   */
+  readonly agentsViewExitGuard?: () => Promise<number>;
+  /** agent-core-v2 engine; enables the startup workspace-trust prompt. */
+  readonly engineV2?: boolean;
 }
 
 type EffectiveActivityPaneMode = ActivityPaneMode | 'idle' | 'session';
@@ -227,10 +260,12 @@ function createInitialAppState(input: KimiTUIStartupInput): AppState {
     isReplaying: false,
     streamingPhase: 'idle',
     streamingStartTime: 0,
+    streamingStartApprox: false,
     theme: input.tuiConfig.theme,
     version: input.version,
     editorCommand: input.tuiConfig.editorCommand,
     disablePasteBurst: input.tuiConfig.disablePasteBurst,
+    cacheExpiryHint: input.tuiConfig.cacheExpiryHint,
     notifications: input.tuiConfig.notifications,
     upgrade: input.tuiConfig.upgrade,
     statusLine: input.tuiConfig.statusLine,
@@ -301,6 +336,9 @@ export class KimiTUI {
   readonly options: KimiTUIOptions;
   session: Session | undefined;
   state: TUIState;
+  /** In-flight lazy session creation (v2 engine), shared by concurrent first-use triggers. */
+  private ensureSessionPromise: Promise<Session | undefined> | null = null;
+  private readonly cacheHint = new CacheHintController(this);
   private readonly approvalController = new ApprovalController();
   private readonly questionController = new QuestionController();
   private readonly reverseRpcDisposers: Array<() => void> = [];
@@ -308,8 +346,16 @@ export class KimiTUI {
   readonly skillCommandMap = new Map<string, string>();
   private pluginCommands: readonly KimiSlashCommand[] = [];
   readonly pluginCommandMap = new Map<string, string>();
+  /** Agents-view dispatch menu's skill cold-start fallback — see
+   *  `warmAgentsViewSkillMenu`. Empty until a warm succeeds; superseded the
+   *  moment `skillCommands` itself becomes non-empty (a session attached). */
+  private agentsViewWorkspaceSkillCommands: readonly KimiSlashCommand[] = [];
+  private agentsViewWorkspaceSkillCommandMap: ReadonlyMap<string, string> = new Map();
   private readonly imageStore = new ImageAttachmentStore();
-  private fdPath: string | null = detectFdPath();
+  // Detected lazily in startBackgroundFdAutocomplete() — detection spawns
+  // `fd --version`, which must not happen before the workspace trust gate:
+  // on Windows a bare command name resolves into the (untrusted) cwd first.
+  private fdPath: string | null = null;
   private fdDownloadStarted = false;
   sessionEventUnsubscribe: (() => void) | undefined;
   cancelInFlight: (() => void) | undefined;
@@ -321,8 +367,27 @@ export class KimiTUI {
   private uninstallRainbowDance: () => void;
   private signalCleanupHandlers: Array<() => void> = [];
   private isShuttingDown = false;
+  private backgroundRefreshPromise: Promise<void> | undefined;
   private readonly migrationPlan: MigrationPlan | null;
   private readonly migrateOnly: boolean;
+  private readonly agentsViewServerLabelOverride: string | undefined;
+  private readonly agentsViewExitGuard: (() => Promise<number>) | undefined;
+  /** Serializes agents-view attaches — see attachAgentsViewSession. */
+  private agentsViewAttachInFlight = false;
+  /**
+   * Roster grouping mode (A6): seeded once from the startup `tuiConfig` (the
+   * same "read once at process start, mutate in memory, `save*` writes
+   * through" footing `theme`/`editorCommand`/`disablePasteBurst`/
+   * `notifications`/`upgrade`/`statusLine` already use via `createInitialAppState`),
+   * NOT re-read from disk on every `show()` — a fresh `tui.toml` load on
+   * every mount would be needless I/O for a value that only ever changes via
+   * `saveAgentsViewGroupMode` in this same process.
+   */
+  private agentsViewGroupModePref: AgentsGroupMode;
+  /** Re-entrancy guard: a second stop() while the exit confirmation is on screen is ignored. */
+  private exitConfirmInFlight = false;
+  /** Whether the harness runs on the agent-core-v2 engine (lazy session creation). */
+  readonly engineV2: boolean;
   private startupNotice: string | undefined;
   private lastActivityMode: string | undefined;
   private currentLoadingTip: { kind: LoadingTipKind; tip: string | undefined } | undefined =
@@ -342,6 +407,7 @@ export class KimiTUI {
   readonly sessionEventHandler: SessionEventHandler;
   readonly sessionReplay: SessionReplayRenderer;
   readonly tasksBrowserController: TasksBrowserController;
+  readonly agentsViewController: AgentsViewController;
   readonly editorKeyboard: EditorKeyboardController;
 
   /** Timer that auto-clears the one-shot "moved to background" footer hint. */
@@ -351,6 +417,17 @@ export class KimiTUI {
   // preview viewer can restore focus to the exact same instance (and its
   // selection / feedback state) when it closes.
   private activeApprovalPanel: ApprovalPanelComponent | undefined;
+  // Agents-view deferral slots: while the view takeover is on screen a
+  // reverse-RPC panel must NOT mount — it would land in the off-tree
+  // editorContainer (invisible) and mountEditorReplacement would
+  // unconditionally steal keyboard focus from the roster. The base
+  // controller keeps the request pending (the roster's awaiting badge keeps
+  // signalling it) and the latest show per kind is replayed by
+  // flushDeferredPanels when the user leaves the view for the owning
+  // session's chat. One slot per kind matches mountEditorReplacement's
+  // replace semantics; queued requests stay in the base controller's queue.
+  private deferredApprovalMount: (() => void) | undefined;
+  private deferredQuestionMount: (() => void) | undefined;
   // Active full-screen approval preview. While set, the root UI's normal
   // children are stashed in `savedChildren`; closing restores them.
   private approvalPreview:
@@ -391,11 +468,16 @@ export class KimiTUI {
         agentProfile: startupInput.agentProfile,
         agentFiles: startupInput.cliOptions.agentFiles,
         startupNotice: startupInput.startupNotice,
+        agentsView: startupInput.startupAgentsView,
       },
     };
     this.options = tuiOptions;
     this.migrationPlan = startupInput.migrationPlan ?? null;
     this.migrateOnly = startupInput.migrateOnly ?? false;
+    this.agentsViewServerLabelOverride = startupInput.agentsViewServerLabel;
+    this.agentsViewExitGuard = startupInput.agentsViewExitGuard;
+    this.agentsViewGroupModePref = startupInput.tuiConfig.agentsView?.groupMode ?? 'state';
+    this.engineV2 = startupInput.engineV2 ?? false;
     this.startupNotice = startupInput.startupNotice;
     this.state = createTUIState(tuiOptions);
     this.uninstallRainbowDance = installRainbowDance(() => {
@@ -424,6 +506,7 @@ export class KimiTUI {
     this.sessionEventHandler = new SessionEventHandler(this);
     this.sessionReplay = new SessionReplayRenderer(this);
     this.tasksBrowserController = new TasksBrowserController(this);
+    this.agentsViewController = new AgentsViewController(this, this.imageStore);
     this.editorKeyboard = new EditorKeyboardController(this, this.imageStore);
     this.editorKeyboard.install();
     this.buildLayout();
@@ -434,8 +517,13 @@ export class KimiTUI {
   // =========================================================================
 
   private getSlashCommands(): readonly KimiSlashCommand[] {
-    const builtins = sortSlashCommands(BUILTIN_SLASH_COMMANDS).filter((command) =>
-      isExperimentalFlagEnabled(command.experimentalFlag),
+    const isAgentsView = this.state.startupState === 'agents-view';
+    const builtins = sortSlashCommands(BUILTIN_SLASH_COMMANDS).filter(
+      (command) =>
+        isExperimentalFlagEnabled(command.experimentalFlag) &&
+        // Never advertise what this transport cannot run; the resolve layer
+        // refuses the same commands when one is typed out in full.
+        !(isAgentsView && command.unavailableInAgentsView === true),
     );
     return [...builtins, ...this.skillCommands, ...this.pluginCommands];
   }
@@ -479,6 +567,18 @@ export class KimiTUI {
 
   async refreshSkillCommands(session?: SkillListSession): Promise<void> {
     if (session === undefined) {
+      // v2 engine: skills live on the workspace handler, not the session, so
+      // they are available before the first (lazy) session is created — the
+      // workspace catalog is the same merged view a session would serve.
+      if (this.engineV2) {
+        try {
+          const skills = await this.harness.listWorkspaceSkills(this.state.appState.workDir);
+          this.applySkillCommands(skills);
+          return;
+        } catch {
+          return;
+        }
+      }
       this.skillCommands = [];
       this.skillCommandMap.clear();
       this.setupAutocomplete();
@@ -491,6 +591,10 @@ export class KimiTUI {
     } catch {
       return;
     }
+    this.applySkillCommands(skills);
+  }
+
+  private applySkillCommands(skills: readonly SkillSummary[]): void {
     const skillCommands = buildSkillSlashCommands(skills);
     this.skillCommands = skillCommands.commands;
     this.skillCommandMap.clear();
@@ -502,6 +606,17 @@ export class KimiTUI {
 
   async refreshPluginCommands(session?: Session): Promise<void> {
     if (session === undefined) {
+      // v2 engine: the enabled plugin commands are an app-global live view,
+      // available before the first (lazy) session is created.
+      if (this.engineV2) {
+        try {
+          const defs = await this.harness.listPluginCommands();
+          this.applyPluginCommands(defs);
+          return;
+        } catch {
+          return;
+        }
+      }
       this.pluginCommands = [];
       this.pluginCommandMap.clear();
       this.setupAutocomplete();
@@ -514,6 +629,10 @@ export class KimiTUI {
     } catch {
       return;
     }
+    this.applyPluginCommands(defs);
+  }
+
+  private applyPluginCommands(defs: readonly PluginCommandDef[]): void {
     const pluginSlashCommands = buildPluginSlashCommands(defs);
     this.pluginCommands = pluginSlashCommands.commands;
     this.pluginCommandMap.clear();
@@ -528,13 +647,24 @@ export class KimiTUI {
   // =========================================================================
 
   async start(): Promise<void> {
+    startupTrace('tui:start');
     // Signal handlers must be installed before raw mode to avoid EIO loops.
     this.registerSignalHandlers();
     // Outer try rolls back signal listeners on startup failure.
     try {
+      // The workspace trust gate must run before anything else in startup —
+      // including the migration branch: a workspace that needs migration is
+      // not implicitly trusted, and later startup steps spawn child processes.
+      startupTrace('trustPrompt:begin');
+      const trustPromptStartedLoop = await this.maybeRunWorkspaceTrustPrompt();
+      startupTrace('trustPrompt:end');
+
       if (this.migrationPlan !== null) {
         // Migration needs the event loop running first (pi-tui component).
-        this.startEventLoop();
+        // When the trust prompt already started it, starting it again would
+        // re-run pi-tui's terminal.start() — stacking a second Kitty
+        // keyboard-protocol push and duplicate stdin listeners.
+        if (!trustPromptStartedLoop) this.startEventLoop();
         try {
           const migrationResult = await this.runMigrationScreen(this.migrationPlan);
           if (this.migrateOnly) {
@@ -555,11 +685,22 @@ export class KimiTUI {
         return;
       }
 
+      startupTrace('initMainTui:begin');
       const shouldReplayHistory = await this.initMainTui();
-      this.startEventLoop();
+      startupTrace('initMainTui:end');
+      // Debug-only input→render latency overlay (KIMI_TUI_INPUT_LATENCY=1).
+      if (process.env['KIMI_TUI_INPUT_LATENCY']) installInputLatencyProbe(this.state.ui);
+      // When the trust prompt already started the event loop, starting it
+      // again would re-run pi-tui's terminal.start() — stacking a second
+      // Kitty keyboard-protocol push (leaking CSI-u mode past exit) and
+      // duplicate stdin listeners.
+      if (!trustPromptStartedLoop) this.startEventLoop();
+      startupTrace('eventLoop:started');
       try {
         this.startBackgroundFdAutocomplete();
+        startupTrace('finishStartup:begin');
         await this.finishStartup(shouldReplayHistory);
+        startupTrace('finishStartup:end');
       } catch (error) {
         this.disposeTerminalTracking();
         this.state.ui.stop();
@@ -656,8 +797,14 @@ export class KimiTUI {
   }
 
   private startBackgroundFdAutocomplete(): void {
-    if (this.fdPath !== null || this.fdDownloadStarted) return;
+    if (this.fdDownloadStarted) return;
     this.fdDownloadStarted = true;
+
+    this.fdPath = detectFdPath();
+    if (this.fdPath !== null) {
+      this.setupAutocomplete();
+      return;
+    }
 
     void ensureFdPath()
       .then((fdPath) => {
@@ -691,6 +838,14 @@ export class KimiTUI {
       this.startupNotice = undefined;
     }
     void this.showTmuxKeyboardWarningIfNeeded();
+    if (this.state.startupState === 'agents-view') {
+      void this.agentsViewController.show();
+      return;
+    }
+    // Config diagnostics (deprecated keys/env vars, invalid sections) in
+    // warning yellow at boot; `run-prompt`/`run-v2-print` print them to
+    // stderr for non-interactive runs.
+    void this.showConfigWarningsIfAny();
     if (this.state.startupState === 'picker') {
       void this.bootstrapFromPicker();
       return;
@@ -706,6 +861,9 @@ export class KimiTUI {
     if (this.session !== undefined) {
       this.sessionEventHandler.startSubscription();
       void this.showSessionWarnings(this.session);
+    }
+    if (shouldReplayHistory) {
+      void this.cacheHint.maybeShowOnResume();
     }
     void this.fetchSessions();
     if (this.session !== undefined) {
@@ -735,11 +893,14 @@ export class KimiTUI {
   }
 
   private async init(): Promise<boolean> {
-    setExperimentalFeatures(await this.harness.getExperimentalFeatures());
-    await this.authFlow.refreshAvailableModels();
-    void this.refreshProviderModelsInBackground();
-
     const { startup } = this.options;
+    if (startup.agentsView !== true) {
+      // Session-chat bootstrap the agents view has no surface for (and the
+      // wire transport cannot serve): experimental flags + model catalog.
+      setExperimentalFeatures(await this.harness.getExperimentalFeatures());
+      await this.authFlow.refreshAvailableModels();
+      this.backgroundRefreshPromise = this.refreshProviderModelsInBackground();
+    }
     const { workDir } = this.state.appState;
     let session: Session | undefined;
     let shouldReplayHistory = false;
@@ -759,6 +920,13 @@ export class KimiTUI {
     }
 
     try {
+      if (startup.agentsView === true) {
+        // `kimi agents`: the agents view IS the home screen — no startup
+        // session. finishStartup mounts it (same early-return shape as the
+        // picker path below).
+        this.state.startupState = 'agents-view';
+        return false;
+      }
       if (isResumeStartup) {
         if (startup.sessionFlag === '') {
           this.state.startupState = 'picker';
@@ -811,6 +979,14 @@ export class KimiTUI {
             );
           }
         }
+      } else if (this.engineV2) {
+        // Lazy session creation (v2 engine): start session-less and create the
+        // session on the first message. Startup flags are carried in appState
+        // and applied when that session is created; until then the footer
+        // shows the config defaults the engine would apply at createSession
+        // time (model, permission, plan mode, thinking effort, context cap).
+        await this.hydrateLazyConfigDefaults();
+        this.appendStartupNotice(SESSIONLESS_STARTUP_NOTICE);
       } else {
         session = await this.harness.createSession(createSessionOptions);
       }
@@ -826,11 +1002,13 @@ export class KimiTUI {
       return false;
     }
 
-    if (session === undefined) {
+    if (!this.engineV2 && session === undefined) {
       throw new Error('Startup session was not initialized.');
     }
-    await this.setSession(session);
-    await this.syncRuntimeState(session);
+    if (session !== undefined) {
+      await this.setSession(session);
+      await this.syncRuntimeState(session);
+    }
     this.applyStartupPermissionAndPlanToAppState();
     this.state.startupState = 'ready';
     return shouldReplayHistory;
@@ -838,14 +1016,56 @@ export class KimiTUI {
 
   async stop(exitCode?: number): Promise<void> {
     if (this.isShuttingDown) return;
+    // Agents mode on an embedded kap-server: quitting interrupts sessions
+    // still running server-side, so confirm BEFORE anything is torn down — a
+    // decline must leave the TUI exactly as it was. The guard is only wired
+    // for embedded servers: attached ones keep running after disconnect, and
+    // the normal TUI never sets it (zero behavior change outside agents
+    // mode, double-gated on the agents-view startup marker). Signal-driven
+    // stops (143 = SIGTERM) skip the dialog: there is no user to answer an
+    // interactive confirm on the signal path — the graceful shutdown below
+    // settles sessions and state is on disk.
+    if (
+      exitCode !== 143 &&
+      this.state.startupState === 'agents-view' &&
+      this.agentsViewExitGuard !== undefined
+    ) {
+      if (this.exitConfirmInFlight) return;
+      this.exitConfirmInFlight = true;
+      let proceed = false;
+      try {
+        proceed = await this.confirmAgentsViewExit();
+      } finally {
+        this.exitConfirmInFlight = false;
+      }
+      if (!proceed) {
+        // Esc/q quit path: the view's onQuit already closed it before stop()
+        // ran (that close is what triggers stop via setAgentsView), so put
+        // the user back in the view. In attach mode nothing was unmounted —
+        // the detached view state is still live and the chat stays as-is.
+        if (this.state.agentsView === undefined) void this.agentsViewController.show();
+        return;
+      }
+    }
     this.isShuttingDown = true;
     this.unregisterSignalHandlers();
     this.aborted = true;
+    // Give the startup provider-model refresh a brief chance to finish before
+    // the harness closes (and the process exits): its config writes are each
+    // atomic, so draining can only ever leave a complete file behind. Bounded
+    // so a slow network never delays the exit.
+    if (this.backgroundRefreshPromise !== undefined) {
+      await Promise.race([
+        this.backgroundRefreshPromise,
+        new Promise((resolve) => setTimeout(resolve, 1500)),
+      ]);
+    }
     this.streamingUI.discardPending();
     // Stop background polling, streaming intervals, and per-component timers
     // before tearing the UI down, so they can't keep firing requestRender after
     // stop() returns (or leak when stop() runs without process.exit).
     this.tasksBrowserController.close();
+    this.agentsViewController.close();
     this.btwPanelController.clear();
     this.stopActivitySpinner();
     this.streamingUI.disposeActiveCompactionBlock();
@@ -881,6 +1101,61 @@ export class KimiTUI {
     if (this.onExit) {
       await this.onExit(exitCode);
     }
+  }
+
+  /**
+   * The agents-mode exit gate: count running sessions via the runner-injected
+   * guard. Zero running exits straight away (no dialog); a failed count also
+   * exits — the interruption note is best effort and must never trap the
+   * user in the TUI (the embedded shutdown itself is always graceful).
+   */
+  private async confirmAgentsViewExit(): Promise<boolean> {
+    const guard = this.agentsViewExitGuard;
+    if (guard === undefined) return true;
+    let running: number;
+    try {
+      running = await guard();
+    } catch {
+      return true;
+    }
+    if (running === 0) return true;
+    return this.showAgentsExitConfirm(running);
+  }
+
+  /**
+   * The shutdown-time confirmation dialog (TasksBrowser inline stop-confirm
+   * shape: `y` confirms, anything else cancels, auto-cancel on timeout).
+   * Mounted as a full-screen container swap — the same pattern as the
+   * approval preview — because the agents view is itself a full-screen
+   * takeover: an editor-slot replacement would be invisible behind it.
+   * Resolving restores the previous children and focus untouched, so a
+   * cancel is fully reversible.
+   */
+  private showAgentsExitConfirm(running: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const savedChildren = [...this.state.ui.children];
+      const component = new AgentsExitConfirmComponent({
+        running,
+        onResolve: (confirmed) => {
+          this.state.ui.clear();
+          for (const child of savedChildren) this.state.ui.addChild(child);
+          const view = this.state.agentsView;
+          if (view !== undefined && !view.detached) {
+            this.state.ui.setFocus(view.component);
+          } else if (this.activeApprovalPanel !== undefined) {
+            this.state.ui.setFocus(this.activeApprovalPanel);
+          } else {
+            this.state.ui.setFocus(this.state.editor);
+          }
+          this.state.ui.requestRender(true);
+          resolve(confirmed);
+        },
+      });
+      this.state.ui.clear();
+      this.state.ui.addChild(component);
+      this.state.ui.setFocus(component);
+      this.state.ui.requestRender(true);
+    });
   }
 
   // SIGHUP / dead-terminal EIO → emergencyTerminalExit (no cleanup, avoids
@@ -1018,17 +1293,31 @@ export class KimiTUI {
         this.state.ui.requestRender();
         return;
       }
-      this.runShellCommandFromInput(text);
+      void this.runShellCommandFromInput(text);
       return;
     }
     slashCommands.dispatchInput(this, text);
   }
 
-  private runShellCommandFromInput(command: string): void {
-    const session = this.session;
+  private async runShellCommandFromInput(command: string): Promise<void> {
+    let session = this.session;
     if (session === undefined) {
-      this.showError('No active session for shell command.');
-      return;
+      if (!this.engineV2) {
+        this.showError('No active session for shell command.');
+        return;
+      }
+      session = await this.ensureSession();
+      if (session === undefined) return;
+      // A concurrent first message may have started a prompt while this lazy
+      // creation was in flight (both inputs share the same creation promise);
+      // honor the busy gate here, like handleUserInput does before the await,
+      // instead of running the shell command concurrently with an agent turn.
+      if (this.state.appState.streamingPhase !== 'idle') {
+        this.enqueueMessage(command, undefined, 'bash');
+        this.updateQueueDisplay();
+        this.state.ui.requestRender();
+        return;
+      }
     }
     // Echo the command locally (bash-input) with a `$` prompt. The agent also
     // records it for resume; this is the live view.
@@ -1132,16 +1421,20 @@ export class KimiTUI {
     const session = this.session;
     if (session === undefined) return;
     if (item.mode === 'bash') {
-      this.runShellCommandFromInput(item.text);
+      void this.runShellCommandFromInput(item.text);
     } else {
       this.sendQueuedMessage(session, item);
     }
     this.updateQueueDisplay();
   }
 
-  sendNormalUserInput(text: string): void {
+  async sendNormalUserInput(text: string, preExtracted?: ExtractionResult): Promise<void> {
     if (this.btwPanelController.sendUserInput(text)) return;
-    if (this.state.appState.model.trim().length === 0) {
+    // While a session switch is deferring input the target session's model is
+    // not synced yet, so an empty model here means "not known", not "not
+    // configured" — refusing the message would turn an ordinary attach into a
+    // spurious login prompt. Let it queue; the switch releases it.
+    if (!this.deferUserMessages && this.state.appState.model.trim().length === 0) {
       this.showError(LLM_NOT_SET_MESSAGE);
       return;
     }
@@ -1150,7 +1443,11 @@ export class KimiTUI {
       // Pasted videos are copied into the cache and expand to a `file://`
       // `video_url` part; the engine resolves (uploads or degrades) them
       // inside the turn, so submission stays fully synchronous.
-      extraction = extractMediaAttachments(text, this.imageStore);
+      //
+      // A cache-hint-swallowed resend passes its pre-dialog extraction back
+      // in: the image store may already be cleared (e.g. after "Start a new
+      // session"), so re-extracting from the text would lose the media.
+      extraction = preExtracted ?? extractMediaAttachments(text, this.imageStore);
     } catch (error) {
       // A video cache copy failed (unwritable cache dir, vanished source…);
       // nothing was dispatched.
@@ -1158,10 +1455,18 @@ export class KimiTUI {
       return;
     }
     if (!this.validateMediaCapabilities(extraction)) return;
-    const session = this.session;
+    // Idle cache-hint interception sits before session creation; it is
+    // synchronous unless a hint actually fires, keeping the send path
+    // await-free up to sendMessage.
+    if (this.cacheHint.maybeInterceptOnSubmit(text, extraction)) return;
+    let session = this.session;
     if (session === undefined) {
-      this.showError(LLM_NOT_SET_MESSAGE);
-      return;
+      if (!this.engineV2) {
+        this.showError(LLM_NOT_SET_MESSAGE);
+        return;
+      }
+      session = await this.ensureSession();
+      if (session === undefined) return;
     }
     if (extraction.hasMedia) {
       this.sendMessage(session, text, {
@@ -1263,6 +1568,7 @@ export class KimiTUI {
   }
 
   beginSessionRequest(): void {
+    this.cacheHint.onTurnBegin();
     this.streamingUI.setTurnId(undefined);
     this.streamingUI.resetLiveText();
     this.streamingUI.resetToolUi();
@@ -1276,6 +1582,7 @@ export class KimiTUI {
     this.setAppState({
       streamingPhase: 'waiting',
       streamingStartTime: Date.now(),
+      streamingStartApprox: false,
     });
   }
 
@@ -1287,7 +1594,7 @@ export class KimiTUI {
 
   sendQueuedMessage(session: Session, item: QueuedMessage): void {
     if (item.mode === 'bash') {
-      this.runShellCommandFromInput(item.text);
+      void this.runShellCommandFromInput(item.text);
       return;
     }
     this.harness.withInteractiveAgent(item.agentId ?? MAIN_AGENT_ID, () => {
@@ -1466,6 +1773,199 @@ export class KimiTUI {
     this.state.tasksBrowser = value;
   }
 
+  setAgentsView(value: TUIState['agentsView']): void {
+    this.state.agentsView = value;
+    // `kimi agents` startup: the view is the home screen with no session
+    // behind it — closing it exits the app.
+    if (value === undefined && this.state.startupState === 'agents-view' && !this.isShuttingDown) {
+      void this.stop();
+    }
+  }
+
+  /** Agents-view header label: attached servers show their host, the in-process engine counts as embedded. */
+  agentsViewServerLabel(): string {
+    return this.agentsViewServerLabelOverride ?? 'embedded';
+  }
+
+  /**
+   * I6: true when closing the agents-view process leaves its sessions
+   * running server-side. `agentsViewExitGuard` is wired only in embedded
+   * mode — a separately-attached kap-server survives the CLI exiting, so
+   * every other mode's sessions genuinely keep running.
+   */
+  agentsViewSessionsSurviveExit(): boolean {
+    return this.agentsViewExitGuard === undefined;
+  }
+
+  /** Dispatch cwd for sessions created from the agents view. */
+  agentsViewWorkDir(): string {
+    return this.state.appState.workDir;
+  }
+
+  /**
+   * AgentsViewHost: startup permission mode (`--auto`/`--yolo`) for sessions
+   * dispatched from the view — same precedence as the startup session's
+   * `createSessionOptions` in init() (`auto` over `yolo`).
+   */
+  agentsViewStartupPermission(): PermissionMode | undefined {
+    const { startup } = this.options;
+    return startup.auto ? 'auto' : startup.yolo ? 'yolo' : undefined;
+  }
+
+  /**
+   * Display label for the model new sessions dispatch with, when no
+   * `/model` override is staged. Same alias-resolution the welcome panel and
+   * footer use for the active session's model.
+   */
+  agentsViewModelLabel(): string {
+    const { model, availableModels } = this.state.appState;
+    const alias = availableModels[model];
+    const effective = alias === undefined ? undefined : effectiveModelAlias(alias);
+    return effective?.displayName ?? effective?.model ?? model;
+  }
+
+  /**
+   * Agents-view roster grouping mode (A6, Ctrl+S) — sync read of the
+   * in-memory preference; see `agentsViewGroupModePref`'s own doc for why
+   * this is never a disk read (same "read once at startup, mutate in
+   * memory" footing `theme`/`editorCommand`/`disablePasteBurst`/
+   * `notifications`/`upgrade`/`statusLine` already use).
+   */
+  agentsViewGroupMode(): AgentsGroupMode {
+    return this.agentsViewGroupModePref;
+  }
+
+  /** Persists a Ctrl+S grouping-mode change (failures propagate so the
+   *  controller's own flash surfaces them — see `AgentsViewController.
+   *  persistGroupMode`) and updates the in-memory preference so the next
+   *  `show()` in this process sees it without a fresh disk read. */
+  async saveAgentsViewGroupMode(mode: AgentsGroupMode): Promise<void> {
+    let config: TuiConfig;
+    try {
+      config = await loadTuiConfig();
+    } catch {
+      config = DEFAULT_TUI_CONFIG;
+    }
+    await saveTuiConfig({ ...config, agentsView: { groupMode: mode } });
+    this.agentsViewGroupModePref = mode;
+  }
+
+  /**
+   * `/model` argument completion candidates for the dispatch composer: every
+   * configured alias, minus the synthesized `__secondary__` derived entry
+   * (same exclusion the chat's model picker applies) — never selectable
+   * directly.
+   */
+  agentsViewModelCompletions(): readonly ArgCompletionSpec[] {
+    return Object.entries(this.state.appState.availableModels)
+      .filter(([alias]) => alias !== SECONDARY_DERIVED_MODEL_ALIAS)
+      .map(([alias, model]) => ({ value: alias, description: modelDisplayName(alias, model) }));
+  }
+
+  /**
+   * Skill + plugin-command entries and activation-lookup maps for the
+   * dispatch composer's staged-activation category — the exact same cached
+   * fields (`skillCommands`/`pluginCommands`/`skillCommandMap`/
+   * `pluginCommandMap`) the main chat's own `/` menu and dispatcher already
+   * use (`getSlashCommands`, `resolveSlashCommandInput`), reused unchanged.
+   *
+   * Cold-start gap, skill half: closed by `warmAgentsViewSkillMenu` — while
+   * `skillCommands` itself is still empty (no session attached this run),
+   * this falls back to `agentsViewWorkspaceSkillCommands`, the workspace-
+   * level warm result.
+   *
+   * Cold-start gap, plugin half: remains. `pluginCommands` only populates
+   * once a session has attached (`refreshPluginCommands` short-circuits to
+   * `[]` with no session) and there is no session-independent
+   * plugin-command route to warm it with — `session.listPluginCommands()`
+   * is `sessionId`-scoped (including the v2 RPC client's internal catalog
+   * path), and `KimiHarness` has no `listPlugins`/equivalent method at all
+   * (only `Session.listPlugins()`, itself session-scoped). So on a fresh
+   * `kimi agents` launch with no prior attach, the plugin section of the
+   * dispatch menu stays empty until the first attach.
+   */
+  agentsViewActivatableCommands(): DispatchActivatableCommands {
+    const skillsWarmed = this.skillCommands.length > 0;
+    return {
+      commands: [
+        ...(skillsWarmed ? this.skillCommands : this.agentsViewWorkspaceSkillCommands),
+        ...this.pluginCommands,
+      ],
+      skillCommandMap: skillsWarmed ? this.skillCommandMap : this.agentsViewWorkspaceSkillCommandMap,
+      pluginCommandMap: this.pluginCommandMap,
+    };
+  }
+
+  /**
+   * `AgentsViewHost` seam: fills `agentsViewActivatableCommands`'s skill
+   * cold-start gap via `KimiHarness.listWorkspaceSkills` — "skills visible
+   * to a new session in `workDir`, without creating that session" — which
+   * is exactly what the dispatch composer needs, since every session it
+   * creates opens in `agentsViewWorkDir()`. Fed through the same
+   * `buildSkillSlashCommands` helper `refreshSkillCommands` already uses,
+   * so a warmed entry is indistinguishable in shape from a session-sourced
+   * one. No-op once `skillCommands` is non-empty (a real session has
+   * attached this run — its own list always wins over the workspace guess)
+   * or if the call fails; either way `agentsViewActivatableCommands` simply
+   * keeps returning whatever it already had.
+   */
+  async warmAgentsViewSkillMenu(): Promise<void> {
+    if (this.skillCommands.length > 0) return;
+    let skills;
+    try {
+      skills = await this.harness.listWorkspaceSkills(this.agentsViewWorkDir());
+    } catch (error) {
+      log.debug('agents-view skill menu warm-up failed', { error });
+      return;
+    }
+    if (this.skillCommands.length > 0) return;
+    const warmed = buildSkillSlashCommands(skills);
+    this.agentsViewWorkspaceSkillCommands = warmed.commands;
+    this.agentsViewWorkspaceSkillCommandMap = warmed.commandMap;
+  }
+
+  /**
+   * Agents-view attach seam (AgentsViewHost): Enter on a roster row resumes
+   * that session and switches the TUI into its full chat UI. The view only
+   * detaches — its roster subscription stays alive for the footer badge.
+   */
+  onOpenSession(targetSessionId: string): void {
+    void this.attachAgentsViewSession(targetSessionId);
+  }
+
+  /**
+   * Agents-view return (EditorKeyboardHost): ← on an empty editor in
+   * agents mode re-mounts the detached view over the still-attached session —
+   * a pure view operation; the server-side turn keeps running. Returns false
+   * outside agents mode or when the view is not detached, so the key falls
+   * through to normal cursor semantics (zero behavior change in normal mode).
+   */
+  returnToAgentsView(): boolean {
+    const view = this.state.agentsView;
+    if (this.state.startupState !== 'agents-view' || view === undefined || !view.detached) {
+      return false;
+    }
+    // The session on screen right now is the one being backed out of — it
+    // becomes the roster's "came from" row (bold title in rows.ts) once the
+    // view remounts. Captured before show() runs; nothing switches sessions
+    // on this path, so appState.sessionId is stable across the call.
+    void this.agentsViewController.show(this.state.appState.sessionId);
+    return true;
+  }
+
+  /**
+   * AgentsViewHost: attach-mode footer badge feed; `undefined` clears it.
+   * `counts` is only ever passed while attached FROM the roster (the agents
+   * view is detached, not closed) — `undefined` vs `{...}` (even all-zero)
+   * is itself the "attached from the roster" signal (I4), so it doubles as
+   * the flag behind the badge's standing return-affordance segment.
+   */
+  setAttachBadge(counts: { agents: number; awaiting: number } | undefined): void {
+    this.state.footer.setAttachCounts(counts ?? { agents: 0, awaiting: 0 });
+    this.state.footer.setAttachedFromRoster(counts !== undefined);
+    this.state.ui.requestRender();
+  }
+
   appendStartupNotice(extra: string): void {
     this.startupNotice = combineStartupNotice(this.startupNotice, extra);
   }
@@ -1502,13 +2002,25 @@ export class KimiTUI {
   }
 
   setAppState(patch: Partial<AppState>): void {
-    if (!hasPatchChanges(this.state.appState, patch)) return;
+    // A transition to 'idle' is, structurally, the ONE place the turn-elapsed
+    // clock must clear. There are several call sites that end a turn (or a
+    // turn-like activity: a session switch, a failed send, a finished shell
+    // command, a standalone compaction) and every one of them goes through
+    // this method — so the clear is tied to the state change itself here,
+    // rather than something each call site has to separately remember. A
+    // caller that only asks for `streamingPhase: 'idle'` gets the clock reset
+    // for free; nothing upstream needs its own streamingStartTime/Approx.
+    const effectivePatch: Partial<AppState> =
+      patch.streamingPhase === 'idle'
+        ? { ...patch, streamingStartTime: 0, streamingStartApprox: false }
+        : patch;
+    if (!hasPatchChanges(this.state.appState, effectivePatch)) return;
     const additionalDirsChanged =
-      'additionalDirs' in patch &&
-      !sameStringArrays(this.state.appState.additionalDirs, patch.additionalDirs ?? []);
-    const busyChanged = 'streamingPhase' in patch || 'isCompacting' in patch;
-    Object.assign(this.state.appState, patch);
-    if ('planMode' in patch) this.updateEditorBorderHighlight();
+      'additionalDirs' in effectivePatch &&
+      !sameStringArrays(this.state.appState.additionalDirs, effectivePatch.additionalDirs ?? []);
+    const busyChanged = 'streamingPhase' in effectivePatch || 'isCompacting' in effectivePatch;
+    Object.assign(this.state.appState, effectivePatch);
+    if ('planMode' in effectivePatch) this.updateEditorBorderHighlight();
     this.state.footer.setState(this.state.appState);
     this.updateActivityPane();
     if (busyChanged) {
@@ -1549,22 +2061,199 @@ export class KimiTUI {
     return this.session;
   }
 
-  private async createSessionFromCurrentState(): Promise<Session> {
+  /**
+   * Seed appState with the config defaults the v2 engine would apply at
+   * createSession time (model, permission, plan mode, thinking effort,
+   * context cap), so the footer and the lazy create path reflect them while
+   * no session exists. Runs at session-less startup and again on /reload
+   * while still session-less, so externally edited defaults take effect
+   * before the first lazy-created session.
+   */
+  async hydrateLazyConfigDefaults(): Promise<void> {
+    const { startup } = this.options;
+    const config = await this.harness.getConfig({ reload: true });
+    const patch: Partial<AppState> = {};
+    const startupModel = startup.model ?? config.defaultModel;
+    if (startupModel !== undefined) {
+      patch.model = startupModel;
+      const selected = config.models?.[startupModel];
+      if (selected?.maxContextSize !== undefined) {
+        patch.maxContextTokens = selected.maxContextSize;
+      }
+    } else {
+      // The default disappeared from config (edited externally): clear the
+      // previously hydrated value instead of passing a stale explicit model
+      // to the first lazy-created session.
+      patch.model = '';
+      patch.maxContextTokens = 0;
+    }
+    // CLI --auto/--yolo/--plan win over config defaults; the flags are
+    // re-applied by applyStartupPermissionAndPlanToAppState at startup.
+    if (!startup.auto && !startup.yolo) {
+      // Reset to manual when the default was removed from config — a stale
+      // elevated mode must not be passed to the first lazy-created session.
+      patch.permissionMode = config.defaultPermissionMode ?? 'manual';
+    }
+    // Track the config default itself (vs an explicit CLI --plan) so the lazy
+    // create path can tell which one would activate plan mode; a removed
+    // default also clears the hydrated footer value.
+    patch.configDefaultPlanMode = config.defaultPlanMode === true;
+    if (!startup.plan) {
+      patch.planMode = config.defaultPlanMode === true;
+    }
+    const effort = thinkingEffortFromConfig(config.thinking);
+    if (effort !== undefined) {
+      patch.thinkingEffort = effort;
+    } else if (startupModel !== undefined) {
+      // No concrete effort configured: mirror the engine, which resolves the
+      // model's default effort at createSession time.
+      const raw = config.models?.[startupModel];
+      if (raw !== undefined) {
+        const providerType = config.providers?.[raw.provider]?.type;
+        patch.thinkingEffort = defaultThinkingEffortFor(
+          effectiveModelAlias(raw, providerType ?? raw.protocol),
+        );
+      }
+    }
+    if (startup.agentProfile !== undefined || startup.agentFiles !== undefined) {
+      patch.agentProfile = startup.agentProfile;
+      patch.agentFiles = startup.agentFiles?.length ? [...startup.agentFiles] : undefined;
+    }
+    this.setAppState(patch);
+  }
+
+  /**
+   * The model the engine would bind at an unbound session's first turn:
+   * `--model` wins, then `defaultModel` from config — the same precedence
+   * `hydrateLazyConfigDefaults` seeds into appState. Best-effort: an
+   * unreadable config yields '', leaving the client's LLM-not-set guard in
+   * place (which is correct when there is genuinely no default to bind).
+   */
+  private async configDefaultModel(): Promise<string> {
+    const { startup } = this.options;
+    if (startup.model !== undefined) return startup.model;
+    try {
+      const config = await this.harness.getConfig();
+      return config.defaultModel ?? '';
+    } catch {
+      return '';
+    }
+  }
+
+  private async createSessionFromCurrentState(bindStartupAgent = false): Promise<Session> {
+    // Background warm-up of the cache-hint config on every new session.
+    this.cacheHint.refreshConfigInBackground();
     const model = this.state.appState.model.trim();
     if (model.length === 0) {
       throw new Error(LLM_NOT_SET_MESSAGE);
     }
+    // With an active session, carry the live plan state. Session-less (lazy
+    // creation / `/new` before the first session) on v2, pass only the
+    // explicit CLI --plan intent — and only when the engine is not already
+    // applying `defaultPlanMode` at create time (sessionLifecycleService),
+    // since re-entering an active plan mode throws. On v1 (which never
+    // pre-fills plan mode from config), keep the historical appState value.
+    const explicitPlanMode =
+      this.session !== undefined || !this.engineV2
+        ? this.state.appState.planMode
+        : this.options.startup.plan && this.state.appState.configDefaultPlanMode !== true;
     const options: MutableCreateSessionOptions = {
       workDir: this.state.appState.workDir,
       model,
-      thinking: this.session === undefined ? undefined : this.state.appState.thinkingEffort,
+      // With an active session, carry the live effort. Session-less (lazy
+      // creation / `/new` before the first session), carry the session-only
+      // thinking override chosen via Alt+S if any — never the initial 'off'
+      // default, which would force thinking off where the engine's config or
+      // model default would apply.
+      thinking:
+        this.session === undefined
+          ? this.state.appState.lazySessionThinking
+          : this.state.appState.thinkingEffort,
       permission: this.state.appState.permissionMode,
-      planMode: this.state.appState.planMode ? true : undefined,
+      planMode: explicitPlanMode ? true : undefined,
     };
     if (this.state.appState.additionalDirs.length > 0) {
       options.additionalDirs = [...this.state.appState.additionalDirs];
     }
+    if (bindStartupAgent) {
+      // The --agent/--agent-file startup binding is consumed by the first
+      // lazy-created session; `/new` sessions fall back to the default profile.
+      if (this.state.appState.agentProfile !== undefined) {
+        options.agentProfile = this.state.appState.agentProfile;
+      }
+      if (this.state.appState.agentFiles !== undefined) {
+        options.agentFiles = [...this.state.appState.agentFiles];
+      }
+    }
     return this.harness.createSession(options);
+  }
+
+  /**
+   * Lazy-create the session on first use (v2 engine, session-less startup).
+   * Returns the existing session, or creates one from the current state and
+   * runs the same assembly `createNewSession` performs. Returns undefined and
+   * shows the error when creation fails; callers must still guard on
+   * `appState.model`.
+   *
+   * Concurrent first-use triggers (a double Enter, or a slash command right
+   * after a prompt) both observe `session === undefined`, so the first caller
+   * owns the creation and the rest share the in-flight promise — otherwise
+   * two sessions would be created and the later `setSession` would close the
+   * first one mid-dispatch.
+   */
+  async ensureSession(): Promise<Session | undefined> {
+    // Even when a session is already assigned, a previous lazy creation may
+    // still be finishing its assembly (runtime sync, command refresh,
+    // subscription). Wait for it so callers never dispatch against a
+    // partially initialized session.
+    if (this.ensureSessionPromise !== null) return this.ensureSessionPromise;
+    if (this.session !== undefined) return this.session;
+    this.ensureSessionPromise = this.lazyCreateSession().finally(() => {
+      this.ensureSessionPromise = null;
+    });
+    return this.ensureSessionPromise;
+  }
+
+  /** Await the in-flight lazy session creation, if any (v2); no-op otherwise. */
+  async waitForLazyCreation(): Promise<void> {
+    await this.ensureSessionPromise;
+  }
+
+  private async lazyCreateSession(): Promise<Session | undefined> {
+    let session: Session;
+    try {
+      session = await this.createSessionFromCurrentState(true);
+    } catch (error) {
+      const msg = formatErrorMessage(error);
+      this.showError(`Failed to start a session: ${msg}`);
+      return undefined;
+    }
+    this.resetSessionRuntime();
+    await this.setSession(session);
+    this.setAppState({ sessionId: session.id });
+    try {
+      await this.activateRuntime();
+      await this.syncRuntimeState(session);
+    } catch (error) {
+      this.sessionEventHandler.startSubscription();
+      const msg = formatErrorMessage(error);
+      this.showError(`Post-create setup failed: ${msg}`);
+      return undefined;
+    }
+    try {
+      await this.refreshSkillCommands(session);
+      await this.refreshPluginCommands(session);
+    } catch {
+      /* keep the new session usable even if dynamic skills fail */
+    }
+    this.sessionEventHandler.startSubscription();
+    void this.showSessionWarnings(session);
+    // The session-only thinking override was consumed by this session; the
+    // runtime status now owns the displayed effort.
+    if (this.state.appState.lazySessionThinking !== undefined) {
+      this.setAppState({ lazySessionThinking: undefined });
+    }
+    return session;
   }
 
   async setSession(session: Session): Promise<void> {
@@ -1578,9 +2267,47 @@ export class KimiTUI {
 
   async syncRuntimeState(session: Session = this.requireSession()): Promise<void> {
     const [status, goalResult] = await Promise.all([session.getStatus(), session.getGoal()]);
+    // A not-yet-bound session (v2/wire create is model-less by design; the
+    // engine binds `defaultModel` at the first turn's profile bind) reports
+    // no model. Mirror that turn-start fallback here: syncing `''` would wipe
+    // the hydrated default and trip the client's own LLM-not-set guard on the
+    // session's very first prompt. Cheap: one config read, only in this case.
+    const fallbackModel =
+      status.model === undefined || status.model.length === 0
+        ? await this.configDefaultModel()
+        : undefined;
+    // R9 I1: every switch/attach path calls this right after resetSessionRuntime
+    // forced streamingPhase to 'idle' — so on a session that is ALREADY busy
+    // (attaching to a live spinner row is a primary agents-view use case, not
+    // an edge case), that idle baseline is wrong: it exposes the exact same
+    // no-backlog-subscribe gap Q1a/Q1b diagnosed, from a different trigger.
+    // turn.started/turn.step.started for the in-progress turn necessarily
+    // already fired before this client's subscription existed; if the
+    // remainder is a tool-only tail with no further delta or step boundary,
+    // the only event this client ever sees is turn.ended arriving against a
+    // phase this reset just forced idle — finalizeTurn's own idle-guard then
+    // silently skips its entire body (queued-message dispatch included) for
+    // that turn. Seed from the real status instead of assuming idle: 'waiting'
+    // is the same placeholder phase turn.started/turn.step.started themselves
+    // set before any delta narrows it further, so it self-heals to
+    // 'thinking'/'composing' on the very next delta exactly like a normal
+    // turn start would. Guarded on currently-idle so this only ever seeds,
+    // never downgrades a phase a delta already narrowed.
+    if (status.busy === true && this.state.appState.streamingPhase === 'idle') {
+      // This client did not observe the turn's real start — it predates the
+      // subscription (see reconcileStreamingPhaseAfterAttach above) and is
+      // never replayed. Seed the clock at attach time and mark it
+      // approximate so the elapsed display renders "at least this long"
+      // (trailing `+`) instead of fabricating an age.
+      this.setAppState({
+        streamingPhase: 'waiting',
+        streamingStartTime: Date.now(),
+        streamingStartApprox: true,
+      });
+    }
     this.setAppState({
       sessionId: session.id,
-      model: status.model ?? '',
+      model: status.model || fallbackModel || '',
       thinkingEffort: status.thinkingEffort,
       permissionMode: status.permission,
       planMode: status.planMode,
@@ -1701,8 +2428,9 @@ export class KimiTUI {
     this.state.terminal.setTitle(label);
   }
 
-  resetSessionRuntime(): void {
+  resetSessionRuntime(opts: { keepAgentsView?: boolean } = {}): void {
     this.aborted = false;
+    this.cacheHint.resetRuntime();
     this.streamingUI.discardPending();
     this.state.queuedMessages = [];
     this.state.swarmModeEntry = undefined;
@@ -1710,11 +2438,47 @@ export class KimiTUI {
     this.streamingUI.resetToolUi();
     this.sessionEventHandler.resetRuntimeState();
     this.tasksBrowserController.close();
+    // Session switches (prepareSessionSwitch) pass keepAgentsView: the agents-
+    // view attach runs this reset while the roster is still the mounted tree,
+    // and the view's teardown is detachForAttach's job later in the attach —
+    // close() here would kill the roster subscription the attach badge feeds
+    // on, and (agents-view startup) setAgentsView(undefined) would stop the
+    // app mid-attach. Non-switch resets keep the close.
+    if (opts.keepAgentsView !== true) this.agentsViewController.close();
     this.btwPanelController.clear();
+    // M7: a deferred approval/question mount belongs to the session that
+    // raised it — carrying it across a switch means a later flush (e.g.
+    // `close()` in agents mode) mounts the OLD session's panel over the
+    // NEW session's chat. Discard rather than run it: the runtime it would
+    // reverse-RPC into no longer belongs to the session on screen.
+    this.deferredApprovalMount = undefined;
+    this.deferredQuestionMount = undefined;
     this.state.footer.setBackgroundCounts({ bashTasks: 0, agentTasks: 0 });
     this.streamingUI.setTodoList([]);
     this.streamingUI.setTurnId(undefined);
-    this.setAppState({ mcpServersSummary: null });
+    // R9 Q1b: every session switch/attach starts from a settled 'idle'
+    // baseline, closing the agents-view guard exemption's actual gap (the
+    // exemption is about not blocking the switch, not about skipping this
+    // reset). Without it, a `turn.ended` missed by the no-backlog live
+    // subscription (attach subscribes only after this reset + hydrate +
+    // replay complete) can leave the phase permanently wedged non-idle —
+    // finalizeTurn's own idle-guard then silently no-ops forever for that
+    // session, since no later `turn.ended` for the SAME turn ever arrives.
+    // (R9 I1: this idle baseline is provisional — syncRuntimeState, always
+    // the very next call in every switch path, re-seeds it from the target
+    // session's REAL busy status before the live subscription starts, so an
+    // attach to an already-busy session doesn't inherit the same gap from a
+    // different trigger.)
+    this.setAppState({ mcpServersSummary: null, streamingPhase: 'idle' });
+    // The live pane is per-session UI state too (every writer is a turn
+    // event or beginSessionRequest) — resetting only streamingPhase leaves
+    // a stale livePane.mode='waiting' behind, and updateActivityPane's
+    // mode-key early return then keeps the PREVIOUS session's spinner (and
+    // its approximate elapsed clock) ticking over the newly attached idle
+    // session. Wire reattach re-presents pending interactions via
+    // replayPending, so dropping pendingApproval/pendingQuestion here is
+    // consistent with the M7 deferred-slot discard above.
+    this.resetLivePane();
     this.streamingUI.setStep(0);
     this.streamingUI.resetLiveText();
     this.updateQueueDisplay();
@@ -1733,15 +2497,23 @@ export class KimiTUI {
   }
 
   private async resumeSession(targetSessionId: string): Promise<boolean> {
+    // A first-use lazy creation may still be in flight: wait it out so the
+    // checks below see settled state — the pending prompt would otherwise
+    // replace the resumed session when creation completes.
+    await this.waitForLazyCreation();
     if (targetSessionId === this.state.appState.sessionId) {
       this.showStatus('Already on this session.');
       return true;
     }
-    if (this.state.appState.streamingPhase !== 'idle') {
+    // Agents mode runs on the wire transport, where switching sessions is a
+    // local detach that never kills the server-side turn — the streaming and
+    // replay guards (which protect the in-process engine) do not apply there.
+    const agentsViewMode = this.state.startupState === 'agents-view';
+    if (!agentsViewMode && this.state.appState.streamingPhase !== 'idle') {
       this.showError('Cannot switch sessions while streaming — press Esc or Ctrl-C first.');
       return false;
     }
-    if (this.state.appState.isReplaying) {
+    if (!agentsViewMode && this.state.appState.isReplaying) {
       this.showError('Cannot switch sessions while history is replaying.');
       return false;
     }
@@ -1762,8 +2534,141 @@ export class KimiTUI {
     return true;
   }
 
+  /**
+   * Agents-view attach: resume first — a failure leaves the view mounted with
+   * the error shown — then run the whole session switch while the roster is
+   * STILL the mounted tree (it only touches off-screen children), and only
+   * then detach the view: one visible transition straight into the target
+   * session's finished transcript, no stale-content or clear-screen
+   * intermediate frames. The resume wait is bounded (attachRpcTimeoutMs):
+   * the server-side materialization chain has unbounded `.ready` waits and
+   * the client HTTP layer no timeout of its own, so without a bound here a
+   * wedged resume means the Enter does nothing, forever, with zero feedback.
+   * The wait is announced up front via the roster's own flash ("Attaching
+   * session…") so a slow-but-alive attach no longer reads as a frozen UI;
+   * detachForAttach clears it on success, the error flash replaces it on
+   * failure.
+   * The streaming/replay guards of {@link resumeSession}
+   * are intentionally absent: on the wire transport the switch is a local
+   * detach, so an in-flight turn on either session keeps running.
+   *
+   * Enter on the CURRENT session's row (attach → ← → Enter on the same row)
+   * is a re-enter, not an attach: the chat is still live underneath, so the
+   * view simply unmounts — no resume call, no guard error.
+   */
+  private async attachAgentsViewSession(targetSessionId: string): Promise<void> {
+    if (targetSessionId === this.state.appState.sessionId) {
+      this.agentsViewController.detachForAttach(targetSessionId, true);
+      return;
+    }
+    // One attach at a time: the roster stays mounted and interactive
+    // through the whole wait below, so without this guard every Enter
+    // starts another attach and their session switches interleave
+    // (setSession's previous.close() racing another attach's setup).
+    if (this.agentsViewAttachInFlight) {
+      this.agentsViewController.notifyUser(
+        this.state.agentsView,
+        'An attach is already in progress.',
+      );
+      return;
+    }
+    this.agentsViewAttachInFlight = true;
+    try {
+      // Immediate visible feedback for the whole bounded wait below (the
+      // roster stays mounted and otherwise looks frozen for up to
+      // attachRpcTimeoutMs). Cleared on success by detachForAttach's own
+      // flash reset; replaced by the error flash on failure — the duration
+      // only backstops a wait that never reaches either (reply barrier +
+      // resume can stack, hence the sum).
+      this.agentsViewController.notifyUser(this.state.agentsView, 'Attaching session…', {
+        durationMs: replyRpcTimeoutMs() + attachRpcTimeoutMs(),
+      });
+      // R9 Q1a: a reply just fired at this row from the roster is
+      // fire-and-forget — wait for it to settle (success or the bounded
+      // give-up) before taking the attach snapshot, so the snapshot can never
+      // be taken before the reply is durably applied server-side.
+      await this.agentsViewController.awaitPendingReply(targetSessionId);
+      let session: Session;
+      try {
+        session = await raceTimeout(
+          this.harness.resumeSession({
+            id: targetSessionId,
+            replayTurnLimit: REPLAY_TURN_LIMIT,
+          }),
+          attachRpcTimeoutMs(),
+        );
+      } catch (error) {
+        const msg = formatErrorMessage(error);
+        // The roster flash truncates the reason on narrow terminals — keep the
+        // full error (stack included) in the diagnostic log so a wedged
+        // resume is diagnosable after the fact.
+        log.error('agents-view attach resume failed', { sessionId: targetSessionId, error });
+        // The view is still mounted here (detachForAttach hasn't run yet) —
+        // this.showError would render into the UI-tree child `show()` already
+        // detached, so it must go through the controller's own visible
+        // channel instead (see AgentsViewController.notifyUser's doc).
+        const message = `Failed to attach session ${targetSessionId}: ${msg}`;
+        this.agentsViewController.notifyUser(this.state.agentsView, message, { error: true });
+        return;
+      }
+      try {
+        // Same startup-flag contract as a startup resume (`--auto`/`--yolo`/
+        // `--plan` apply to the session being entered); a no-op when none
+        // were passed.
+        await this.applyStartupModesToResumedSession(session);
+        await this.prepareSessionSwitch(session);
+      } catch (error) {
+        const msg = formatErrorMessage(error);
+        // Same full-error logging as the resume failure above.
+        log.error('agents-view attach switch failed', { sessionId: targetSessionId, error });
+        // Same mounted-view error channel as the resume failure above —
+        // detachForAttach still hasn't run, so the roster never left the
+        // screen and there is nothing to remount.
+        const message = `Failed to attach session ${targetSessionId}: ${msg}`;
+        this.agentsViewController.notifyUser(this.state.agentsView, message, { error: true });
+        return;
+      }
+      // Everything the switch needs is ready and the roster never flickered:
+      // detach restores the chat subtree — already holding the TARGET
+      // session — and the replay (synchronous in practice) lands before the
+      // detach's queued forced render fires, so the first painted frame IS
+      // the final transcript, pinned to the bottom.
+      this.agentsViewController.detachForAttach(targetSessionId, false);
+      await this.finishSessionSwitch(session, `Attached to session (${session.id}).`);
+    } finally {
+      this.agentsViewAttachInFlight = false;
+    }
+  }
+
   async switchToSession(session: Session, statusMessage: string): Promise<void> {
-    this.resetSessionRuntime();
+    await this.prepareSessionSwitch(session);
+    await this.finishSessionSwitch(session, statusMessage);
+  }
+
+  /**
+   * Everything a session switch needs BEFORE its chat may go on screen:
+   * session assignment, runtime-state sync, dynamic commands, and the
+   * transcript reset. Kept separate from {@link finishSessionSwitch} so the
+   * agents-view attach can run this whole phase while the roster is still
+   * the mounted tree (all of it touches off-screen children only), then
+   * swap trees once — one visible transition, no stale-content or
+   * clear-screen intermediate frames.
+   *
+   * The editor is already focused and accepting input while this runs (the
+   * roster focuses it before handing over), but the session's event listener
+   * is not registered until startSubscription() in finishSessionSwitch,
+   * and receiveEvent() has no buffering — a prompt sent inside that window
+   * loses every event it produces, including its own turn.ended, so the
+   * spinner wedges forever with no reply and no error. Queue instead: the
+   * message stays visible as queued and goes out once the listener is live.
+   */
+  private async prepareSessionSwitch(session: Session): Promise<void> {
+    this.deferUserMessages = true;
+    // keepAgentsView: on the agents-view attach path the roster is still the
+    // mounted tree at this point — detachForAttach (later in the attach) owns
+    // its teardown. On every other switch path the view is detached/absent
+    // already, so the skip changes nothing there.
+    this.resetSessionRuntime({ keepAgentsView: true });
     await this.setSession(session);
     await this.syncRuntimeState(session);
     this.updateTerminalTitle();
@@ -1774,6 +2679,10 @@ export class KimiTUI {
       /* keep the switched session usable even if dynamic skills fail */
     }
     this.clearTranscriptAndRedraw();
+  }
+
+  /** Replay + subscription + status lines — see {@link prepareSessionSwitch}. */
+  private async finishSessionSwitch(session: Session, statusMessage: string): Promise<void> {
     try {
       await this.sessionReplay.hydrateFromReplay(session);
     } catch (error) {
@@ -1781,13 +2690,62 @@ export class KimiTUI {
       this.showError(`Failed to replay session history: ${msg}`);
     } finally {
       this.sessionEventHandler.startSubscription();
+      // Released only here, and in the same `finally` as the subscription, so
+      // a failed replay cannot leave the composer permanently deferring.
+      this.deferUserMessages = false;
     }
+    this.drainOneQueuedMessage();
+    void this.reconcileStreamingPhaseAfterAttach(session);
     const resumeState = session.getResumeState();
     if (resumeState?.warning !== undefined) {
       this.showStatus(`Warning: ${resumeState.warning}`, 'warning');
     }
     this.showStatus(statusMessage);
     void this.showSessionWarnings(session);
+    void this.cacheHint.maybeShowOnResume();
+  }
+
+  /**
+   * Closes the gap between syncRuntimeState's busy-seed (streamingPhase set
+   * from a getStatus() snapshot taken BEFORE the session's event listener is
+   * registered — startSubscription() is the last step of switchToSession(),
+   * behind clearTranscriptAndRedraw + hydrateFromReplay) and events for that
+   * in-flight turn landing inside that gap: SDKRpcClientBase.receiveEvent()
+   * has no buffering, so anything — including the turn's own turn.ended — that
+   * arrives before the listener exists is lost forever, and nothing else
+   * will ever flip a seeded 'waiting' phase back to idle. Re-checks
+   * getStatus() now that the listener is live: if the turn already ended,
+   * runs the same finalize path a live turn.ended would have run
+   * (finalizeTurn's own idle-guard makes this a no-op if a real turn.ended
+   * already got through normally in the meantime — double-firing is safe).
+   * Skips entirely once any real, turn-scoped event has arrived
+   * (hasActiveTurn()): that means the listener is genuinely receiving this
+   * turn's events, so the real turn.ended will finalize it normally and a
+   * stale status snapshot must not race ahead of it.
+   */
+  private async reconcileStreamingPhaseAfterAttach(session: Session): Promise<void> {
+    // Read through a function reference (not a direct property comparison)
+    // so TS's control-flow narrowing doesn't treat the field as unchanged
+    // across the `await` below — other code genuinely mutates it in between.
+    const isIdle = (): boolean => this.state.appState.streamingPhase === 'idle';
+    if (isIdle()) return;
+    if (this.streamingUI.hasActiveTurn()) return;
+    let status: Awaited<ReturnType<Session['getStatus']>>;
+    try {
+      status = await session.getStatus();
+    } catch {
+      // Best-effort: a real turn.ended will still arrive normally if the
+      // turn is genuinely still in flight.
+      return;
+    }
+    if (this.session !== session || this.state.appState.sessionId !== session.id) return;
+    if (isIdle()) return;
+    if (this.streamingUI.hasActiveTurn()) return;
+    if (status.busy) return;
+    this.streamingUI.flushNow();
+    this.streamingUI.finalizeTurn((item) => {
+      this.sendQueuedMessage(session, item);
+    });
   }
 
   async reloadCurrentSessionView(session: Session, statusMessage: string): Promise<void> {
@@ -2052,11 +3010,10 @@ export class KimiTUI {
     this.state.todoPanelContainer.clear();
     this.imageStore.clear();
     this.renderWelcome();
-    // Session resets (/new, /clear, session switch) want a pristine screen.
-    // Force a destructive full render: the renderer's collapse repaint
-    // intentionally preserves scrollback, which would leave the previous
-    // session's text above the welcome banner.
-    this.state.ui.requestRender(true);
+    // No forced full render on session reset: let the differential renderer
+    // converge on its own (a mass change above the viewport still makes the
+    // engine repaint everything, but nothing is forced destructively here).
+    this.state.ui.requestRender();
   }
 
   private isTurnBoundaryComponent(child: Component): boolean {
@@ -2433,6 +3390,7 @@ export class KimiTUI {
         return;
       case 'waiting': {
         const spinner = this.ensureActivitySpinner('moon');
+        spinner.setElapsedOrigin(this.turnElapsedOrigin(), this.state.appState.streamingStartApprox === true);
         this.syncAgentSwarmActivitySpinner(placeSpinnerInAgentSwarm ? spinner : undefined);
         if (placeSpinnerInAgentSwarm) break;
         this.state.activityContainer.addChild(
@@ -2453,6 +3411,7 @@ export class KimiTUI {
         const spinner = this.ensureActivitySpinner('braille', 'working...', (s) =>
           currentTheme.fg('primary', s),
         );
+        spinner.setElapsedOrigin(this.turnElapsedOrigin(), this.state.appState.streamingStartApprox === true);
         this.syncAgentSwarmActivitySpinner(undefined);
         this.state.activityContainer.addChild(
           new ActivityPaneComponent({
@@ -2465,6 +3424,7 @@ export class KimiTUI {
       }
       case 'tool': {
         const spinner = this.ensureActivitySpinner('moon');
+        spinner.setElapsedOrigin(this.turnElapsedOrigin(), this.state.appState.streamingStartApprox === true);
         this.syncAgentSwarmActivitySpinner(placeSpinnerInAgentSwarm ? spinner : undefined);
         if (placeSpinnerInAgentSwarm) break;
         this.state.activityContainer.addChild(
@@ -2490,6 +3450,16 @@ export class KimiTUI {
     this.state.ui.requestRender();
   }
 
+  // The elapsed clock is only meaningful while an actual turn is in flight
+  // (waiting/thinking/composing) — NOT during a `!` shell command, which
+  // reuses the `waiting` activity-pane presentation (see
+  // resolveActivityPaneMode) but shares no timestamp with any turn.
+  private turnElapsedOrigin(): number | undefined {
+    const phase = this.state.appState.streamingPhase;
+    if (phase !== 'waiting' && phase !== 'thinking' && phase !== 'composing') return undefined;
+    return this.state.appState.streamingStartTime;
+  }
+
   private resolveActivityPaneMode(): EffectiveActivityPaneMode {
     if (this.state.activeDialog === 'session-picker') return 'hidden';
     if (this.state.livePane.pendingApproval !== null) return 'hidden';
@@ -2502,8 +3472,17 @@ export class KimiTUI {
     // until it finishes, signalling that input is busy / queued.
     if (streamingPhase === 'shell') return 'waiting';
 
+    // livePane.mode is the primary signal (it tracks tool calls and gets set
+    // together with streamingPhase by every LOCAL turn-start path — sending a
+    // prompt, a real turn.started/step.started — so it is never 'idle' while
+    // one of those phases is in flight). But attaching to a session whose
+    // turn is already running seeds ONLY streamingPhase (syncRuntimeState's
+    // busy-seed — see reconcileStreamingPhaseAfterAttach above); livePane.mode
+    // has no reason to know about that seam and stays at its 'idle' default.
+    // Without this fallback the pane renders nothing for the whole attached
+    // turn until some later event happens to touch livePane.mode.
     if (this.state.livePane.mode === 'idle') {
-      if (streamingPhase === 'thinking' || streamingPhase === 'composing') {
+      if (streamingPhase === 'waiting' || streamingPhase === 'thinking' || streamingPhase === 'composing') {
         return streamingPhase;
       }
     }
@@ -2550,12 +3529,10 @@ export class KimiTUI {
       if (!isExpandable(child)) continue;
       child.setExpanded(this.state.toolOutputExpanded && i >= expandCutoff);
     }
-    // Expanding/collapsing shifts content above the viewport; the clamped
-    // differential render would paint a second copy below the stale one in
-    // scrollback. This is a deliberate user action (like /clear), so do a
-    // destructive full render: scrollback holds exactly one copy and the
-    // expanded output can be read by scrolling up.
-    this.state.ui.requestRender(true);
+    // Differential render only — no destructive full redraw on expand/collapse.
+    // (When the expanded region reaches above the viewport, the engine's own
+    // fallback may still do a full render; that path is not forced from here.)
+    this.state.ui.requestRender();
   }
 
   toggleTodoPanelExpansion(): void {
@@ -2789,22 +3766,34 @@ export class KimiTUI {
     this.state.ui.requestRender();
   }
 
+  /** True while the agents-view takeover owns the screen (mounted, not detached for an attach). */
+  private isAgentsViewTakeoverActive(): boolean {
+    const view = this.state.agentsView;
+    return view !== undefined && !view.detached;
+  }
+
+  /**
+   * AgentsViewHost seam: replays the reverse-RPC panel mounts deferred
+   * while the agents-view takeover was on screen. Runs after the view has
+   * detached/closed, so the replayed shows mount (and focus) normally.
+   */
+  flushDeferredPanels(): void {
+    const approval = this.deferredApprovalMount;
+    const question = this.deferredQuestionMount;
+    this.deferredApprovalMount = undefined;
+    this.deferredQuestionMount = undefined;
+    approval?.();
+    question?.();
+  }
+
   restoreEditor(): void {
     this.state.editorContainer.clear();
     this.state.editorContainer.addChild(this.state.editor);
     this.state.ui.setFocus(this.state.editor);
-    // Measure overflow against the restored tree (editor mounted), not the tall
-    // panel just removed — otherwise a short session with a tall panel looks like
-    // it overflows and we take a full clear/home that yanks the editor to the top.
-    // Treat an exact one-screen fill as overflowing too: a full redraw is safe
-    // there (no blank tail) and clears a stale viewport offset after a shrink.
-    const { columns, rows } = this.state.terminal;
-    const overflowsViewport = this.state.ui.render(columns).length >= rows;
-    // Force a full re-render after replacing a tall panel with the shorter editor:
-    // differential rendering leaves the editor shifted up when the bottom-anchored
-    // region shrinks in place. Skip under tmux (its own reflow handles the shrink)
-    // and when content fits on one screen (a full clear would pull the editor up).
-    this.state.ui.requestRender(!this.state.terminalState.insideTmux && overflowsViewport);
+    // Differential render only: closing a tall panel leaves the editor a few
+    // rows above the bottom (blank tail) until the next append, but avoids a
+    // destructive full redraw on every dialog close.
+    this.state.ui.requestRender();
   }
 
   restoreInputText(text: string): void {
@@ -2812,6 +3801,26 @@ export class KimiTUI {
     this.state.editor.setText(text);
     this.updateEditorBorderHighlight(text);
     this.state.ui.requestRender();
+  }
+
+  /** Latest in-process LLM round-trip; feeds the idle cache-hint scenario. */
+  recordSessionActivity(): void {
+    this.cacheHint.recordActivity();
+  }
+
+  /** Per-step usage for the client-side cache-break detector. */
+  noteStepUsage(usage: TokenUsage | undefined): void {
+    this.cacheHint.noteStepUsage(usage);
+  }
+
+  /** Compaction shrinks the cached prefix — reset the cache-break baseline. */
+  noteCompactionFinished(): void {
+    this.cacheHint.resetCacheBreakBaseline();
+  }
+
+  /** /undo cut the context — the next step's cache drop is expected. */
+  noteContextCut(): void {
+    this.cacheHint.resetCacheBreakBaseline();
   }
 
   private async runMigrationScreen(plan: MigrationPlan): Promise<MigrationScreenResult> {
@@ -2841,6 +3850,57 @@ export class KimiTUI {
       }
     }
     return result;
+  }
+
+  /**
+   * agent-core-v2 startup gate: before any session is created, ask whether to
+   * trust this folder when the workspace is not trusted yet (project-level MCP
+   * servers stay disabled while untrusted). Best-effort throughout — a failed
+   * check or trust write never blocks startup. Choosing "don't trust" (or Esc)
+   * exits the program before any session is created; the prompt reappears on
+   * the next launch: the engine's untrusted state is indistinguishable from
+   * never-trusted. Returns true when the prompt started the event loop (the
+   * caller must not start it again).
+   */
+  private async maybeRunWorkspaceTrustPrompt(): Promise<boolean> {
+    if (!this.engineV2) return false;
+    const workDir = this.state.appState.workDir;
+    let info: WorkspaceTrustInfo;
+    try {
+      info = await this.harness.getWorkspaceTrustInfo(workDir);
+    } catch {
+      return false;
+    }
+    if (info.trusted) return false;
+    this.startEventLoop();
+    const choice = await new Promise<TrustPromptChoice>((resolve) => {
+      this.state.activeDialog = 'trust-prompt';
+      this.mountEditorReplacement(
+        new TrustPromptComponent({
+          workDir,
+          gatedMcpServers: info.gatedMcpServers,
+          onSelect: (c) => {
+            resolve(c);
+          },
+        }),
+      );
+    });
+    this.state.activeDialog = null;
+    if (choice !== 'trust') {
+      // Declining trust exits the program (Claude Code's "No, exit" semantics):
+      // stop() runs the standard shutdown path and ends in process.exit. The
+      // editor is NOT restored first — its frame would linger as an orphaned
+      // input box above the exit message; the prompt stays as the last frame.
+      await this.stop();
+      return true;
+    }
+    this.restoreEditor();
+    try {
+      await this.harness.trustWorkspace(workDir);
+    } catch {
+      // A failed write leaves the workspace untrusted (re-asked next launch).
+    }
+    return true;
   }
 
   showHelpPanel(): void {
@@ -3006,6 +4066,15 @@ export class KimiTUI {
   }
 
   private showApprovalPanel(payload: ApprovalPanelData): void {
+    if (this.isAgentsViewTakeoverActive()) {
+      // Defer: mounting now would be invisible behind the takeover and
+      // would steal the roster's keyboard focus. The request stays pending
+      // in the approval controller; the roster badge signals it.
+      this.deferredApprovalMount = () => {
+        this.showApprovalPanel(payload);
+      };
+      return;
+    }
     this.patchLivePane({ pendingApproval: { data: payload } });
     notifyTerminalOnce(this.state, `approval:${payload.id}`, {
       title: 'Kimi Code approval required',
@@ -3028,6 +4097,12 @@ export class KimiTUI {
   }
 
   private hideApprovalPanel(): void {
+    if (this.deferredApprovalMount !== undefined) {
+      // The show was deferred, so nothing was ever mounted — restoreEditor
+      // here would focus the off-tree editor behind the takeover.
+      this.deferredApprovalMount = undefined;
+      return;
+    }
     // If the full-screen preview is open, fold it back first so the saved-
     // children stack stays consistent with what mountEditorReplacement set up.
     if (this.approvalPreview !== undefined) this.closeApprovalPreview();
@@ -3073,6 +4148,13 @@ export class KimiTUI {
   }
 
   private showQuestionDialog(payload: QuestionPanelData): void {
+    if (this.isAgentsViewTakeoverActive()) {
+      // Defer for the same reason as showApprovalPanel.
+      this.deferredQuestionMount = () => {
+        this.showQuestionDialog(payload);
+      };
+      return;
+    }
     this.patchLivePane({ pendingQuestion: { data: payload } });
     notifyTerminalOnce(this.state, `question:${payload.id}`, {
       title: 'Kimi Code needs your answer',
@@ -3092,6 +4174,11 @@ export class KimiTUI {
   }
 
   private hideQuestionDialog(): void {
+    if (this.deferredQuestionMount !== undefined) {
+      // Deferred shows never mounted — skip restoreEditor (see hideApprovalPanel).
+      this.deferredQuestionMount = undefined;
+      return;
+    }
     this.patchLivePane({ pendingQuestion: null });
     this.restoreEditor();
   }

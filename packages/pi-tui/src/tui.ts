@@ -7,6 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
 import { isKeyRelease, matchesKey } from "./keys.ts";
+import { decodeMouseClick, isMouseSequence, type MouseClickEvent } from "./mouse.ts";
 import type { Terminal } from "./terminal.ts";
 import {
 	isOsc11BackgroundColorResponse,
@@ -83,6 +84,17 @@ export interface Component {
 	 * Optional handler for keyboard input when component has focus
 	 */
 	handleInput?(data: string): void;
+
+	/**
+	 * Optional handler for a left mouse-button press, delivered only while
+	 * this component has focus (mirrors `handleInput`'s focus routing).
+	 * Mouse reporting is off by default everywhere — nothing calls this
+	 * unless something has explicitly turned it on (see `ProcessTerminal.
+	 * enableMouseTracking`), and only for the narrow window that caller
+	 * chooses. Coordinates are 0-indexed screen row/column. Components that
+	 * do not implement this are simply never called.
+	 */
+	handleMouse?(event: MouseClickEvent): void;
 
 	/**
 	 * If true, component receives key release events (Kitty protocol).
@@ -811,6 +823,12 @@ export class TUI extends Container {
 			return;
 		}
 
+		// Consume any recognized mouse escape sequence before it can reach a
+		// component's handleInput as garbage keys — see consumeMouseSequence.
+		if (this.consumeMouseSequence(data)) {
+			return;
+		}
+
 		// Global debug key handler (Shift+Ctrl+D)
 		if (matchesKey(data, "shift+ctrl+d") && this.onDebug) {
 			this.onDebug();
@@ -910,6 +928,27 @@ export class TUI extends Container {
 		// Invalidate all components so images re-render with correct dimensions.
 		this.invalidate();
 		this.requestRender();
+		return true;
+	}
+
+	/**
+	 * Consume any recognized mouse escape sequence — SGR or legacy — so it
+	 * never reaches a focused component's handleInput as garbage keys. Only
+	 * a decoded left-button press (see decodeMouseClick) is forwarded on, to
+	 * the focused component's optional handleMouse; releases, other
+	 * buttons, and the legacy encoding are swallowed silently. There is no
+	 * coordinate-based routing beyond "the currently focused component" —
+	 * same focus target handleInput already uses.
+	 */
+	private consumeMouseSequence(data: string): boolean {
+		if (!isMouseSequence(data)) {
+			return false;
+		}
+		const event = decodeMouseClick(data);
+		if (event) {
+			this.focusedComponent?.handleMouse?.(event);
+			this.requestRender();
+		}
 		return true;
 	}
 

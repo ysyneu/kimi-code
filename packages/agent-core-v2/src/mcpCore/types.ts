@@ -1,19 +1,13 @@
 /**
- * `mcpCore` domain (L2) — MCP protocol types and the minimal client contract
- * `ToolManager` consumes.
+ * `mcpCore` domain — MCP protocol types and the minimal client contract.
  *
- * Lives in its own file (rather than `toolset.ts`) because the agent-side
- * tool-runtime layer is `ExecutableTool`, not the legacy `Toolset` interface.
- * What remains here is the wire-level surface: tool definitions returned by
- * `tools/list`, the `tools/call` result shape, and the small interface that
- * lets tests inject a fake transport without pulling in the MCP SDK type graph.
+ * The wire-level surface: tool definitions returned by `tools/list`, the
+ * `tools/call` result shape, and the small interface that lets tests inject a
+ * fake transport without pulling in the MCP SDK type graph.
  */
 
-/**
- * Inline resource contents nested under an EmbeddedResource block.
- * Exactly one of `text` or `blob` is populated, per the MCP schema's
- * `TextResourceContents | BlobResourceContents` union.
- */
+import { ErrorCodes, Error2 } from '#/errors';
+
 export interface MCPEmbeddedResourceContents {
   uri: string;
   mimeType?: string;
@@ -35,6 +29,8 @@ export interface MCPContentBlock {
 export interface MCPToolResult {
   content: MCPContentBlock[];
   isError: boolean;
+  structuredContent?: unknown;
+  _meta?: Record<string, unknown>;
 }
 
 export interface MCPToolDefinition {
@@ -50,12 +46,6 @@ export interface MCPClient {
     args: Record<string, unknown>,
     signal?: AbortSignal,
   ): Promise<MCPToolResult>;
-  /**
-   * Sends a protocol-level `ping` with a short built-in timeout, so a hung
-   * server rejects instead of blocking. Used to probe liveness after an
-   * ambiguous call failure; a server that answers in any way — even with
-   * `MethodNotFound` — proves the transport is usable.
-   */
   ping(signal?: AbortSignal): Promise<void>;
 }
 
@@ -66,5 +56,8 @@ export function assertMcpInputSchema(
   if (typeof inputSchema === 'object' && inputSchema !== null && !Array.isArray(inputSchema)) {
     return inputSchema as Record<string, unknown>;
   }
-  throw new Error(`Invalid inputSchema for MCP tool "${toolName}": schema must be a JSON object`);
+  throw new Error2(
+    ErrorCodes.MCP_STARTUP_FAILED,
+    `Invalid inputSchema for MCP tool "${toolName}": schema must be a JSON object`,
+  );
 }

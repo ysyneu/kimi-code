@@ -137,7 +137,8 @@ Holds the concrete class(es) and the top-level registration. A typical impl:
  * … collaborators as roles ("logs through `log`") … Bound at App scope.
  */
 
-import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
+import { LifecycleScope } from '#/app/scopes';
+import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { ILogService } from '#/log';
 
 import { type Greeting, IGreeter } from './greet';
@@ -162,6 +163,8 @@ What belongs here:
 - **Class** — `XxxService implements IXxxService`, with `declare readonly _serviceBrand: undefined`.
 - **Helper classes / functions** used only by this impl (e.g. a built-in writer, an `extractError` helper) — co-located in the same file.
 - **Top-level `registerScopedService(...)`** — one per Service the file owns; importing the impl file runs the registration.
+
+Base class: extend `Service` (from `#/_base/di/service`) when the unit needs capability calls on `this` — `provide` / `effect` / `on` / `get` / `ref` (e.g. contributing a record to a `collection` token). `Service` extends `Disposable`, so `_register` keeps working; constructor-time `provide` / `on` / `effect` calls are buffered and flushed by the kernel after construction, while `get` / `ref` throw inside the constructor (dependencies stay constructor parameters). Otherwise extend `Disposable` — both are full DI units; a service whose own members collide with the `Service` vocabulary (`name` / `state` / `config` / `get`) must stay on `Disposable` (leave a NOTE comment saying so).
 
 ## Constructor conventions
 
@@ -204,7 +207,7 @@ A scoped Service may expose a factory method that returns a **new** instance of 
 
 ### Runtime state goes into the per-scope state container
 
-Session/Agent-scope Services register their runtime state into the scope's state container (`ISessionStateService` / `IAgentStateService`, both over `_base`'s `StateRegistry`) instead of holding it in bare instance fields, so per-scope state lives in one observable place (`snapshot()` / `onDidChange`) and dies with the scope. Reference: `session/interaction/interactionService.ts`.
+Workspace/Session/Agent-scope Services register their runtime state into the scope's state container (`IWorkspaceStateService` / `ISessionStateService` / `IAgentStateService`, all over `_base`'s `StateRegistry`) instead of holding it in bare instance fields, so per-scope state lives in one observable place (`snapshot()` / `onDidChange`) and dies with the scope. Reference: `session/interaction/interactionService.ts`.
 
 - Declare keys in the domain file and export them: `export const interactionPendingKey = defineState<Map<string, Pending>>('interaction.pending', () => new Map())` — `<domain>.<field>` naming, factory initializers.
 - Inject `@ISessionStateService private readonly states` (or the Agent token) and `this.states.register(key)` per key at the top of the constructor.
@@ -317,7 +320,8 @@ export const IGreeter: ServiceIdentifier<IGreeter> = createDecorator<IGreeter>('
 
 ```ts
 // greet/greetService.ts
-import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
+import { LifecycleScope } from '#/app/scopes';
+import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { type Greeting, IGreeter } from './greet';
 
 export class Greeter implements IGreeter {

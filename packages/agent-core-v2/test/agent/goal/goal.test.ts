@@ -6,6 +6,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { isUserCancellation } from '#/_base/utils/abort';
 import type { TurnEndedEvent } from '#/agent/loop/turnEvents';
 
 import type { IDisposable } from '#/_base/di/lifecycle';
@@ -63,9 +64,6 @@ import { stubLoopWithHooks, type StubLoop } from '../loop/stubs';
 import { stubToolExecutorEvents, type ToolExecutorEventStubs } from '../toolExecutor/stubs';
 import { stubAgentSwarm } from './stubs';
 
-// The real AgentSwarmService self-wires executor listeners and pulls in the
-// swarm runtime; goal tests never exercise swarm behavior, so every test
-// agent here stubs it out to keep the wiring focused on the goal domain.
 function createTestAgent(
   ...inputs: readonly (TestAgentServiceOverride | TestAgentOptions)[]
 ): TestAgentContext {
@@ -257,6 +255,7 @@ async function runTerminalUpdateGoalResult(
     toolCall,
     toolCalls: [toolCall],
     args: { status },
+    outcome: 'executed',
     result: { output, stopTurn: true },
   });
 }
@@ -1160,7 +1159,8 @@ describe('AgentGoalService core workflow hooks', () => {
     await goals.cancelGoal();
 
     expect(abort).toHaveBeenCalledOnce();
-    expect(cancel).toHaveBeenCalledWith(41);
+    expect(cancel).toHaveBeenCalledWith(41, expect.any(Error));
+    expect(isUserCancellation(cancel.mock.calls[0]?.[1])).toBe(false);
   });
 
   it.each(['turn', 'token', 'wall-clock'] as const)(
@@ -1608,6 +1608,32 @@ describe('AgentGoalService core workflow hooks', () => {
     expect(updates.at(-1)?.snapshot).toMatchObject({ status: 'paused' });
   });
 
+  it('pauses the goal when the continuation assignment rejects (loop disposed)', async () => {
+    await goals.createGoal({ objective: 'finish the task' });
+    // The loop disposing with the request still queued rejects the
+    // assignment ('Agent loop disposed' at server shutdown). The
+    // continuation chain must settle the goal through the same
+    // continuation-failure path — before the fix the rejection escaped the
+    // chain entirely and surfaced as an unhandled rejection. (Deferred to a
+    // macrotask so the rejection lands after the chain's handlers attach.)
+    vi.spyOn(loopService, 'enqueue').mockReturnValue({
+      assigned: new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('Agent loop disposed')), 0);
+      }),
+      abort: vi.fn(),
+    });
+
+    const turn = makeTurn(22);
+    eventBus.publish({ type: 'turn.started', turnId: turn.id, origin: USER_PROMPT_ORIGIN });
+    await runGoalStep(loopService, turn);
+    endTurn(eventBus, turn);
+
+    await vi.waitFor(() => expect(goals.getGoal().goal?.status).toBe('paused'));
+    expect(goals.getGoal().goal?.terminalReason).toBe(
+      'Paused after goal continuation failure: Agent loop disposed',
+    );
+  });
+
   it('queues one continuation and lets the loop start it automatically', async () => {
     await goals.createGoal({ objective: 'finish the task' });
 
@@ -1753,7 +1779,7 @@ describe('goal pause classification on provider errors', () => {
     return {
       initialConfig: {
         providers: {},
-        loopControl: { maxRetriesPerStep: 1 },
+        loopControl: { maxAttemptsPerStep: 1 },
       },
     };
   }
@@ -1928,7 +1954,7 @@ describe('AgentGoalService hard wall-clock deadline', () => {
     }
   });
 
-  it('keeps user cancellation authoritative when it precedes the wall-clock deadline', async () => {
+  it('keeps the goal-cancellation abort authoritative when it precedes the wall-clock deadline', async () => {
     const clock = new ManualGoalDeadlineScheduler();
     const llm = blockingGenerate();
     const ctx = createTestAgent(appService(IGoalDeadlineScheduler, clock), {
@@ -1946,8 +1972,9 @@ describe('AgentGoalService hard wall-clock deadline', () => {
       await ctx.rpc.cancelGoal({});
       expect(llm.signal()).toMatchObject({
         aborted: true,
-        reason: expect.objectContaining({ userCancelled: true }),
+        reason: expect.objectContaining({ message: 'Goal cancelled' }),
       });
+      expect(isUserCancellation(llm.signal().reason)).toBe(false);
       clock.advanceBy(1_000);
 
       await ctx.untilTurnEnd();

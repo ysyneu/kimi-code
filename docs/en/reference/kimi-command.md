@@ -133,7 +133,7 @@ In `stream-json` mode, regular replies produce an Assistant message; when the mo
 
 ## Subcommands
 
-`kimi` provides the following subcommands: `login` (non-interactive login), `acp` (ACP IDE mode), `web` (run the local REST/WebSocket/web service in the foreground and open the web UI), `doctor` (validate configuration files), `export` (export a session), `migrate` (migrate legacy data), `upgrade` (check for updates), and `provider` (manage providers).
+`kimi` provides the following subcommands: `login` (non-interactive login), `acp` (ACP IDE mode), `web` (run the local REST/WebSocket/web service in the foreground and open the web UI), `agents` (open the agents view to dispatch and monitor sessions on the local Kimi server), `doctor` (validate configuration files), `export` (export a session), `migrate` (migrate legacy data), `upgrade` (check for updates), and `provider` (manage providers).
 
 ### `kimi login`
 
@@ -194,6 +194,54 @@ Deprecated — only stops a server started by a version before 0.28.0. Those ver
 #### `kimi web rotate-token`
 
 Generate a new persistent bearer token (written to `~/.kimi-code/server.token`); the previous token stops working immediately. The token is shared by the whole home directory, so every running instance picks the new one up on its next auth check — no restart needed.
+
+### `kimi agents`
+
+Open the agents view — a full-screen terminal dashboard over the local Kimi server. It lists the sessions the view owns — every session dispatched from or attached through it — grouped by live status (Pinned / Needs input / Working / Completed, in that order), updates as sessions make progress or ask for input, and dispatches new sessions from an input box at the bottom, so you can run and supervise many sessions at once without leaving the terminal.
+
+Each row shows the session's status, name, a summary of its latest assistant reply, and how long ago it last updated. The status symbol animates while the session is busy, shows `✻` when it has new output you haven't looked at yet, and `∙` once you have.
+
+```sh
+kimi agents
+```
+
+This subcommand has no flags.
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Move the selection |
+| `Enter` | Attach the full chat UI for the selected session; on a group header, collapse or expand the group |
+| `→` | Same as `Enter` for opening a session; on a group header, expand a collapsed group |
+| `←` | Collapse an expanded group; from an attached chat (with an empty editor), return to the agents view |
+| `Space` | Reply to the selected session from the bottom input box, without opening its chat |
+| `Shift-↑` / `Shift-↓` | Reorder the selected session within the Pinned group |
+| `Alt-1` – `Alt-9` | Open the Nth visible session, same as `Enter` |
+| `@` | Mention a file by path in the bottom input box |
+| `Ctrl-J` | Insert a newline in the bottom input box |
+| `Shift-Enter` | In the bottom input box, dispatch the new session and attach to it right away — plain text only, not while replying and not with a `/model` / `/agent` / skill / plugin prefix |
+| `Ctrl-X` | Archive the selected session (press twice to confirm); on a group header, archive the whole group. A session's running turn is cancelled first |
+| `Ctrl-R` | Rename the session |
+| `Ctrl-T` | Pin or unpin the session; pinned sessions move to the Pinned group |
+| `Ctrl-S` | Toggle the roster between grouping by status (Pinned / Needs input / Working / Completed) and grouping by working directory |
+| `?` | Show the shortcut list |
+| `Esc` | Quit |
+| `Ctrl-C` | Double-press to quit: the first press arms a confirmation, the second press (within a few seconds) actually quits. Pressing any other key in between clears the arm |
+
+The bottom input box dispatches a new session in the current working directory: typing any text focuses the box, and `Enter` creates the session with that text as its first prompt (`Shift-Enter` also attaches to it right away — see the table above). Slash commands are available there as prefixes: `/model <alias>` and `/agent <profile>` stage a model or agent override for the new session's first prompt (e.g. `/agent reviewer Review the changes on this branch`), and a skill or plugin command (e.g. `/skill:reviewcode`) stages that activation instead, applied as the session's first action in place of a prompt. Other slash commands the CLI recognizes elsewhere — including `/help` — are not runnable from this box; dispatching one shows a message telling you to attach to a session first instead. Typing exactly `exit` or `/exit` there and pressing `Enter` closes the agents view instead, the same as `Esc`. Pressing `Space` on a session row switches this same box to reply mode instead: `Enter` sends the text straight to that session as typed — no new session, and no slash interpretation, so a leading `/model` or `/agent` in a reply goes through as plain text rather than being treated as an override — and `Esc` returns to dispatching a new one.
+
+#### Server Lifecycle
+
+The agents view talks to a local Kimi server on this machine only:
+
+- **Attach**: when a server is already running for the same home directory (for example one started by `kimi web`), the view connects to it — after a quick connectivity check, so a stale registration that no longer answers is treated as "no server" and falls back to Embed. The server must run the same version as this CLI; a mismatch is refused with a restart hint. Quitting only disconnects — the server and its sessions keep running.
+- **Embed**: when no server is running, `kimi agents` starts one in-process. Quitting shuts that server down, so if sessions are still running a confirmation appears (`y` confirms, any other key cancels, and the prompt cancels itself after a timeout). Interrupted sessions are saved and can be resumed by running `kimi agents` again.
+
+#### Limitations
+
+- Sessions created or attached from the agents view run on the server's engine; they cannot be reopened with `kimi --resume` — re-enter them through `kimi agents`.
+- The list only shows sessions the view itself created or attached on the local Kimi server; sessions started with the plain `kimi` command or created by other clients (for example `kimi web`) do not appear.
+- For the whole `kimi agents` run — in the view and in any attached session — `!` shell commands are disabled.
+- Inside an attached session, configuration slash commands such as `/model` are not yet available.
 
 ### `kimi doctor`
 
@@ -343,7 +391,7 @@ kimi provider list --json | jq '.providers | keys'
 
 #### `kimi provider catalog list [providerId]`
 
-Browse the public [models.dev](https://models.dev/) model catalog without modifying any configuration. Without an argument, lists all providers along with their protocol type and model count; with a `providerId`, lists all models under that provider along with their context window and capabilities.
+Browse the public [models.dev](https://models.dev/) model catalog without modifying any configuration. Without an argument, lists all providers along with their protocol type and model count; with a `providerId`, lists all models under that provider along with their context window and capabilities. If the catalog URL cannot be reached, a built-in snapshot of the catalog is used instead.
 
 | Parameter / Option | Description |
 | --- | --- |
@@ -360,7 +408,7 @@ kimi provider catalog list anthropic
 
 #### `kimi provider catalog add <providerId>`
 
-Import a known provider directly from the catalog by ID. The protocol type, base URL, and model information are all supplied by the catalog — only an API key is required. Vendors whose protocol the catalog does not declare (e.g. xai, openrouter, and other vendor-specific SDKs) are imported as OpenAI-compatible and the output notes the guess; when the catalog provides no usable endpoint, `--base-url` is required. Proprietary protocols (e.g. Amazon Bedrock) cannot be imported.
+Import a known provider directly from the catalog by ID. The protocol type, base URL, and model information are all supplied by the catalog — only an API key is required. Vendors whose protocol the catalog does not declare (e.g. xai, openrouter, and other vendor-specific SDKs) are imported as OpenAI-compatible and the output notes the guess; when the catalog provides no usable endpoint, `--base-url` is required. Proprietary protocols (e.g. Amazon Bedrock) cannot be imported. When the public catalog is unreachable, the import uses the built-in snapshot, so it still works offline or in blocked networks.
 
 | Parameter / Option | Description |
 | --- | --- |

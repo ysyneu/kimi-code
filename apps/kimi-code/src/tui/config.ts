@@ -51,9 +51,27 @@ export const DEFAULT_STATUS_LINE_CONFIG: StatusLineConfig = {
   command: null,
 };
 
+export const AgentsViewGroupModeSchema = z.enum(['state', 'directory']);
+export type AgentsViewGroupModeConfig = z.infer<typeof AgentsViewGroupModeSchema>;
+
+export const AgentsViewFileConfigSchema = z.object({
+  group_mode: z.string().optional(),
+});
+
+export const AgentsViewConfigSchema = z.object({
+  /** Roster grouping mode the agents view opens in — Ctrl+S there cycles it. */
+  groupMode: AgentsViewGroupModeSchema,
+});
+export type AgentsViewConfig = z.infer<typeof AgentsViewConfigSchema>;
+
+export const DEFAULT_AGENTS_VIEW_CONFIG: AgentsViewConfig = {
+  groupMode: 'state',
+};
+
 export const TuiConfigFileSchema = z.object({
   theme: TuiThemeSchema.optional(),
   disable_paste_burst: z.boolean().optional(),
+  cache_expiry_hint: z.boolean().optional(),
   editor: z
     .object({
       command: z.string().optional(),
@@ -71,17 +89,24 @@ export const TuiConfigFileSchema = z.object({
     })
     .optional(),
   status_line: StatusLineFileConfigSchema.optional(),
+  agents_view: AgentsViewFileConfigSchema.optional(),
 });
 
 export const TuiConfigSchema = z.object({
   theme: TuiThemeSchema,
   disablePasteBurst: z.boolean(),
+  /** Present in every normalized config; optional only so hand-built test
+   * fixtures from before this field existed still typecheck. */
+  cacheExpiryHint: z.boolean().optional(),
   editorCommand: z.string().nullable(),
   notifications: NotificationsConfigSchema,
   upgrade: UpgradePreferencesSchema,
   /** Present in every normalized config; optional only so hand-built test
    * fixtures from before this field existed still typecheck. */
   statusLine: StatusLineConfigSchema.optional(),
+  /** Present in every normalized config; optional only so hand-built test
+   * fixtures from before this field existed still typecheck. */
+  agentsView: AgentsViewConfigSchema.optional(),
 });
 
 export type TuiConfigFileShape = z.infer<typeof TuiConfigFileSchema>;
@@ -101,10 +126,12 @@ export const DEFAULT_UPGRADE_PREFERENCES: UpgradePreferences = {
 export const DEFAULT_TUI_CONFIG: TuiConfig = TuiConfigSchema.parse({
   theme: 'auto',
   disablePasteBurst: false,
+  cacheExpiryHint: true,
   editorCommand: null,
   notifications: DEFAULT_NOTIFICATIONS_CONFIG,
   upgrade: DEFAULT_UPGRADE_PREFERENCES,
   statusLine: DEFAULT_STATUS_LINE_CONFIG,
+  agentsView: DEFAULT_AGENTS_VIEW_CONFIG,
 });
 
 /**
@@ -183,9 +210,17 @@ export function normalizeTuiConfig(
         return known;
       })
       .map((item) => item as StatusLineItem) ?? null;
+  const groupModeRaw = config.agents_view?.group_mode;
+  let groupMode: AgentsViewGroupModeConfig = DEFAULT_AGENTS_VIEW_CONFIG.groupMode;
+  if (groupModeRaw !== undefined) {
+    const parsedGroupMode = AgentsViewGroupModeSchema.safeParse(groupModeRaw);
+    if (parsedGroupMode.success) groupMode = parsedGroupMode.data;
+    else warn(`[tui.toml] ignoring unknown agents_view.group_mode: ${groupModeRaw}`);
+  }
   return TuiConfigSchema.parse({
     theme: config.theme ?? DEFAULT_TUI_CONFIG.theme,
     disablePasteBurst: config.disable_paste_burst ?? DEFAULT_TUI_CONFIG.disablePasteBurst,
+    cacheExpiryHint: config.cache_expiry_hint ?? DEFAULT_TUI_CONFIG.cacheExpiryHint,
     editorCommand: command === undefined || command.length === 0 ? null : command,
     notifications: {
       enabled: config.notifications?.enabled ?? DEFAULT_NOTIFICATIONS_CONFIG.enabled,
@@ -202,6 +237,7 @@ export function normalizeTuiConfig(
           ? null
           : statusLineCommand,
     },
+    agentsView: { groupMode },
   });
 }
 
@@ -234,6 +270,7 @@ export function renderTuiConfig(config: TuiConfig): string {
 
 theme = "${escapeTomlBasicString(config.theme)}" # "auto" | "dark" | "light" | custom theme name
 disable_paste_burst = ${String(config.disablePasteBurst)} # true disables non-bracketed paste-burst fallback
+cache_expiry_hint = ${String(config.cacheExpiryHint !== false)} # false disables the "cache expired" dialog on resume / idle submit
 
 [editor]
 command = "${escapeTomlBasicString(config.editorCommand ?? '')}" # Empty uses $VISUAL / $EDITOR
@@ -244,6 +281,9 @@ notification_condition = "${config.notifications.condition}" # "unfocused" | "al
 
 [upgrade]
 auto_install = ${String(config.upgrade.autoInstall)} # true | false
+
+[agents_view]
+group_mode = "${config.agentsView?.groupMode ?? DEFAULT_AGENTS_VIEW_CONFIG.groupMode}" # "state" | "directory" — ctrl+s in the agents view cycles this
 
 ${statusSection}`;
 }

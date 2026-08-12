@@ -1,14 +1,24 @@
 /**
- * `undo` domain (L6) — `IAgentConversationUndoService` implementation.
+ * `undo` domain — `IAgentConversationUndoService` implementation.
  *
  * Owns idle conversation undo coordination and restored observable state.
  * Coordinates `contextMemory`, undo participants, `fullCompaction`,
  * `loop`, `prompt`, Agent and Session identity, `sessionMetadata`, `event`,
  * `eventBus`, `telemetry`, and `wire`. Bound at Agent scope.
+ *
+ * Also mirrors the main agent's most recent assistant reply into
+ * `sessionMetadata.lastAssistantText`, both on every `turn.ended` and after
+ * an undo (mirrors `reconcileLastPrompt`'s backscan, on the response side
+ * instead of the undo side) — the same L4-turn-facts-into-L6-sessionMetadata
+ * coordination this domain already does for `lastPrompt`, driven by both the
+ * turn lifecycle and the undo itself (an undo can cut off the anchor turn's
+ * reply, same as it can cut off its prompt).
  */
 
-import { Disposable, type IDisposable } from '#/_base/di/lifecycle';
-import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
+import { type IDisposable } from '#/_base/di/lifecycle';
+import { Service } from '#/_base/di/service';
+import { LifecycleScope } from '#/app/scopes';
+import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { ILogService } from '#/_base/log/log';
 import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
 import { IAgentConversationUndoParticipantRegistry } from '#/agent/contextMemory/conversationUndoParticipants';
@@ -46,7 +56,7 @@ declare module '#/app/event/eventBus' {
 }
 
 export class AgentConversationUndoService
-  extends Disposable
+  extends Service
   implements IAgentConversationUndoService
 {
   declare readonly _serviceBrand: undefined;
@@ -70,6 +80,11 @@ export class AgentConversationUndoService
     @ILogService private readonly log: ILogService,
   ) {
     super();
+    this._register(
+      this.eventBus.subscribe('turn.ended', () => {
+        void this.reconcileLastAssistantTextSafely();
+      }),
+    );
   }
 
   availability(): UndoAvailability {
@@ -113,6 +128,11 @@ export class AgentConversationUndoService
       await this.reconcileParticipants();
       await this.flushAfterCommit('state reconciliation');
       await this.reconcileLastPromptSafely();
+      // I10: `context.undo` can cut off the anchor turn's assistant reply
+      // too — without this, `lastAssistantText` (and everything it feeds:
+      // the roster summary, the reply-panel preview) keeps showing text
+      // that undo already removed from history, until some later turn ends.
+      await this.reconcileLastAssistantTextSafely();
       this.telemetry.track2('conversation_undo', { count: turns });
       this.eventBus.publish({ type: 'context.undone', turns });
       return turns;
@@ -158,8 +178,6 @@ export class AgentConversationUndoService
     }
     const { depth, model } = this.checkpointDepth();
     if (depth >= turns) return;
-    // A compaction explains missing checkpoints (they are cleared at the
-    // boundary); without one, a checkpointed model failed to track an anchor.
     const fullCut = computeUndoCut(this.context.get(), Number.MAX_SAFE_INTEGER);
     const reason = fullCut.stoppedAtCompaction ? 'compaction_boundary' : 'checkpoint_lost';
     throw new Error2(
@@ -234,6 +252,35 @@ export class AgentConversationUndoService
         agentId: MAIN_AGENT_ID,
         sessionId: this.session.sessionId,
         patch: { lastPrompt },
+      },
+    });
+  }
+
+  private async reconcileLastAssistantTextSafely(): Promise<void> {
+    try {
+      await this.reconcileLastAssistantText();
+    } catch (error) {
+      this.log.error('undo lastAssistantText reconciliation failed', { error });
+    }
+  }
+
+  private async reconcileLastAssistantText(): Promise<void> {
+    if (this.agentCtx.agentId !== MAIN_AGENT_ID) return;
+    const history = this.context.get();
+    let lastAssistantText: string | undefined;
+    for (let i = history.length - 1; i >= 0; i--) {
+      const message = history[i]!;
+      if (message.role !== 'assistant') continue;
+      lastAssistantText = promptMetadataTextFromContentParts(message.content);
+      if (lastAssistantText !== undefined) break;
+    }
+    await this.metadata.update({ lastAssistantText });
+    this.eventService.publish({
+      type: 'session.meta.updated',
+      payload: {
+        agentId: MAIN_AGENT_ID,
+        sessionId: this.session.sessionId,
+        patch: { lastAssistantText },
       },
     });
   }

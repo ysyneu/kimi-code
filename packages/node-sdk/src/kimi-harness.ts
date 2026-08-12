@@ -7,23 +7,32 @@ import {
   type ExperimentalFeatureState,
 } from '@moonshot-ai/agent-core';
 
-import { Session } from '#/session';
+import { capabilityRpc, Session } from '#/session';
 import type { KimiAuthFacade } from '#/auth';
+import type { Event } from '#/events';
 import type { SDKRpcClientBase } from '#/rpc';
 import type {
   AuthenticateMcpServerOptions,
+  CapabilityStatus,
   ConfigDiagnostics,
   CreateSessionOptions,
   ExportSessionInput,
   ExportSessionResult,
   ForkSessionInput,
   GetConfigOptions,
+  GlobalMcpServerAuthStatus,
   KimiConfig,
   KimiConfigPatch,
+  KimiHarnessOptions,
   KimiHostIdentity,
   ListSessionsOptions,
   McpServerConfig,
+  McpServerInfo,
   McpTestResult,
+  PluginCommandDef,
+  PluginInfo,
+  PluginSummary,
+  ReloadSummary,
   RenameSessionInput,
   ResumeSessionInput,
   ReloadSessionInput,
@@ -33,7 +42,10 @@ import type {
   TelemetryContextPatch,
   TelemetryProperties,
   TestMcpServerOptions,
+  Unsubscribe,
+  WorkspaceTrustInfo,
 } from '#/types';
+import { SDKRpcClientWire } from '#/wire/sdk-rpc-client-wire';
 
 export interface KimiHarnessRuntimeOptions {
   readonly identity?: KimiHostIdentity;
@@ -101,6 +113,19 @@ export class KimiHarness {
     return this.rpc.withInteractiveAgent(agentId, fn);
   }
 
+  /**
+   * Narrow onto the wire transport's rpc client: the agents view needs its
+   * extended prompt input (model/profile overrides), a feature only the wire
+   * transport exposes. Returns undefined for any other transport — callers
+   * must treat that as "wire-only feature unavailable", never fall back to
+   * `any`. A public accessor instead of reaching past `rpc`'s private
+   * modifier from outside the class, so a rename here stays a compile error
+   * at every call site instead of a silent runtime `undefined`.
+   */
+  wireRpc(): SDKRpcClientWire | undefined {
+    return this.rpc instanceof SDKRpcClientWire ? this.rpc : undefined;
+  }
+
   track(event: string, properties?: TelemetryProperties): void {
     this.telemetry.track(event, properties);
   }
@@ -138,10 +163,25 @@ export class KimiHarness {
     const active = this.activeSessions.get(id);
     const { kaos, persistenceKaos, sessionStartedProperties, ...resumeInput } = input;
     if (active !== undefined) {
+      // A cache hit only skips the real resume when `active` already
+      // carries resume state from one. A `Session` that has only ever
+      // been through `createSession()` (e.g. agents-view dispatch,
+      // attached moments later while its id is still hot in this map) has
+      // `resumeState` undefined — handing it back untouched would silently
+      // return a session with no history and no live subscription. Do the
+      // real resume and merge it into the SAME object so identity-sensitive
+      // callers (kaos rebind, profile checks) keep getting `active` back.
+      const needsResume = active.getResumeState() === undefined;
       if (kaos !== undefined || persistenceKaos !== undefined) {
-        await this.rpc.resumeSessionWithKaos({ ...resumeInput, id }, kaos ?? persistenceKaos as Kaos, persistenceKaos);
-      } else if (input.agentProfile !== undefined) {
-        await this.rpc.resumeSession({ ...resumeInput, id });
+        const summary = await this.rpc.resumeSessionWithKaos({ ...resumeInput, id }, kaos ?? persistenceKaos as Kaos, persistenceKaos);
+        if (needsResume) active.applyResumedState(summary);
+      } else if (input.agentProfile !== undefined || needsResume) {
+        const summary = await this.rpc.resumeSession({ ...resumeInput, id });
+        if (needsResume) active.applyResumedState(summary);
+      }
+      if (needsResume) {
+        this.trackSessionStarted(id, true, sessionStartedProperties);
+        this.trackSessionEvent(id, 'session_resume');
       }
       return active;
     }
@@ -232,6 +272,22 @@ export class KimiHarness {
     await this.rpc.deleteSession({ sessionId });
   }
 
+  /**
+   * Aborts a session's in-flight turn WITHOUT closing/detaching it —
+   * distinct from `deleteSession`, which archives it. Addressed purely by
+   * id, the same shape as `deleteSession`: unlike `Session.cancel()`, this
+   * needs no cached `Session` (a caller that never attached/created the
+   * session locally, e.g. the agents-view roster's Ctrl+X arm stopping a
+   * BUSY row it only ever saw as a list entry, has none). `rpc.cancel` is
+   * itself already session-id-scoped either way (`SDKRpcClientBase.cancel`
+   * routes through the in-process gateway by id; `SDKRpcClientWire.cancel`
+   * is a plain `POST .../abort` keyed by id) — this is nothing more than
+   * that same call with no `Session` object in between.
+   */
+  async cancelSession(id: string): Promise<void> {
+    await this.rpc.cancel({ sessionId: normalizeSessionId(id) });
+  }
+
   async renameSession(input: RenameSessionInput): Promise<void> {
     await this.rpc.renameSession(input);
     this.activeSessions.get(input.id)?.emitMetaUpdated({ title: input.title });
@@ -250,9 +306,102 @@ export class KimiHarness {
     return this.rpc.listSessions(options);
   }
 
+  /**
+   * Subscribes to the full translated event stream — every session's events
+   * plus the subscription-free global events (`event.session.work_changed`,
+   * `session.meta.updated`, `event.session.created`). Listeners interested in
+   * one session should use `Session.onEvent`, which filters by session id.
+   */
+  onEvent(listener: (event: Event) => void): Unsubscribe {
+    return this.rpc.onEvent(listener);
+  }
+
   /** Skills visible to a new session in `workDir`, without creating that session. */
   async listWorkspaceSkills(workDir: string): Promise<readonly SkillSummary[]> {
     return this.rpc.listWorkspaceSkills(workDir);
+  }
+
+  /**
+   * App-global plugin command list, no session required. Empty on the v1
+   * engine, which only exposes plugin commands through a live session.
+   */
+  async listPluginCommands(): Promise<readonly PluginCommandDef[]> {
+    return this.rpc.listPluginCommandsGlobal();
+  }
+
+  /**
+   * App-global plugin management, no session required. The v2 engine keeps
+   * plugin state app-global (these calls are routed through the klient
+   * `global.plugins` facade), so `/plugins` works before the first session
+   * exists; the v1 engine only exposes plugins through a live session.
+   */
+  async listPlugins(): Promise<readonly PluginSummary[]> {
+    return this.rpc.listPlugins();
+  }
+
+  /**
+   * Workspace-level MCP server list, no session required. The v2 engine owns
+   * one shared connection set per workspace handler, so `/mcp` is inspectable
+   * before the first session exists; empty on the v1 engine.
+   */
+  async listWorkspaceMcpServers(workDir: string): Promise<readonly McpServerInfo[]> {
+    return this.rpc.listWorkspaceMcpServers(workDir);
+  }
+
+  async installPlugin(source: string): Promise<PluginSummary> {
+    return this.rpc.installPlugin(source);
+  }
+
+  async setPluginEnabled(id: string, enabled: boolean): Promise<void> {
+    return this.rpc.setPluginEnabled(id, enabled);
+  }
+
+  async setPluginMcpServerEnabled(id: string, server: string, enabled: boolean): Promise<void> {
+    return this.rpc.setPluginMcpServerEnabled(id, server, enabled);
+  }
+
+  async removePlugin(id: string): Promise<void> {
+    return this.rpc.removePlugin(id);
+  }
+
+  async reloadPlugins(): Promise<ReloadSummary> {
+    return this.rpc.reloadPlugins();
+  }
+
+  async getPluginInfo(id: string): Promise<PluginInfo> {
+    return this.rpc.getPluginInfo(id);
+  }
+
+  /**
+   * App-global capability readiness and setup (the built-in product
+   * capabilities kimi-cu / kimi-webbridge), no session required. Routed
+   * through the same global channel as session capability calls; requires
+   * the v2 engine and throws on v1, which has no capability surface.
+   */
+  async listCapabilities(): Promise<readonly CapabilityStatus[]> {
+    return capabilityRpc(this.rpc).listCapabilities();
+  }
+
+  async getCapability(id: string): Promise<CapabilityStatus> {
+    return capabilityRpc(this.rpc).getCapability(id);
+  }
+
+  async installCapability(id: string): Promise<CapabilityStatus> {
+    return capabilityRpc(this.rpc).installCapability(id);
+  }
+
+  /**
+   * Trust state of `workDir` (agent-core-v2 only; the v1 engine reports an
+   * always-trusted workspace). Querying may register the workDir as a
+   * workspace, which session creation would do anyway.
+   */
+  async getWorkspaceTrustInfo(workDir: string): Promise<WorkspaceTrustInfo> {
+    return this.rpc.getWorkspaceTrustInfo(workDir);
+  }
+
+  /** Mark `workDir` as trusted; project-level MCP servers connect live afterwards. */
+  async trustWorkspace(workDir: string): Promise<void> {
+    return this.rpc.trustWorkspace(workDir);
   }
 
   async getConfig(options: GetConfigOptions = {}): Promise<KimiConfig> {
@@ -280,9 +429,31 @@ export class KimiHarness {
     return this.rpc.removeProvider(providerId);
   }
 
+  /**
+   * Whether several config sections can be persisted as ONE atomic write
+   * (see {@link replaceConfigSections}). False on the v1 harness.
+   */
+  supportsAtomicSectionReplace(): boolean {
+    return this.rpc.supportsAtomicSectionReplace();
+  }
+
+  /**
+   * Replace several top-level config sections in ONE atomic write: a section
+   * mapped to `undefined` is cleared, absent sections are left untouched.
+   * Replace semantics (unlike {@link setConfig}'s deep-merge), so staged
+   * removals are expressed by the written record itself.
+   */
+  async replaceConfigSections(sections: Record<string, unknown>): Promise<void> {
+    return this.rpc.replaceConfigSections(sections);
+  }
+
   /** User-global MCP entries from `<KIMI_CODE_HOME>/mcp.json` only. */
   async listMcpServers(): Promise<readonly McpServerConfig[]> {
     return this.rpc.listGlobalMcpServers();
+  }
+
+  async listMcpServerAuthStatuses(): Promise<readonly GlobalMcpServerAuthStatus[]> {
+    return this.rpc.listGlobalMcpServerAuthStatuses();
   }
 
   async addMcpServer(server: McpServerConfig): Promise<readonly McpServerConfig[]> {
@@ -372,4 +543,29 @@ function normalizeSessionId(value: string): string {
     throw new KimiError(ErrorCodes.SESSION_ID_EMPTY, 'Session id cannot be empty.');
   }
   return normalized;
+}
+
+/**
+ * The wire-transport harness factory: the SDK drives a running kap-server over
+ * the `/api/v1` REST + WS surface instead of hosting an engine in-process.
+ * Async because the supervisor must connect (`rpc.start()`) before the harness
+ * is handed out; option plumbing mirrors `createKimiHarnessV2`.
+ */
+export async function createKimiHarnessWire(
+  options: KimiHarnessOptions & { readonly serverUrl: string; readonly token?: string },
+): Promise<KimiHarness> {
+  const rpc = new SDKRpcClientWire(options);
+  await rpc.start();
+  return new KimiHarness(rpc, {
+    identity: rpc.identity,
+    uiMode: options.uiMode,
+    homeDir: rpc.homeDir,
+    configPath: rpc.configPath,
+    auth: rpc.auth,
+    telemetry: rpc.telemetry,
+    ensureConfigFile: () => rpc.ensureConfigFile(),
+    onClose: () => rpc.close(),
+    imageLimits: undefined,
+    sessionStartedProperties: options.sessionStartedProperties,
+  });
 }

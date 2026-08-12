@@ -21,6 +21,10 @@ import {
   getLiveSessionById,
 } from '@moonshot-ai/agent-core-v2';
 
+import { McpOAuthService } from '../../agent-core/src/mcp/oauth/service';
+
+import { startMcpAuthStatusServer } from './mcp-auth-status-server';
+
 import {
   createKimiHarness,
   createKimiHarnessV2,
@@ -48,6 +52,7 @@ import {
   type ResumedAgentState,
   type ResumedSessionSummary,
   type SessionPlan,
+  type SessionStatus,
   type SessionSummary,
   type SkillSummary,
   type SDKRpcClientBase,
@@ -241,14 +246,23 @@ const KNOWN_DIFFS = {
     projectResumedSession(resumed, home),
   reloadSession: (resumed: ResumedSessionSummary, home: HomePair): unknown =>
     projectResumedSession(resumed, home),
-  // Agent context: v1 reports the running token ESTIMATE (an import adopts
-  // it wholesale); v2 reports the provider-MEASURED prefix, which an
-  // in-memory append never touches — post-import counts diverge by design
-  // (v1 > 0, v2 === 0, asserted explicitly at the call site). Histories
-  // compare in full; the count compares only in the pre-import state where
-  // both are 0.
+  // Agent context: v1 reports the running token ESTIMATE; v2 reports the
+  // provider-MEASURED prefix. In-memory appends (e.g. importContext) count
+  // identically on both engines via the shared `estimateTokensForMessages`,
+  // but once the provider reports measured usage the counts diverge by
+  // design. Histories compare in full; the count compares only in the
+  // pre-LLM state where both sides still estimate.
   getContext: (context: { readonly history: readonly unknown[] }): unknown =>
     context.history.length === 0 ? context : { history: context.history },
+  // R9 I1 (kimi-code TUI): v2's `getStatus` now also reports `busy`, read off
+  // the klient session facade's own derived status — the v1 base RPC surface
+  // has no equivalent primitive plumbed in and isn't in scope for that fix;
+  // accepted gap, not a defect. Deleted from both sides so the rest of the
+  // status object (the part v1 does report) still compares in full.
+  getStatus: (status: SessionStatus): unknown => {
+    const { busy: _busy, ...rest } = status;
+    return rest;
+  },
   // Plan ids are random per engine (hero slugs) and the plan path embeds
   // both the per-home session dir and the id, so the comparison covers the
   // content and the path LAYOUT (id scrubbed); the id itself is asserted
@@ -343,6 +357,9 @@ function projectSessionSummary(summary: SessionSummary, home: HomePair): unknown
   const projected = scrubHomePrefixes(summary, home) as Record<string, unknown>;
   delete projected['createdAt'];
   delete projected['updatedAt'];
+  // `lastTurnReason` is v2-only: the v1 engine never records a turn outcome,
+  // so the field cannot compare across engines.
+  delete projected['lastTurnReason'];
   if (projected['title'] === 'New Session') delete projected['title'];
   return projected;
 }
@@ -393,8 +410,9 @@ function projectResumedAgents(
  *   v2's resumed agent state has no equivalent field. Engine-owned profile
  *   data, not resume data.
  * - `context.tokenCount`: the KNOWN_DIFFS.getContext divergence (v1's running
- *   estimate vs v2's provider-measured prefix) — the history compares in
- *   full, the count only in the empty state.
+ *   estimate vs v2's provider-measured prefix once the provider reports
+ *   usage) — the history compares in full, the count only where both sides
+ *   still estimate.
  * - replay `config_updated` records: v1 persists the profile BIND as
  *   `config.update` records (which restore maps to config_updated entries);
  *   v2 persists it as a `profile.bind` op the replay fold deliberately does
@@ -1645,7 +1663,8 @@ describe('v1↔v2 agent interaction parity', () => {
         pair.v1.getStatus(input),
         pair.v2.getStatus(input),
       ]);
-      expect(normalize(v2Status, '')).toEqual(normalize(v1Status, ''));
+      const projectStatus = KNOWN_DIFFS.getStatus;
+      expect(projectStatus(v2Status)).toEqual(projectStatus(v1Status));
       // The eager-default state both engines arrive at from the fixture:
       // default model + its default effort + the configured permission mode.
       expect(v1Status).toEqual({
@@ -1696,7 +1715,8 @@ describe('v1↔v2 agent interaction parity', () => {
         pair.v1.getStatus(input),
         pair.v2.getStatus(input),
       ]);
-      expect(normalize(v2Status, '')).toEqual(normalize(v1Status, ''));
+      const projectStatus = KNOWN_DIFFS.getStatus;
+      expect(projectStatus(v2Status)).toEqual(projectStatus(v1Status));
       expect(v1Status).toEqual({
         model: undefined,
         thinkingEffort: 'off',
@@ -1730,7 +1750,8 @@ describe('v1↔v2 agent interaction parity', () => {
         pair.v1.getStatus(input),
         pair.v2.getStatus(input),
       ]);
-      expect(normalize(v2Status, '')).toEqual(normalize(v1Status, ''));
+      const projectStatus = KNOWN_DIFFS.getStatus;
+      expect(projectStatus(v2Status)).toEqual(projectStatus(v1Status));
       expect(v1Status.model).toBe('second-model');
       expect(v1Status.maxContextTokens).toBe(128000);
     } finally {
@@ -1776,7 +1797,8 @@ describe('v1↔v2 agent interaction parity', () => {
         pair.v1.getStatus(input),
         pair.v2.getStatus(input),
       ]);
-      expect(normalize(v2Low, '')).toEqual(normalize(v1Low, ''));
+      const projectStatus = KNOWN_DIFFS.getStatus;
+      expect(projectStatus(v2Low)).toEqual(projectStatus(v1Low));
       expect(v1Low.thinkingEffort).toBe('low');
       // An unlisted effort on a strict-thinking (kimi-typed) model rejects
       // with the same code AND the same message on both engines.
@@ -1803,7 +1825,7 @@ describe('v1↔v2 agent interaction parity', () => {
         pair.v1.getStatus(input),
         pair.v2.getStatus(input),
       ]);
-      expect(normalize(v2Off, '')).toEqual(normalize(v1Off, ''));
+      expect(projectStatus(v2Off)).toEqual(projectStatus(v1Off));
       expect(v1Off.thinkingEffort).toBe('off');
     } finally {
       await closeSessionPair(pair);
@@ -1825,7 +1847,8 @@ describe('v1↔v2 agent interaction parity', () => {
         pair.v1.getStatus(input),
         pair.v2.getStatus(input),
       ]);
-      expect(normalize(v2Yolo, '')).toEqual(normalize(v1Yolo, ''));
+      const projectStatus = KNOWN_DIFFS.getStatus;
+      expect(projectStatus(v2Yolo)).toEqual(projectStatus(v1Yolo));
       expect(v1Yolo.permission).toBe('yolo');
       await Promise.all([
         pair.v1.setPermission({ ...input, mode: 'manual' }),
@@ -1835,7 +1858,7 @@ describe('v1↔v2 agent interaction parity', () => {
         pair.v1.getStatus(input),
         pair.v2.getStatus(input),
       ]);
-      expect(normalize(v2Manual, '')).toEqual(normalize(v1Manual, ''));
+      expect(projectStatus(v2Manual)).toEqual(projectStatus(v1Manual));
       expect(v1Manual.permission).toBe('manual');
     } finally {
       await closeSessionPair(pair);
@@ -1927,11 +1950,12 @@ describe('v1↔v2 agent interaction parity', () => {
       expect(normalize(v2Context.history, '')).toEqual(normalize(v1Context.history, ''));
       expect(v1Context.history).toHaveLength(1);
       expect(v1Context.history[0]).toMatchObject({ role: 'user', origin: { kind: 'user' } });
-      // The pinned divergence (KNOWN_DIFFS.getContext): v1 adopts the import
-      // estimate as its reported count; v2's reported count is
-      // provider-measured and stays 0 until the first LLM round.
+      // Both engines estimate an in-memory import with the same
+      // `estimateTokensForMessages`, so post-import counts match exactly.
+      // (They diverge again once the provider reports measured usage — see
+      // KNOWN_DIFFS.getContext.)
       expect(v1Context.tokenCount).toBeGreaterThan(0);
-      expect(v2Context.tokenCount).toBe(0);
+      expect(v2Context.tokenCount).toBe(v1Context.tokenCount);
       // v1's validations, replicated on the v2 side.
       await expect(
         pair.v1.importContext({ ...input, content: ' \n\t ', source: "file 'empty.md'" }),
@@ -2244,7 +2268,8 @@ describe('v1↔v2 agent interaction parity', () => {
         pair.v1.getStatus(statusInput),
         pair.v2.getStatus(statusInput),
       ]);
-      expect(normalize(v2Status, '')).toEqual(normalize(v1Status, ''));
+      const projectStatus = KNOWN_DIFFS.getStatus;
+      expect(projectStatus(v2Status)).toEqual(projectStatus(v1Status));
       expect(v1Status).toMatchObject({
         model: 'fixture-model',
         thinkingEffort: 'low',
@@ -2263,7 +2288,7 @@ describe('v1↔v2 agent interaction parity', () => {
         pair.v1.getStatus({ sessionId: drifted.id }),
         pair.v2.getStatus({ sessionId: drifted.id }),
       ]);
-      expect(normalize(v2Drift, '')).toEqual(normalize(v1Drift, ''));
+      expect(projectStatus(v2Drift)).toEqual(projectStatus(v1Drift));
       expect(v1Drift.thinkingEffort).toBe('high');
     } finally {
       await closeSessionPair(pair);
@@ -2418,28 +2443,26 @@ describe('v1↔v2 agent interaction parity', () => {
     }
   });
 
-  it('steer on an idle session: v1 launches a turn, v2 rejects prompt.not_found (pinned)', async () => {
+  it('steer on an idle session: both engines launch a turn and update metadata', async () => {
     const restoreEnv = scrubConfigEnv();
     const pair = await makeSessionParityPair();
     try {
       await createOnBoth(pair, { id: 'session_parity_agent_steer' });
       const input = { sessionId: 'session_parity_agent_steer' } as const;
-      // Pinned divergence: v1 treats an idle steer like a prompt — it
-      // launches a fresh turn and updates title/lastPrompt. v2's steer RPC
-      // enqueues first (which itself launches the turn), so the follow-up
-      // steer step finds no pending prompt and rejects with prompt.not_found;
-      // the v2 path never touches the metadata.
+      // v1 treats an idle steer like a prompt — it launches a fresh turn and
+      // updates title/lastPrompt. v2's steer RPC enqueues first (which itself
+      // launches the turn) and converges on the same end state: the launched
+      // turn is returned instead of rejecting, and the metadata is updated.
       await pair.v1.steer({ ...input, input: [{ type: 'text', text: 'steer text' }] });
-      await expect(
-        pair.v2.steer({ ...input, input: [{ type: 'text', text: 'steer text' }] }),
-      ).rejects.toMatchObject({ code: 'prompt.not_found' });
+      await pair.v2.steer({ ...input, input: [{ type: 'text', text: 'steer text' }] });
       const [v1List, v2List] = await Promise.all([
         pair.v1.listSessions(),
         pair.v2.listSessions(),
       ]);
       expect(v1List[0]?.title).toBe('steer text');
       expect(v1List[0]?.lastPrompt).toBe('steer text');
-      expect(v2List[0]?.lastPrompt).not.toBe('steer text');
+      expect(v2List[0]?.title).toBe('steer text');
+      expect(v2List[0]?.lastPrompt).toBe('steer text');
       await settleTurns();
     } finally {
       await closeSessionPair(pair);
@@ -3456,6 +3479,65 @@ async function expectSameMcpRejection(
 }
 
 describe('v1↔v2 global MCP parity', () => {
+  it('classifies global MCP authorization identically from persisted credentials', async () => {
+    const statusServer = await startMcpAuthStatusServer();
+    const authorizedUrl = 'https://authorized.example.test/mcp';
+    const pair = await makeGlobalMcpParityPair({
+      mcpServers: {
+        stdio: { command: 'local-command' },
+        plain: { transport: 'http', url: statusServer.plainUrl },
+        detected: { transport: 'http', url: statusServer.oauthUrl },
+        sse: { transport: 'sse', url: statusServer.oauthUrl },
+        'sse-oauth': { transport: 'sse', url: statusServer.oauthUrl, auth: 'oauth' },
+        bearer: {
+          transport: 'http',
+          url: 'https://bearer.example.test/mcp',
+          bearerTokenEnvVar: 'EXAMPLE_MCP_TOKEN',
+        },
+        'oauth-required': {
+          transport: 'http',
+          url: 'https://required.example.test/mcp',
+          auth: 'oauth',
+        },
+        'oauth-authorized': {
+          transport: 'http',
+          url: authorizedUrl,
+          auth: 'oauth',
+        },
+      },
+    });
+    for (const homeDir of [pair.v1HomeDir, pair.v2HomeDir]) {
+      const externalOAuth = new McpOAuthService({ kimiHomeDir: homeDir });
+      externalOAuth
+        .getProvider('oauth-authorized', authorizedUrl)
+        .saveTokens({ access_token: 'test-access-token', token_type: 'Bearer' });
+      externalOAuth
+        .getProvider('sse', statusServer.oauthUrl)
+        .saveTokens({ access_token: 'stale-sse-token', token_type: 'Bearer' });
+    }
+
+    try {
+      const [v1Statuses, v2Statuses] = await Promise.all([
+        pair.v1.listGlobalMcpServerAuthStatuses(),
+        pair.v2.listGlobalMcpServerAuthStatuses(),
+      ]);
+      expect(v2Statuses).toEqual(v1Statuses);
+      expect(v1Statuses).toEqual([
+        { name: 'stdio', authStatus: 'not-applicable' },
+        { name: 'plain', authStatus: 'not-applicable' },
+        { name: 'detected', authStatus: 'oauth-required' },
+        { name: 'sse', authStatus: 'not-applicable' },
+        { name: 'sse-oauth', authStatus: 'oauth-required' },
+        { name: 'bearer', authStatus: 'bearer-token' },
+        { name: 'oauth-required', authStatus: 'oauth-required' },
+        { name: 'oauth-authorized', authStatus: 'oauth-authorized' },
+      ]);
+    } finally {
+      await closeGlobalMcpPair(pair);
+      await statusServer.close();
+    }
+  }, 15_000);
+
   it('CRUD round-trips identically and writes byte-identical mcp.json files', async () => {
     const pair = await makeGlobalMcpParityPair({
       custom: { keep: true },
@@ -4050,9 +4132,28 @@ describe('v1↔v2 event & interaction parity', () => {
       // pinned wording family as setModel / generateAgentsMd).
       const projectFailure = (events: readonly Event[]): unknown[] =>
         projectEventStream(events, input.sessionId).flatMap((projected) => {
-          const entry = projected as { type: string; code?: string };
+          const entry = projected as {
+            type: string;
+            code?: string;
+            title?: string;
+            lastPrompt?: string;
+          };
           if (entry.type === 'turn.step.interrupted') return [];
           if (entry.type === 'error') return { type: entry.type, code: entry.code };
+          // Another pinned v2-only emission: v2 reconciles the session's
+          // lastAssistantText on every turn.ended and publishes
+          // session.meta.updated even when the failed turn produced no
+          // assistant text at all (both projected fields undefined) — v1 has
+          // no such reconcile, so the bare update is projected out like
+          // turn.step.interrupted above. The real prompt-metadata update
+          // (with values) stays, keeping the comparison non-vacuous.
+          if (
+            entry.type === 'session.meta.updated' &&
+            entry.title === undefined &&
+            entry.lastPrompt === undefined
+          ) {
+            return [];
+          }
           return entry;
         });
       const v1Projected = projectFailure(v1Events);

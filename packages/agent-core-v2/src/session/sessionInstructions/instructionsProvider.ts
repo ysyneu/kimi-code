@@ -1,15 +1,11 @@
 /**
- * `sessionInstructions` domain (L1) — seeded AGENTS.md provider contract.
+ * `sessionInstructions` domain — seeded AGENTS.md provider contract.
  *
  * Defines `ISessionInstructionsProvider`, the pure-data injection contract
- * the Workspace-scope `workspaceInstructions` service hands to every Session
- * scope it creates: the workspace's current AGENTS.md snapshot (combined
- * content plus the oversize/load warning) and the change event fired when a
- * watched instruction file invalidates the snapshot. The contract carries no
- * IO — loading and watching live on the workspace side; consumers (the
- * agent's `profile` service) read the seed and re-read it off `onDidChange`.
- * Seeded into the Session scope by `workspaceHandler` when the session is
- * materialized. Session-scoped.
+ * carrying the workspace's current AGENTS.md snapshot (combined content, the
+ * oversize/load warning, and the discovered-file list) and the change event
+ * fired when a watched instruction file invalidates the snapshot. The
+ * contract carries no IO. Session-scoped.
  */
 
 import { createDecorator, type ServiceIdentifier } from '#/_base/di/instantiation';
@@ -22,6 +18,7 @@ export interface ISessionInstructionsProvider {
   readonly ready: Promise<void>;
   readonly agentsMd: string | undefined;
   readonly agentsMdWarning: string | undefined;
+  readonly agentsMdPaths: readonly string[] | undefined;
   readonly onDidChange: Event<void>;
 }
 

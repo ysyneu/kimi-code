@@ -1,8 +1,5 @@
 import type { KimiHarness, Session } from '@moonshot-ai/kimi-code-sdk';
-import { compressImageForModel, persistOriginalImage, sessionMediaOriginalsDir } from '@moonshot-ai/kimi-code-sdk';
 
-import { ClipboardMediaError, readClipboardMedia } from '#/utils/clipboard/clipboard-image';
-import { parseImageMeta } from '#/utils/image/image-mime';
 import { editInExternalEditor, resolveEditorCommand } from '#/utils/process/external-editor';
 
 import {
@@ -16,6 +13,7 @@ import {
 import { formatErrorMessage } from '../utils/event-payload';
 import type { ImageAttachmentStore } from '../utils/image-attachment-store';
 import { extractMediaAttachments } from '../utils/image-placeholder';
+import { pasteClipboardImage } from '../media/clipboard-paste';
 import type { PendingExit, QueuedMessage, SteerInputItem } from '../types';
 import type { TUIState } from '../tui-state';
 import type { BtwPanelController } from './btw-panel';
@@ -23,6 +21,7 @@ import type { BtwPanelController } from './btw-panel';
 export interface EditorKeyboardHost {
   state: TUIState;
   session: Session | undefined;
+  readonly engineV2: boolean;
   cancelInFlight: (() => void) | undefined;
   /**
    * The host's harness (KimiTUI always has one). Its `imageLimits` drives
@@ -41,6 +40,7 @@ export interface EditorKeyboardHost {
   }): boolean;
   recallLastQueued(): QueuedMessage | undefined;
   showError(msg: string): void;
+  showStatus(msg: string): void;
   track(event: string, props?: Record<string, unknown>): void;
   updateEditorBorderHighlight(text?: string): void;
   updateQueueDisplay(): void;
@@ -50,7 +50,14 @@ export interface EditorKeyboardHost {
   cancelRunningShellCommand(): void;
   hideSessionPicker(): void;
   openUndoSelector(): void;
+  /**
+   * Agents-view attach: ← on an empty editor asks the host to return to
+   * the agents view. Return `true` when the return happened (agents mode +
+   * view detached); `false` leaves the key to its normal cursor semantics.
+   */
+  returnToAgentsView(): boolean;
   stop(exitCode?: number): Promise<void>;
+  ensureSession(): Promise<Session | undefined>;
   handlePlanToggle(next: boolean): void;
   handleInputModeChange(mode: 'prompt' | 'bash'): void;
   clearQueuedMessages(): void;
@@ -83,8 +90,12 @@ export class EditorKeyboardController {
     // recalls everything. The filter is locked to the mode captured when the
     // user first enters history browsing (see onHistoryDraftSave), so landing on
     // a shell entry mid-browse doesn't switch the filter to shell-only.
+    // Agents view: bash mode is gated off, so `!` shell entries are hidden
+    // from recall entirely — input history is global, and landing on one would
+    // resurrect the hidden bash input mode via onRecall below.
     let browseMode: 'prompt' | 'bash' | null = null;
     editor.setHistoryFilter((entry: string) => {
+      if (host.state.startupState === 'agents-view') return !entry.startsWith('!');
       const mode = browseMode ?? editor.inputMode;
       return mode === 'bash' ? entry.startsWith('!') : true;
     });
@@ -198,7 +209,20 @@ export class EditorKeyboardController {
         return;
       }
       if (host.state.appState.streamingPhase !== 'idle') {
+        // I4: mid-turn Esc keeps today's interrupt semantics (chat parity) —
+        // the way back is surfaced instead as a standing footer hint (see
+        // `Footer.attachedFromRoster`), not by changing what Esc does here.
         this.cancelCurrentStream();
+        this.clearPendingUndoEsc();
+        return;
+      }
+      // I4: idle with an empty composer, attached FROM the roster — Esc means
+      // "back" everywhere else in this view, so it must not silently arm the
+      // double-Esc undo shortcut below instead; return to the roster the same
+      // way ← does. `returnToAgentsView()` already declines (false) outside
+      // agents mode or when there is no detached view to return to, so every
+      // other idle Esc case (including a non-empty composer) is untouched.
+      if (editor.getText().length === 0 && host.returnToAgentsView()) {
         this.clearPendingUndoEsc();
         return;
       }
@@ -212,14 +236,25 @@ export class EditorKeyboardController {
     };
 
     editor.onShiftTab = () => {
+      const togglePlan = (): void => {
+        const next = !host.state.appState.planMode;
+        host.track('shortcut_plan_toggle', { enabled: next });
+        host.track('shortcut_mode_switch', { to_mode: next ? 'plan' : 'agent' });
+        host.handlePlanToggle(next);
+      };
       if (host.session === undefined) {
-        host.showError(NO_ACTIVE_SESSION_MESSAGE);
+        if (!host.engineV2) {
+          host.showError(NO_ACTIVE_SESSION_MESSAGE);
+          return;
+        }
+        // v2 session-less: lazy-create the session, then toggle — the same
+        // path /plan takes.
+        void host.ensureSession().then((session) => {
+          if (session !== undefined) togglePlan();
+        });
         return;
       }
-      const next = !host.state.appState.planMode;
-      host.track('shortcut_plan_toggle', { enabled: next });
-      host.track('shortcut_mode_switch', { to_mode: next ? 'plan' : 'agent' });
-      host.handlePlanToggle(next);
+      togglePlan();
     };
 
     editor.onInputModeChange = (mode) => {
@@ -354,6 +389,17 @@ export class EditorKeyboardController {
 
     editor.onDownArrowEmpty = () => host.btwPanelController.scroll('down');
 
+    editor.onLeftArrowEmpty = () => host.returnToAgentsView();
+
+    // Agents view: the wire surface has no one-shot shell route,
+    // so the `!` bash-input mode is unavailable — veto the switch and say
+    // why. Outside agents mode the gate passes through (zero change).
+    editor.onBashModeAttempt = () => {
+      if (host.state.startupState !== 'agents-view') return false;
+      host.showStatus('Shell commands (!) are not available in agents view.');
+      return true;
+    };
+
     editor.onPasteImage = async () => this.handleClipboardImagePaste();
   }
 
@@ -411,7 +457,19 @@ export class EditorKeyboardController {
     // Cancel any running `!` shell command (treated as a streaming phase) in
     // addition to the agent turn, so Esc / Ctrl+C interrupts it too.
     this.host.cancelRunningShellCommand();
-    void this.host.session?.cancel();
+    const session = this.host.session;
+    if (session === undefined) return;
+    // A failed cancel must surface (matches cancelCurrentCompaction below):
+    // the in-process harness a normal chat session runs on almost never
+    // rejects here, but an agents-view attach always rides the wire
+    // transport, where the abort is a real network round trip that can
+    // fail. Without a `.catch()`, a rejection here is a silently swallowed
+    // promise — Ctrl+C would look like a total no-op instead of a reported
+    // failure the user can retry.
+    void session.cancel().catch((error: unknown) => {
+      const message = formatErrorMessage(error);
+      this.host.showError(`Failed to cancel: ${message}`);
+    });
   }
 
   private cancelCurrentCompaction(): void {
@@ -424,82 +482,15 @@ export class EditorKeyboardController {
   }
 
   private async handleClipboardImagePaste(): Promise<boolean> {
-    let media;
-    try {
-      media = await readClipboardMedia();
-    } catch (error) {
-      if (error instanceof ClipboardMediaError) {
-        this.host.showError(error.message);
-        return true;
-      }
-      return false;
-    }
-    if (media === null) return false;
-
-    if (media.kind === 'video') {
-      const attachment = this.imageStore.addVideo(media.mimeType, media.sourcePath, media.filename);
-      this.host.state.editor.insertTextAtCursor?.(`${attachment.placeholder} `);
-      this.host.state.ui.requestRender();
-      this.host.track('shortcut_paste', { kind: 'video' });
-      return true;
-    }
-
-    const meta = parseImageMeta(media.bytes);
-    if (meta === null) return false;
-    // Compress at ingestion — a pure data step while building the attachment, so
-    // the stored bytes, the inline thumbnail, the `[image #N (W×H)]` placeholder,
-    // and the submitted image all agree, and the agent core only ever sees an
-    // already-compressed image. Best effort: originals pass through on failure.
-    // When compression changed the bytes, the original is persisted (into the
-    // session's media-originals dir when known, else the temp-dir fallback)
-    // and recorded on the attachment, so submit-time expansion can announce
-    // the compression and point the model at the full-fidelity copy.
-    // The edge cap comes from the host harness's [image] config (resolved per
-    // paste so a config reload applies immediately); hosts without a harness
-    // use the env/built-in default.
-    const compressed = await compressImageForModel(media.bytes, meta.mime, {
-      maxEdge: this.host.harness?.imageLimits?.maxEdgePx(),
-      telemetry: {
-        client: {
-          track: (event, properties) =>
-            this.host.track(event, properties === undefined ? undefined : { ...properties }),
-        },
-        source: 'tui_paste',
-      },
+    return pasteClipboardImage({
+      editor: this.host.state.editor,
+      imageStore: this.imageStore,
+      harness: this.host.harness,
+      sessionDir: this.host.session?.summary?.sessionDir,
+      track: (event, properties) => this.host.track(event, properties),
+      notifyError: (message) => this.host.showError(message),
+      requestRender: () => this.host.state.ui.requestRender(),
     });
-    const sessionDir = this.host.session?.summary?.sessionDir;
-    // Dimensions come from the compression result, not parseImageMeta: the
-    // compressor reports display space (EXIF orientation applied) — the space
-    // the sent image, the caption, and ReadMediaFile region readback share —
-    // while parseImageMeta reads the raw pre-rotation header.
-    const attachment = compressed.changed
-      ? this.imageStore.addImage(
-          compressed.data,
-          compressed.mimeType,
-          compressed.width,
-          compressed.height,
-          {
-            path: await persistOriginalImage(
-              media.bytes,
-              meta.mime,
-              sessionDir === undefined ? {} : { dir: sessionMediaOriginalsDir(sessionDir) },
-            ),
-            width: compressed.originalWidth,
-            height: compressed.originalHeight,
-            byteLength: media.bytes.length,
-            mime: meta.mime,
-          },
-        )
-      : this.imageStore.addImage(
-          media.bytes,
-          meta.mime,
-          compressed.width || meta.width,
-          compressed.height || meta.height,
-        );
-    this.host.state.editor.insertTextAtCursor?.(`${attachment.placeholder} `);
-    this.host.state.ui.requestRender();
-    this.host.track('shortcut_paste', { kind: 'image' });
-    return true;
   }
 
   private async openExternalEditor(): Promise<void> {

@@ -17,12 +17,6 @@ export interface PluginSessionStart {
   readonly skill: string;
 }
 
-/**
- * A plugin-contributed agent-definition root directory (`manifest.agents`
- * entries). Structurally compatible with the workspace agent-profile loader's
- * `AgentFileRoot` (`source: 'plugin'`) so the loader can feed them straight
- * into discovery without the plugin domain importing it.
- */
 export interface PluginAgentRoot {
   readonly path: string;
   readonly source: 'plugin';
@@ -168,6 +162,15 @@ export interface ReloadSummary {
   readonly added: readonly string[];
   readonly removed: readonly string[];
   readonly errors: ReadonlyArray<{ readonly id: string; readonly message: string }>;
+}
+
+export interface PluginMutation {
+  readonly kind: 'install' | 'enable' | 'disable' | 'remove' | 'mcp-server';
+  readonly id: string;
+}
+
+export interface PluginMutationSummary extends ReloadSummary {
+  readonly mutation: PluginMutation;
 }
 
 export interface PluginUpdateStatus {

@@ -1,18 +1,31 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { log, type GoalSnapshot } from '@moonshot-ai/kimi-code-sdk';
+import {
+  log,
+  SDKRpcClientWire,
+  type ApprovalHandler,
+  type ApprovalRequest,
+  type Event,
+  type GoalSnapshot,
+  type SkillSummary,
+} from '@moonshot-ai/kimi-code-sdk';
 import type { MigrationPlan } from '@moonshot-ai/migration-legacy';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { BannerProvider } from '#/tui/banner/banner-provider';
 import { readBannerDisplayState } from '#/tui/banner/state';
 import { handleLoginCommand, handleLogoutCommand } from '#/tui/commands/auth';
 import { promptPlatformSelection, promptLogoutProviderSelection } from '#/tui/commands/prompts';
+import { AgentsExitConfirmComponent } from '#/tui/components/agents-view/exit-confirm';
 import { BannerComponent } from '#/tui/components/chrome/banner';
 import { WelcomeComponent } from '#/tui/components/chrome/welcome';
+import { ApprovalPanelComponent } from '#/tui/components/dialogs/approval-panel';
+import { loadTuiConfig } from '#/tui/config';
+import type { AgentsGroupMode } from '#/tui/controllers/agents-view-groups';
 import { KimiTUI, type KimiTUIStartupInput, type TUIState } from '#/tui/kimi-tui';
+import type { ApprovalController } from '#/tui/reverse-rpc/approval/controller';
 import { REPLAY_TURN_LIMIT } from '#/tui/utils/message-replay';
 import { copyTextToClipboard } from '#/utils/clipboard/clipboard-text';
 import { quoteShellArg } from '#/utils/shell-quote';
@@ -116,6 +129,7 @@ function makeSession(overrides: Record<string, unknown> = {}) {
       contextTokens: 10,
       maxContextTokens: 100,
       contextUsage: 0.1,
+      busy: false,
     })),
     setApprovalHandler: vi.fn(),
     setQuestionHandler: vi.fn(),
@@ -124,7 +138,9 @@ function makeSession(overrides: Record<string, unknown> = {}) {
     setPermission: vi.fn(async () => {}),
     setPlanMode: vi.fn(async () => {}),
     getGoal: vi.fn(async () => ({ goal: null })),
-    onEvent: vi.fn(() => () => {}),
+    prompt: vi.fn(async () => {}),
+    cancel: vi.fn(async () => {}),
+    onEvent: vi.fn((_listener: (event: Event) => void) => () => {}),
     getResumeState: vi.fn(() => null),
     listSkills: vi.fn(async () => []),
     close: vi.fn(async () => {}),
@@ -156,7 +172,9 @@ function goalSnapshot(overrides: Partial<GoalSnapshot> = {}): GoalSnapshot {
   };
 }
 
-function createResumeState(overrides: { permissionMode?: string; planMode?: boolean } = {}) {
+function createResumeState(
+  overrides: { permissionMode?: string; planMode?: boolean; replay?: readonly unknown[] } = {},
+) {
   return {
     id: 'ses-latest',
     workDir: '/tmp/proj-a',
@@ -174,7 +192,7 @@ function createResumeState(overrides: { permissionMode?: string; planMode?: bool
           systemPrompt: '',
         },
         context: { history: [], tokenCount: 10 },
-        replay: [],
+        replay: overrides.replay ?? [],
         permission: { mode: overrides.permissionMode ?? 'manual', rules: [] },
         plan: overrides.planMode ? { id: 'plan-1', content: '', path: '/tmp/plan.md' } : null,
         swarmMode: false,
@@ -205,7 +223,12 @@ function makeHarness(session = makeSession(), overrides: Record<string, unknown>
     close: vi.fn(async () => {}),
     track: vi.fn(),
     setTelemetryContext: vi.fn(),
+    withInteractiveAgent: vi.fn(<T>(_agentId: string, fn: () => T): T => fn()),
     getExperimentalFeatures: vi.fn(async () => []),
+    // No fixture here runs the wire transport — the agents view's
+    // wire-only narrowing (AgentsViewController.show) must see "unavailable".
+    wireRpc: vi.fn(() => undefined),
+    supportsAtomicSectionReplace: vi.fn(() => false),
     auth: {
       status: vi.fn(async () => ({ providers: [] })),
       login: vi.fn(async () => {}),
@@ -278,6 +301,220 @@ describe('KimiTUI startup', () => {
       maxContextTokens: 200,
       contextUsage: 0.125,
       sessionTitle: 'Session title',
+    });
+  });
+
+  it('starts session-less on the v2 engine and carries startup flags to appState', async () => {
+    const harness = makeHarness(makeSession(), {
+      getConfig: vi.fn(async () => ({
+        models: {
+          k2: { model: 'moonshot-v1', maxContextSize: 200 },
+        },
+        defaultModel: 'k2',
+        // CLI --yolo must win over the config default.
+        defaultPermissionMode: 'auto',
+      })),
+    });
+    const driver = makeDriver(
+      harness,
+      { ...makeStartupInput({ model: 'k2', yolo: true }), engineV2: true },
+    );
+
+    await expect(driver.init()).resolves.toBe(false);
+
+    expect(harness.createSession).not.toHaveBeenCalled();
+    expect(driver.state.startupState).toBe('ready');
+    expect(driver.state.appState).toMatchObject({
+      sessionId: '',
+      model: 'k2',
+      permissionMode: 'yolo',
+    });
+  });
+
+  it('shows a session-less notice on v2 startup', async () => {
+    const harness = makeHarness(makeSession());
+    const driver = makeDriver(harness, { ...makeStartupInput(), engineV2: true });
+
+    await expect(driver.init()).resolves.toBe(false);
+    await (
+      driver as unknown as { finishStartup(shouldReplayHistory: boolean): Promise<void> }
+    ).finishStartup(false);
+
+    const transcript = driver.state.transcriptContainer.render(160).join('\n');
+    expect(transcript).toContain('No session yet — one will be created on your first message.');
+  });
+
+  it('shows config defaults in appState before the lazy session exists (v2)', async () => {
+    const harness = makeHarness(makeSession(), {
+      getConfig: vi.fn(async () => ({
+        models: {
+          k2: { model: 'moonshot-v1', maxContextSize: 200 },
+        },
+        defaultModel: 'k2',
+        defaultPermissionMode: 'auto',
+        defaultPlanMode: true,
+        thinking: { enabled: true, effort: 'high' },
+      })),
+    });
+    const driver = makeDriver(harness, { ...makeStartupInput(), engineV2: true });
+
+    await expect(driver.init()).resolves.toBe(false);
+
+    expect(harness.createSession).not.toHaveBeenCalled();
+    expect(driver.state.appState).toMatchObject({
+      sessionId: '',
+      model: 'k2',
+      maxContextTokens: 200,
+      permissionMode: 'auto',
+      planMode: true,
+      thinkingEffort: 'high',
+    });
+  });
+
+  it('hydrates the model default effort when thinking is enabled without an effort (v2)', async () => {
+    const harness = makeHarness(makeSession(), {
+      getConfig: vi.fn(async () => ({
+        models: {
+          k2: {
+            model: 'moonshot-v1',
+            maxContextSize: 200,
+            capabilities: ['thinking'],
+            supportEfforts: ['low', 'medium', 'high'],
+            defaultEffort: 'high',
+          },
+        },
+        defaultModel: 'k2',
+        thinking: { enabled: true },
+      })),
+    });
+    const driver = makeDriver(harness, { ...makeStartupInput(), engineV2: true });
+
+    await expect(driver.init()).resolves.toBe(false);
+
+    expect(harness.createSession).not.toHaveBeenCalled();
+    expect(driver.state.appState.thinkingEffort).toBe('high');
+  });
+
+  it('hydrates the model default effort when no [thinking] section exists (v2)', async () => {
+    const harness = makeHarness(makeSession(), {
+      getConfig: vi.fn(async () => ({
+        models: {
+          k2: {
+            model: 'moonshot-v1',
+            maxContextSize: 200,
+            capabilities: ['thinking'],
+            supportEfforts: ['low', 'medium', 'high'],
+          },
+        },
+        defaultModel: 'k2',
+      })),
+    });
+    const driver = makeDriver(harness, { ...makeStartupInput(), engineV2: true });
+
+    await expect(driver.init()).resolves.toBe(false);
+
+    expect(driver.state.appState.thinkingEffort).toBe('medium');
+  });
+
+  it('hydrates permission/plan defaults after a session-less v2 login', async () => {
+    let loggedIn = false;
+    const harness = makeHarness(makeSession(), {
+      getConfig: vi.fn(async () =>
+        loggedIn
+          ? {
+              models: { k2: { model: 'moonshot-v1', maxContextSize: 100 } },
+              defaultModel: 'k2',
+              defaultPermissionMode: 'auto',
+              defaultPlanMode: true,
+            }
+          : { models: {} },
+      ),
+      auth: {
+        status: vi.fn(async () => ({ providers: [] })),
+        login: vi.fn(async () => {
+          loggedIn = true;
+        }),
+        logout: vi.fn(),
+        getManagedUsage: vi.fn(),
+      },
+    });
+    const driver = makeDriver(harness, { ...makeStartupInput(), engineV2: true });
+
+    await expect(driver.init()).resolves.toBe(false);
+    expect(driver.state.appState).toMatchObject({
+      sessionId: '',
+      model: '',
+      permissionMode: 'manual',
+      planMode: false,
+    });
+
+    vi.mocked(promptPlatformSelection).mockResolvedValue('kimi-code');
+    await handleLoginCommand(driver as any);
+
+    // Login must not create a session on v2, but the refreshed config
+    // defaults must reach the first lazy-created session.
+    expect(harness.createSession).not.toHaveBeenCalled();
+    expect(driver.state.appState).toMatchObject({
+      sessionId: '',
+      model: 'k2',
+      permissionMode: 'auto',
+      planMode: true,
+      configDefaultPlanMode: true,
+    });
+  });
+
+  it('hydrates permission defaults after a session-less v2 login without a default model', async () => {
+    let loggedIn = false;
+    const harness = makeHarness(makeSession(), {
+      getConfig: vi.fn(async () =>
+        loggedIn
+          ? {
+              models: { k2: { model: 'moonshot-v1', maxContextSize: 100 } },
+              defaultPermissionMode: 'auto',
+            }
+          : { models: {} },
+      ),
+      auth: {
+        status: vi.fn(async () => ({ providers: [] })),
+        login: vi.fn(async () => {
+          loggedIn = true;
+        }),
+        logout: vi.fn(),
+        getManagedUsage: vi.fn(),
+      },
+    });
+    const driver = makeDriver(harness, { ...makeStartupInput(), engineV2: true });
+
+    await expect(driver.init()).resolves.toBe(false);
+
+    vi.mocked(promptPlatformSelection).mockResolvedValue('kimi-code');
+    await handleLoginCommand(driver as any);
+
+    expect(harness.createSession).not.toHaveBeenCalled();
+    expect(driver.state.appState).toMatchObject({
+      sessionId: '',
+      model: '',
+      permissionMode: 'auto',
+    });
+  });
+
+  it('carries the --agent/--agent-file binding for the lazy-created first session (v2)', async () => {
+    const harness = makeHarness(makeSession());
+    const driver = makeDriver(
+      harness,
+      {
+        ...makeStartupInput({ model: 'k2', agentFiles: ['agent.md'] }),
+        engineV2: true,
+        agentProfile: 'reviewer',
+      },
+    );
+
+    await expect(driver.init()).resolves.toBe(false);
+
+    expect(harness.createSession).not.toHaveBeenCalled();
+    expect(driver.state.appState).toMatchObject({
+      agentProfile: 'reviewer',
+      agentFiles: ['agent.md'],
     });
   });
 
@@ -649,6 +886,103 @@ describe('KimiTUI startup', () => {
     expect(harness.createSession).not.toHaveBeenCalled();
     expect(harness.resumeSession).not.toHaveBeenCalled();
     expect(driver.state.startupState).toBe('picker');
+  });
+
+  it('enters agents-view startup without creating a session and mounts the view in finishStartup', async () => {
+    const harness = makeHarness();
+    const driver = makeDriver(harness, { ...makeStartupInput(), startupAgentsView: true });
+    const tui = driver as unknown as {
+      agentsViewController: { show(): Promise<void> };
+      finishStartup(shouldReplayHistory: boolean): Promise<void>;
+    };
+    const show = vi.spyOn(tui.agentsViewController, 'show').mockImplementation(async () => {});
+
+    await expect(driver.init()).resolves.toBe(false);
+
+    expect(harness.createSession).not.toHaveBeenCalled();
+    expect(harness.resumeSession).not.toHaveBeenCalled();
+    expect(driver.state.startupState).toBe('agents-view');
+
+    await tui.finishStartup(false);
+    expect(show).toHaveBeenCalledOnce();
+  });
+
+  it('closing the agents view during agents-view startup stops the TUI', async () => {
+    const harness = makeHarness();
+    const driver = makeDriver(harness, { ...makeStartupInput(), startupAgentsView: true });
+    await driver.init();
+    const stop = vi.spyOn(driver, 'stop').mockImplementation(async () => {});
+
+    (driver as unknown as { setAgentsView(value: unknown): void }).setAgentsView(undefined);
+
+    expect(stop).toHaveBeenCalledOnce();
+  });
+
+  it('closing the agents view in a normal session does not stop the TUI', async () => {
+    const harness = makeHarness();
+    const driver = makeDriver(harness, makeStartupInput());
+    await driver.init();
+    const stop = vi.spyOn(driver, 'stop').mockImplementation(async () => {});
+
+    (driver as unknown as { setAgentsView(value: unknown): void }).setAgentsView(undefined);
+
+    expect(stop).not.toHaveBeenCalled();
+  });
+
+  it('agentsViewServerLabel defaults to embedded and honors the startup override', () => {
+    const harness = makeHarness();
+    const embedded = makeDriver(harness, makeStartupInput());
+    expect(
+      (embedded as unknown as { agentsViewServerLabel(): string }).agentsViewServerLabel(),
+    ).toBe('embedded');
+
+    const attached = makeDriver(harness, {
+      ...makeStartupInput(),
+      startupAgentsView: true,
+      agentsViewServerLabel: '127.0.0.1:58627',
+    });
+    expect(
+      (attached as unknown as { agentsViewServerLabel(): string }).agentsViewServerLabel(),
+    ).toBe('127.0.0.1:58627');
+  });
+
+  it('agentsViewGroupMode defaults to state and honors the startup tuiConfig, with no disk I/O', () => {
+    // Sync, in-memory read (see `KimiTUI#agentsViewGroupModePref`) — safe to
+    // call directly with no `KIMI_CODE_HOME` sandboxing, unlike
+    // `saveAgentsViewGroupMode` below.
+    const harness = makeHarness();
+    const defaulted = makeDriver(harness, makeStartupInput());
+    expect((defaulted as unknown as { agentsViewGroupMode(): AgentsGroupMode }).agentsViewGroupMode()).toBe(
+      'state',
+    );
+
+    const seeded = makeDriver(harness, makeStartupInput({}, { agentsView: { groupMode: 'directory' } }));
+    expect((seeded as unknown as { agentsViewGroupMode(): AgentsGroupMode }).agentsViewGroupMode()).toBe(
+      'directory',
+    );
+  });
+
+  it('saveAgentsViewGroupMode writes tui.toml and updates the in-memory preference', async () => {
+    const originalEnv = { ...process.env };
+    const dir = mkdtempSync(join(tmpdir(), 'kimi-startup-group-mode-'));
+    process.env['KIMI_CODE_HOME'] = dir;
+
+    try {
+      const harness = makeHarness();
+      const driver = makeDriver(harness, makeStartupInput()) as unknown as {
+        agentsViewGroupMode(): AgentsGroupMode;
+        saveAgentsViewGroupMode(mode: AgentsGroupMode): Promise<void>;
+      };
+
+      await driver.saveAgentsViewGroupMode('directory');
+
+      expect(driver.agentsViewGroupMode()).toBe('directory');
+      const reloaded = await loadTuiConfig();
+      expect(reloaded.agentsView).toEqual({ groupMode: 'directory' });
+    } finally {
+      process.env = { ...originalEnv };
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('applies --auto after picking a session from bare --session', async () => {
@@ -1140,6 +1474,121 @@ describe('KimiTUI startup', () => {
     expect(showStatus).toHaveBeenCalledWith("New Models · +2 models.");
   });
 
+  it("stages provider-refresh removals and persists one atomic write on atomic-capable harnesses", async () => {
+    const registryUrl = "https://registry.example.test/v1/models/api.json";
+    const source = { kind: "apiJson", url: registryUrl, apiKey: "sk-test-token" };
+    const replaceConfigSections = vi.fn(async (_sections: Record<string, unknown>) => {});
+    const removeProvider = vi.fn(async () => ({}));
+    const setConfig = vi.fn(async () => ({}));
+    const harness = makeHarness(makeSession(), {
+      supportsAtomicSectionReplace: vi.fn(() => true),
+      replaceConfigSections,
+      removeProvider,
+      setConfig,
+      getConfig: vi.fn(async () => ({
+        providers: {
+          a: { type: "openai", baseUrl: "https://a.example.test/v1", apiKey: "sk-test-token", source },
+          b: { type: "openai", baseUrl: "https://b.example.test/v1", apiKey: "sk-test-token", source },
+        },
+        models: {
+          "a/m1": { provider: "a", model: "m1", maxContextSize: 100, capabilities: ["tool_use"] },
+          "b/m1": { provider: "b", model: "m1", maxContextSize: 100, capabilities: ["tool_use"] },
+        },
+        defaultModel: "b/m1",
+        thinking: { enabled: true },
+      })),
+    });
+    const driver = makeDriver(harness, makeStartupInput());
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            a: {
+              id: "a",
+              name: "Provider A",
+              api: "https://a.example.test/v1",
+              type: "openai",
+              models: { m1: { id: "m1" } },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+    try {
+      const result = await (driver as any).authFlow.refreshProviderModels();
+
+      expect(result.failed).toEqual([]);
+      expect(result.changed).toContainEqual({ providerId: "b", providerName: "b", added: 0, removed: 1 });
+      // The removal was staged in memory: no destructive pre-write, exactly
+      // one atomic section replace carrying the complete records — with the
+      // dangling default model / thinking expressed as cleared sections.
+      expect(removeProvider).not.toHaveBeenCalled();
+      expect(setConfig).not.toHaveBeenCalled();
+      expect(replaceConfigSections).toHaveBeenCalledTimes(1);
+      const sections = replaceConfigSections.mock.calls[0]?.[0] as Record<string, unknown>;
+      expect(Object.keys(sections["providers"] as object)).toEqual(["a"]);
+      expect(sections["models"]).not.toHaveProperty("b/m1");
+      expect(sections["defaultModel"]).toBeUndefined();
+      expect(sections["thinking"]).toBeUndefined();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("keeps the two-phase removeProvider/setConfig host on harnesses without atomic replace", async () => {
+    const registryUrl = "https://registry.example.test/v1/models/api.json";
+    const source = { kind: "apiJson", url: registryUrl, apiKey: "sk-test-token" };
+    const replaceConfigSections = vi.fn(async () => {});
+    const removeProvider = vi.fn(async () => ({}));
+    const setConfig = vi.fn(async (patch: Record<string, unknown>) => patch);
+    const harness = makeHarness(makeSession(), {
+      replaceConfigSections,
+      removeProvider,
+      setConfig,
+      getConfig: vi.fn(async () => ({
+        providers: {
+          a: { type: "openai", baseUrl: "https://a.example.test/v1", apiKey: "sk-test-token", source },
+          b: { type: "openai", baseUrl: "https://b.example.test/v1", apiKey: "sk-test-token", source },
+        },
+        models: {
+          "a/m1": { provider: "a", model: "m1", maxContextSize: 100, capabilities: ["tool_use"] },
+          "b/m1": { provider: "b", model: "m1", maxContextSize: 100, capabilities: ["tool_use"] },
+        },
+        defaultModel: "b/m1",
+      })),
+    });
+    const driver = makeDriver(harness, makeStartupInput());
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            a: {
+              id: "a",
+              name: "Provider A",
+              api: "https://a.example.test/v1",
+              type: "openai",
+              models: { m1: { id: "m1" } },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+    try {
+      const result = await (driver as any).authFlow.refreshProviderModels();
+
+      expect(result.failed).toEqual([]);
+      expect(removeProvider).toHaveBeenCalledWith("b");
+      expect(setConfig).toHaveBeenCalledTimes(1);
+      expect(replaceConfigSections).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("starts TUI without a session when fresh startup needs OAuth login", async () => {
     const harness = makeHarness(makeSession(), {
       createSession: vi.fn(async () => {
@@ -1611,6 +2060,79 @@ describe('KimiTUI startup', () => {
     expect(driver.terminalFocusTrackingDispose).toBeUndefined();
   });
 
+  it('checks workspace trust before entering the migration screen', async () => {
+    // The migration branch used to skip the trust gate entirely: a workspace
+    // with legacy ~/.kimi data went straight to the migration screen, and
+    // later startup steps spawned child processes in an untrusted directory.
+    const getWorkspaceTrustInfo = vi.fn(async () => ({
+      trusted: true,
+      gatedMcpServers: [] as string[],
+    }));
+    const harness = makeHarness(makeSession(), { getWorkspaceTrustInfo });
+    const driver = makeDriver(harness, {
+      ...makeStartupInput(),
+      migrationPlan: MIGRATION_PLAN,
+      migrateOnly: true,
+      engineV2: true,
+    }) as unknown as MigrateExitDriver;
+    vi.spyOn(driver.state.ui, 'start').mockImplementation(() => {});
+    vi.spyOn(driver.state.ui, 'stop').mockImplementation(() => {});
+    vi.spyOn(driver.state.terminal, 'write').mockImplementation(() => {});
+    const migrationSpy = vi
+      .spyOn(driver, 'runMigrationScreen')
+      .mockResolvedValue({ decision: 'later' });
+    const onExit = vi.fn(async () => {});
+    driver.onExit = onExit;
+
+    await driver.start();
+
+    expect(getWorkspaceTrustInfo).toHaveBeenCalledWith('/tmp/proj-a');
+    expect(getWorkspaceTrustInfo.mock.invocationCallOrder[0]!).toBeLessThan(
+      migrationSpy.mock.invocationCallOrder[0]!,
+    );
+    expect(onExit).toHaveBeenCalledWith(0);
+  });
+
+  it('prompts for workspace trust before migrating an untrusted workspace', async () => {
+    const getWorkspaceTrustInfo = vi.fn(async () => ({
+      trusted: false,
+      gatedMcpServers: [] as string[],
+    }));
+    const trustWorkspace = vi.fn(async () => {});
+    const harness = makeHarness(makeSession(), { getWorkspaceTrustInfo, trustWorkspace });
+    const driver = makeDriver(harness, {
+      ...makeStartupInput(),
+      migrationPlan: MIGRATION_PLAN,
+      migrateOnly: true,
+      engineV2: true,
+    }) as unknown as MigrateExitDriver & {
+      mountEditorReplacement(panel: { handleInput(data: string): void }): void;
+    };
+    vi.spyOn(driver.state.ui, 'start').mockImplementation(() => {});
+    vi.spyOn(driver.state.ui, 'stop').mockImplementation(() => {});
+    vi.spyOn(driver.state.terminal, 'write').mockImplementation(() => {});
+    const migrationSpy = vi
+      .spyOn(driver, 'runMigrationScreen')
+      .mockResolvedValue({ decision: 'later' });
+    const mountSpy = vi.spyOn(driver, 'mountEditorReplacement');
+    const onExit = vi.fn(async () => {});
+    driver.onExit = onExit;
+
+    const startPromise = driver.start();
+    await vi.waitFor(() => {
+      expect(mountSpy).toHaveBeenCalled();
+    });
+    // Choose the default "Trust this folder" option with Enter.
+    mountSpy.mock.calls[0]![0].handleInput('\r');
+    await startPromise;
+
+    expect(trustWorkspace).toHaveBeenCalledWith('/tmp/proj-a');
+    expect(getWorkspaceTrustInfo.mock.invocationCallOrder[0]!).toBeLessThan(
+      migrationSpy.mock.invocationCallOrder[0]!,
+    );
+    expect(onExit).toHaveBeenCalledWith(0);
+  });
+
   it('keeps non-login startup session errors fatal', async () => {
     const harness = makeHarness(makeSession(), {
       createSession: vi.fn(async () => {
@@ -1821,6 +2343,1262 @@ describe('KimiTUI startup', () => {
   });
 });
 
+describe('KimiTUI resetSessionRuntime — deferred panel slots (M7)', () => {
+  interface DeferredPanelDriver extends StartupDriver {
+    resetSessionRuntime(): void;
+    flushDeferredPanels(): void;
+  }
+
+  it('a deferred approval/question mount from the session being left does not survive a runtime reset, so a later flush mounts nothing', async () => {
+    const harness = makeHarness();
+    const driver = makeDriver(harness, makeStartupInput()) as unknown as DeferredPanelDriver;
+    await driver.init();
+
+    // Simulates the state right after `showApprovalPanel`/`showQuestionDialog`
+    // deferred a reverse-RPC show for the session being left (the roster
+    // takeover was on screen) — see `isAgentsViewTakeoverActive`.
+    const approvalMount = vi.fn();
+    const questionMount = vi.fn();
+    const withDeferred = driver as unknown as {
+      deferredApprovalMount: (() => void) | undefined;
+      deferredQuestionMount: (() => void) | undefined;
+    };
+    withDeferred.deferredApprovalMount = approvalMount;
+    withDeferred.deferredQuestionMount = questionMount;
+
+    driver.resetSessionRuntime();
+    expect(withDeferred.deferredApprovalMount).toBeUndefined();
+    expect(withDeferred.deferredQuestionMount).toBeUndefined();
+
+    driver.flushDeferredPanels();
+    expect(approvalMount).not.toHaveBeenCalled();
+    expect(questionMount).not.toHaveBeenCalled();
+  });
+});
+
+// ── Agents-view attach (Enter on a row → full chat UI) ──
+
+describe('KimiTUI agents-view attach', () => {
+  interface AttachDriver extends StartupDriver {
+    onOpenSession(id: string): void;
+    returnToAgentsView(): boolean;
+    agentsViewController: { show(): Promise<void> };
+    resumeSession(id: string): Promise<boolean>;
+    session: { id: string } | undefined;
+    showStatus(msg: string, severity?: string): void;
+    showError(msg: string): void;
+    handleUserInput(text: string): void;
+    setAppState(patch: Record<string, unknown>): void;
+    deferUserMessages: boolean;
+  }
+
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  function makeAttachSession(id: string) {
+    return makeSession({
+      id,
+      listMcpServers: vi.fn(async () => []),
+      getSessionWarnings: vi.fn(async () => []),
+    });
+  }
+
+  const ATTACH_SUMMARY = {
+    id: 'ses-attached',
+    title: 'attached title',
+    workDir: '/tmp/proj-a',
+    sessionDir: '/tmp/ses-attached',
+    createdAt: 1,
+    updatedAt: 1_000,
+  };
+
+  function makeAgentsHarness(
+    session: ReturnType<typeof makeAttachSession>,
+    opts: { withWireReply?: boolean } = {},
+  ) {
+    const listeners = new Set<(event: Event) => void>();
+    const homeDir = mkdtempSync(join(tmpdir(), 'kimi-agents-attach-'));
+    dirs.push(homeDir);
+    // Pre-register the attach target (and a second view-owned session used by
+    // the badge test): the view's roster only lists sessions in its own
+    // registry (dispatched from / attached through the view).
+    writeFileSync(
+      join(homeDir, 'agents-view.json'),
+      JSON.stringify({ pins: [], sessions: [ATTACH_SUMMARY.id, 'ses-other'] }),
+    );
+    // Reply-from-roster (R9 Q1a) needs a real wire rpc — the plain
+    // listSessions()-seeded roster every other attach test uses has no
+    // prompt() route (handleReply requires the wire transport).
+    const wirePrompt = opts.withWireReply === true ? vi.fn(async () => {}) : undefined;
+    const wireRpc =
+      wirePrompt === undefined
+        ? undefined
+        : Object.assign(Object.create(SDKRpcClientWire.prototype) as SDKRpcClientWire, {
+            prompt: wirePrompt,
+            listSessionRows: vi.fn(async () => [
+              {
+                id: ATTACH_SUMMARY.id,
+                workspace_id: 'ws_1',
+                title: ATTACH_SUMMARY.title,
+                created_at: new Date(ATTACH_SUMMARY.createdAt).toISOString(),
+                updated_at: new Date(ATTACH_SUMMARY.updatedAt).toISOString(),
+                busy: false,
+                pending_interaction: 'none',
+                metadata: { cwd: ATTACH_SUMMARY.workDir },
+                agent_config: { model: 'k2' },
+                usage: {
+                  input_tokens: 0,
+                  output_tokens: 0,
+                  cache_read_tokens: 0,
+                  cache_creation_tokens: 0,
+                  total_cost_usd: 0,
+                  context_tokens: 0,
+                  context_limit: 0,
+                  turn_count: 0,
+                },
+                permission_rules: [],
+                message_count: 0,
+                last_seq: 0,
+              },
+            ]),
+            getWorkspaceTrustForSession: vi.fn(async () => true),
+            onConnectionState: () => () => {},
+          });
+    const harness = makeHarness(session, {
+      homeDir,
+      listSessions: vi.fn(async () => [ATTACH_SUMMARY]),
+      onEvent: (listener: (event: Event) => void) => {
+        listeners.add(listener);
+        return () => {
+          listeners.delete(listener);
+        };
+      },
+      ...(wireRpc === undefined ? {} : { wireRpc: vi.fn(() => wireRpc) }),
+    });
+    return {
+      harness,
+      wirePrompt,
+      emit: (event: Event) => {
+        for (const listener of listeners) listener(event);
+      },
+    };
+  }
+
+  async function bootAgentsView(
+    harness: ReturnType<typeof makeAgentsHarness>['harness'],
+    cliOptions: Parameters<typeof makeStartupInput>[0] = {},
+  ): Promise<AttachDriver> {
+    const driver = makeDriver(harness, {
+      ...makeStartupInput(cliOptions),
+      startupAgentsView: true,
+    }) as unknown as AttachDriver;
+    await driver.init();
+    expect(driver.state.startupState).toBe('agents-view');
+    await driver.agentsViewController.show();
+    expect(driver.state.agentsView).toBeDefined();
+    return driver;
+  }
+
+  it('attach resumes the session, detaches the view and switches into its chat UI', async () => {
+    const session = makeAttachSession('ses-attached');
+    const { harness, emit } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    const showStatus = vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(harness.resumeSession).toHaveBeenCalledWith({
+      id: 'ses-attached',
+      replayTurnLimit: REPLAY_TURN_LIMIT,
+    });
+    expect(driver.session?.id).toBe('ses-attached');
+    expect(showStatus).toHaveBeenCalledWith('Attached to session (ses-attached).');
+    // The view unmounted (detached) but its roster subscription survived
+    // switchToSession's runtime reset — the footer badge needs live counts.
+    const view = driver.state.agentsView;
+    expect(view?.detached).toBe(true);
+    emit({
+      type: 'event.session.work_changed',
+      sessionId: 'ses-attached',
+      busy: true,
+      pending_interaction: 'none',
+    } as Event);
+    expect(view?.roster.counts().working).toBe(1);
+  });
+
+  it('attach under `--auto --plan` applies the startup modes to the resumed session (same contract as a startup resume)', async () => {
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness, { auto: true, plan: true });
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(session.setPermission).toHaveBeenCalledWith('auto');
+    expect(session.setPlanMode).toHaveBeenCalledWith(true);
+  });
+
+  it('a failed attach leaves the view mounted and shows the error on its own visible flash, not the (detached) host surface', async () => {
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    const showError = vi.spyOn(driver, 'showError').mockImplementation(() => {});
+    harness.resumeSession.mockRejectedValueOnce(new Error('server exploded'));
+
+    driver.onOpenSession('ses-attached');
+
+    // The in-flight "Attaching session…" flash lands first, so waiting on
+    // the flash being DEFINED is no longer enough — wait for the error
+    // itself to replace it.
+    await vi.waitFor(() => {
+      expect(driver.state.agentsView?.flashMessage).toContain('server exploded');
+    });
+    // detachForAttach never ran (the resume failed before it) — the view is
+    // still mounted, so host.showError (which renders into the UI-tree
+    // child the takeover already detached) must NOT be the surface used.
+    expect(showError).not.toHaveBeenCalled();
+    expect(driver.state.agentsView?.flashMessage).toContain('server exploded');
+    expect(driver.state.agentsView?.detached).toBe(false);
+    expect(driver.session).toBeUndefined();
+    expect(driver.state.appState.sessionId).toBe('');
+  });
+
+  it('a failed session-switch after a successful resume never leaves the roster — the error flashes in place', async () => {
+    // syncRuntimeState's getStatus()/getGoal() are live HTTP calls that can
+    // reject (server restart, network blip) after resumeSession already
+    // succeeded. The switch runs BEFORE the detach now, so the roster is
+    // still the mounted tree: the error goes through the controller's own
+    // visible flash (same channel as a resume failure), not the host
+    // surface, and there is no detach/remount churn at all.
+    const session = makeAttachSession('ses-attached');
+    session.getStatus.mockRejectedValueOnce(new Error('status fetch failed'));
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    const showError = vi.spyOn(driver, 'showError').mockImplementation(() => {});
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(driver.state.agentsView?.flashMessage).toContain('status fetch failed');
+    });
+    expect(showError).not.toHaveBeenCalled();
+    expect(driver.state.agentsView?.detached).toBe(false);
+  });
+
+  it('the roster stays mounted through the whole resume/switch wait — one transition into the finished chat', async () => {
+    // The attach used to detach the roster FIRST (painting the previous
+    // session's stale chat), run its RPC awaits on that frame, then clear
+    // the screen again before replaying — two visible full-screen flashes
+    // per open. Now every await runs with the roster still mounted and the
+    // detach is the single transition, so a held-open resume must show the
+    // roster (not detached, no chat) until the very end.
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    let release: (() => void) | undefined;
+    harness.resumeSession.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = () => {
+            resolve(session);
+          };
+        }),
+    );
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(harness.resumeSession).toHaveBeenCalled();
+    });
+    // Mid-wait: the roster is still the mounted tree — the stale chat never
+    // got a frame — and the attach is announced on the roster's own flash
+    // line, so a slow resume no longer reads as a frozen UI.
+    expect(driver.state.agentsView?.detached).toBe(false);
+    expect(driver.session).toBeUndefined();
+    expect(driver.state.agentsView?.flashMessage).toBe('Attaching session…');
+
+    release!();
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(driver.state.agentsView?.detached).toBe(true);
+    expect(driver.session?.id).toBe('ses-attached');
+    // detachForAttach cleared the progress flash with the detach — nothing
+    // stale greets the user on the next return to the roster.
+    expect(driver.state.agentsView?.flashMessage).toBeUndefined();
+  });
+
+  it('a second open during an in-flight attach is refused — no second resume, and the guard resets afterwards', async () => {
+    // The roster stays interactive through the attach wait, so repeated
+    // Enters would otherwise stack concurrent attaches whose session
+    // switches interleave (setSession's previous.close() racing another
+    // attach's setup). The second open is refused with a flash instead.
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    let release: (() => void) | undefined;
+    harness.resumeSession.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = () => {
+            resolve(session);
+          };
+        }),
+    );
+
+    driver.onOpenSession('ses-attached');
+    await vi.waitFor(() => {
+      expect(harness.resumeSession).toHaveBeenCalledTimes(1);
+    });
+    driver.onOpenSession('ses-other');
+    await vi.waitFor(() => {
+      expect(driver.state.agentsView?.flashMessage).toContain('already in progress');
+    });
+    expect(harness.resumeSession).toHaveBeenCalledTimes(1);
+
+    release!();
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    // The guard cleared: a later open attaches normally.
+    driver.returnToAgentsView();
+    await vi.waitFor(() => {
+      expect(driver.state.agentsView?.detached).toBe(false);
+    });
+    driver.onOpenSession('ses-other');
+    await vi.waitFor(() => {
+      expect(harness.resumeSession).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it('re-entering the current session resurfaces its chat without resuming again', async () => {
+    // Regression (final review C1): attach → ← → Enter on the SAME row must
+    // re-enter the still-live chat — the T3-era "Already on this session."
+    // guard made the core loop work exactly once and stranded approvals that
+    // arrived for the attached session while the roster was up.
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    const showStatus = vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+    driver.onOpenSession('ses-attached');
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+
+    // ← back to the roster, then Enter on the same session's row.
+    expect(driver.returnToAgentsView()).toBe(true);
+    await vi.waitFor(() => {
+      expect(driver.state.agentsView?.detached).toBe(false);
+    });
+    driver.onOpenSession('ses-attached');
+
+    // The view unmounts again (the chat resurfaces) with no second resume and
+    // no same-session guard error.
+    await vi.waitFor(() => {
+      expect(driver.state.agentsView?.detached).toBe(true);
+    });
+    expect(harness.resumeSession).toHaveBeenCalledTimes(1);
+    expect(showStatus).not.toHaveBeenCalledWith('Already on this session.');
+    expect(driver.state.appState.sessionId).toBe('ses-attached');
+    expect(driver.state.ui.children).not.toContain(driver.state.agentsView?.component);
+  });
+
+  // ── Approval-while-view-open focus seam (final re-review C1 compound) ──
+
+  function makeApprovalRequest(toolCallId: string): ApprovalRequest {
+    return {
+      toolCallId,
+      toolName: 'Bash',
+      action: 'run',
+      display: {
+        kind: 'generic',
+        summary: 'run',
+        detail: { command: 'ls /tmp' },
+      },
+    };
+  }
+
+  /** The approval handler the TUI registered on the attached session mock. */
+  function approvalHandlerOf(session: ReturnType<typeof makeAttachSession>): ApprovalHandler {
+    const handler = vi.mocked(session.setApprovalHandler).mock.calls.at(-1)?.[0] as
+      | ApprovalHandler
+      | undefined;
+    if (handler === undefined) throw new Error('no approval handler registered');
+    return handler;
+  }
+
+  function approvalControllerOf(driver: AttachDriver): ApprovalController {
+    return (driver as unknown as { approvalController: ApprovalController }).approvalController;
+  }
+
+  /** Attach ses-attached, then ← back to the roster with the chat live underneath. */
+  async function bootRosterOverAttachedSession(
+    session: ReturnType<typeof makeAttachSession>,
+  ): Promise<AttachDriver> {
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    // initMainTui mounts the editor into its container; init() alone does not.
+    driver.state.editorContainer.addChild(driver.state.editor);
+    driver.onOpenSession('ses-attached');
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(driver.returnToAgentsView()).toBe(true);
+    await vi.waitFor(() => {
+      expect(driver.state.agentsView?.detached).toBe(false);
+    });
+    return driver;
+  }
+
+  it('an approval arriving while the view is open neither mounts nor steals focus', async () => {
+    const session = makeAttachSession('ses-attached');
+    const driver = await bootRosterOverAttachedSession(session);
+    const setFocus = vi.spyOn(driver.state.ui, 'setFocus');
+
+    const pending = approvalHandlerOf(session)(makeApprovalRequest('tc-1'));
+
+    // The request stays pending in the controller; nothing mounts into the
+    // (off-tree) editor container, and the roster keeps keyboard focus.
+    const view = driver.state.agentsView;
+    expect(driver.state.editorContainer.children[0]).toBe(driver.state.editor);
+    expect(view?.component.focused).toBe(true);
+    expect(
+      setFocus.mock.calls.some(([target]) => target instanceof ApprovalPanelComponent),
+    ).toBe(false);
+
+    // Teardown with a queued panel: cancel resolves the request and still
+    // does not touch the roster's focus or the editor container.
+    approvalControllerOf(driver).cancelAll('test teardown');
+    await expect(pending).resolves.toMatchObject({ decision: 'cancelled' });
+    expect(driver.state.editorContainer.children[0]).toBe(driver.state.editor);
+    expect(view?.component.focused).toBe(true);
+  });
+
+  it('attaching into the session mounts the queued approval visible and focused', async () => {
+    const session = makeAttachSession('ses-attached');
+    const driver = await bootRosterOverAttachedSession(session);
+    const pending = approvalHandlerOf(session)(makeApprovalRequest('tc-1'));
+    expect(driver.state.editorContainer.children[0]).toBe(driver.state.editor);
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(driver.state.agentsView?.detached).toBe(true);
+    });
+    const mounted = driver.state.editorContainer.children[0];
+    expect(mounted).toBeInstanceOf(ApprovalPanelComponent);
+    expect(driver.state.ui.children).toContain(driver.state.editorContainer);
+    expect((mounted as ApprovalPanelComponent).focused).toBe(true);
+
+    // The full answer cycle works: respond resolves the request and the
+    // editor slot returns to the editor.
+    approvalControllerOf(driver).respond({ decision: 'approved' });
+    await expect(pending).resolves.toEqual({ decision: 'approved' });
+    expect(driver.state.editorContainer.children[0]).toBe(driver.state.editor);
+  });
+
+  it('attaching into a DIFFERENT session never pops the pending panel into its chat', async () => {
+    const sessionA = makeAttachSession('ses-attached');
+    const sessionB = makeAttachSession('ses-other');
+    const { harness } = makeAgentsHarness(sessionA);
+    harness.resumeSession = vi.fn(async (input: { id: string }) =>
+      input.id === 'ses-other' ? sessionB : sessionA,
+    ) as unknown as typeof harness.resumeSession;
+    const driver = await bootAgentsView(harness);
+    // initMainTui mounts the editor into its container; init() alone does not.
+    driver.state.editorContainer.addChild(driver.state.editor);
+    driver.onOpenSession('ses-attached');
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(driver.returnToAgentsView()).toBe(true);
+    await vi.waitFor(() => {
+      expect(driver.state.agentsView?.detached).toBe(false);
+    });
+    const pending = approvalHandlerOf(sessionA)(makeApprovalRequest('tc-1'));
+    const setFocus = vi.spyOn(driver.state.ui, 'setFocus');
+
+    driver.onOpenSession('ses-other');
+
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-other');
+    });
+    // Session A's panel never mounted into B's chat and never took focus.
+    // The pending request is resolved by the session switch's cancel — the
+    // same semantics as any switch with a pending approval — rather than
+    // surfacing in the wrong chat.
+    await expect(pending).resolves.toMatchObject({ decision: 'cancelled' });
+    expect(driver.state.editorContainer.children[0]).toBe(driver.state.editor);
+    expect(
+      setFocus.mock.calls.some(([target]) => target instanceof ApprovalPanelComponent),
+    ).toBe(false);
+    expect(driver.session?.id).toBe('ses-other');
+  });
+
+  it('agents mode relaxes the streaming switch guard (wire detach never kills a turn)', async () => {
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    driver.state.appState.streamingPhase = 'waiting';
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+
+    // The picker resume path is relaxed in agents mode too.
+    const other = makeAttachSession('ses-other');
+    harness.resumeSession.mockResolvedValueOnce(other);
+    driver.state.appState.streamingPhase = 'waiting';
+    await expect(driver.resumeSession('ses-other')).resolves.toBe(true);
+    expect(driver.state.appState.sessionId).toBe('ses-other');
+  });
+
+  it('attach resets a stuck streamingPhase back to idle (R9 Q1b) — a missed turn.ended can no longer wedge the status permanently', async () => {
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+    // Simulate the R9 repro: a `turn.ended` for a previous session's short
+    // turn never reached this client (no event backlog on the live
+    // subscription), leaving the phase wedged non-idle.
+    driver.state.appState.streamingPhase = 'thinking';
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(driver.state.appState.streamingPhase).toBe('idle');
+  });
+
+  it('attach to an already-busy session seeds streamingPhase from the real status, so a turn.ended with no further delta still runs finalizeTurn instead of being swallowed (R9 I1)', async () => {
+    const session = makeAttachSession('ses-attached');
+    session.getStatus.mockResolvedValue({
+      model: 'k2',
+      thinkingEffort: 'off',
+      permission: 'manual',
+      planMode: false,
+      contextTokens: 10,
+      maxContextTokens: 100,
+      contextUsage: 0.1,
+      // The turn that's already running server-side when this client
+      // attaches — its own turn.started already fired before this
+      // subscription existed, same "already happened" gap Q1a/Q1b diagnosed
+      // for the reply case, just from attaching to a busy row instead.
+      busy: true,
+    });
+    let sessionEventListener: ((event: Event) => void) | undefined;
+    session.onEvent.mockImplementation((listener) => {
+      sessionEventListener = listener;
+      return () => {
+        sessionEventListener = undefined;
+      };
+    });
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    // Seeded from the real busy status, not the unconditional idle Q1b's own
+    // fix forces — this is what closes the gap at its source, before any
+    // turn.ended for the in-progress turn ever arrives.
+    expect(driver.state.appState.streamingPhase).toBe('waiting');
+    expect(sessionEventListener).toBeDefined();
+
+    // The user typed a follow-up while watching this already-in-progress
+    // turn from the roster.
+    driver.state.queuedMessages = [{ text: 'queued while busy', agentId: 'main' }];
+
+    // The ONLY event this freshly-subscribed client ever sees for the
+    // in-progress turn: no preceding delta, no step boundary — a tool-only
+    // tail, an ordinary agentic pattern.
+    sessionEventListener?.({
+      type: 'turn.ended',
+      agentId: 'main',
+      sessionId: 'ses-attached',
+      turnId: 0,
+      reason: 'completed',
+    } as Event);
+
+    // Synchronous half of finalizeTurn's body: the queued message is shifted
+    // out immediately — proving the idle-guard did NOT swallow the call
+    // whole, the way it would have against the unconditional-idle baseline.
+    expect(driver.state.queuedMessages).toEqual([]);
+
+    await vi.waitFor(() => {
+      expect(session.prompt).toHaveBeenCalledWith('queued while busy');
+    });
+    // beginSessionRequest (inside sendMessageInternal, on the dispatch path)
+    // moved the phase to 'waiting' again for the new turn — settled, not
+    // left dangling.
+    expect(driver.state.appState.streamingPhase).toBe('waiting');
+  });
+
+  it('queues a message typed during the attach switch and releases it once the listener is live', async () => {
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+    const showError = vi.spyOn(driver, 'showError').mockImplementation(() => {});
+
+    // Park the switch inside syncRuntimeState — the composer is focused and
+    // accepting input from the moment the view hands over, but the session's
+    // event listener is not registered until the end of switchToSession, and
+    // receiveEvent() has no buffering: a prompt sent in this window loses
+    // every event it produces, including its own turn.ended.
+    let releaseStatus!: () => void;
+    session.getStatus.mockImplementationOnce(
+      async () =>
+        new Promise((resolve) => {
+          releaseStatus = () =>
+            resolve({
+              model: 'k2',
+              thinkingEffort: 'off',
+              permission: 'manual',
+              planMode: false,
+              contextTokens: 0,
+              maxContextTokens: 100,
+              contextUsage: 0,
+              busy: false,
+            });
+        }),
+    );
+
+    // A model is already known here (the composer carries the last attach's
+    // value), so nothing else stops the send — this is the window in its pure
+    // form: a real prompt into a session with no listener.
+    driver.setAppState({ model: 'k2' });
+
+    driver.onOpenSession('ses-attached');
+    // setSession runs before syncRuntimeState, so a live `driver.session`
+    // means the composer is now talking to the target session while the
+    // listener is still unregistered — the window itself, observed without
+    // reference to how the fix implements the hold.
+    await vi.waitFor(() => {
+      expect(driver.session?.id).toBe('ses-attached');
+    });
+
+    driver.handleUserInput('typed mid-attach');
+
+    expect(session.prompt).not.toHaveBeenCalled();
+    expect(driver.state.queuedMessages).toHaveLength(1);
+    expect(showError).not.toHaveBeenCalled();
+
+    releaseStatus();
+    await vi.waitFor(() => {
+      expect(session.prompt).toHaveBeenCalledTimes(1);
+    });
+    expect(session.prompt).toHaveBeenCalledWith('typed mid-attach');
+    expect(driver.state.queuedMessages).toEqual([]);
+    expect(driver.deferUserMessages).toBe(false);
+  });
+
+  it('does not mistake an unsynced model for a missing login while the attach switch is deferring', async () => {
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+    const showError = vi.spyOn(driver, 'showError').mockImplementation(() => {});
+
+    // First attach of the run: no session has reported a model yet, so the
+    // composer's model is still empty when the switch begins.
+    expect(driver.state.appState.model).toBe('');
+
+    let releaseStatus!: () => void;
+    session.getStatus.mockImplementationOnce(
+      async () =>
+        new Promise((resolve) => {
+          releaseStatus = () =>
+            resolve({
+              model: 'k2',
+              thinkingEffort: 'off',
+              permission: 'manual',
+              planMode: false,
+              contextTokens: 0,
+              maxContextTokens: 100,
+              contextUsage: 0,
+              busy: false,
+            });
+        }),
+    );
+
+    driver.onOpenSession('ses-attached');
+    await vi.waitFor(() => {
+      expect(driver.session?.id).toBe('ses-attached');
+    });
+
+    driver.handleUserInput('typed before the model synced');
+
+    // An empty model mid-switch means "not known yet", not "not configured":
+    // the message waits for the switch instead of being dropped with a login
+    // prompt the user has no reason to act on.
+    expect(showError).not.toHaveBeenCalled();
+    expect(driver.state.queuedMessages).toHaveLength(1);
+
+    releaseStatus();
+    await vi.waitFor(() => {
+      expect(session.prompt).toHaveBeenCalledWith('typed before the model synced');
+    });
+  });
+
+  it('attach to a session whose turn already ended before the listener registered self-heals via the post-subscribe recheck (F2b)', async () => {
+    const session = makeAttachSession('ses-attached');
+    // First call: syncRuntimeState's busy-seed, taken BEFORE the session's
+    // event listener is registered (startSubscription runs last in
+    // switchToSession) — reports busy, so the seed fires.
+    session.getStatus.mockResolvedValueOnce({
+      model: 'k2',
+      thinkingEffort: 'off',
+      permission: 'manual',
+      planMode: false,
+      contextTokens: 10,
+      maxContextTokens: 100,
+      contextUsage: 0.1,
+      busy: true,
+    });
+    // Second call: the F2b reconcile, taken AFTER the listener is live. The
+    // turn's own turn.started/thinking.delta/turn.ended all happened inside
+    // the pre-registration gap — receiveEvent() has no buffering, so this
+    // client never saw a single one of them (simulated here by delivering
+    // zero events on the listener). By the time the reconcile checks, the
+    // server correctly reports the turn is over.
+    session.getStatus.mockResolvedValue({
+      model: 'k2',
+      thinkingEffort: 'off',
+      permission: 'manual',
+      planMode: false,
+      contextTokens: 10,
+      maxContextTokens: 100,
+      contextUsage: 0.1,
+      busy: false,
+    });
+    let sessionEventListener: ((event: Event) => void) | undefined;
+    session.onEvent.mockImplementation((listener) => {
+      sessionEventListener = listener;
+      return () => {
+        sessionEventListener = undefined;
+      };
+    });
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(sessionEventListener).toBeDefined();
+
+    // No event ever arrives for this turn — it's entirely behind the
+    // pre-registration gap. Without the F2b recheck, nothing would ever flip
+    // the busy-seeded phase back to idle: assert it self-heals instead. (The
+    // seed and the recheck both resolve on already-settled mock promises, so
+    // asserting the intermediate 'waiting' state here would be a race
+    // against the recheck's own microtask — the meaningful, deterministic
+    // assertion is the settled end state.)
+    await vi.waitFor(() => {
+      expect(driver.state.appState.streamingPhase).toBe('idle');
+    });
+    expect(session.getStatus).toHaveBeenCalledTimes(2);
+    expect(
+      (
+        driver as unknown as { streamingUI: { hasActiveThinkingComponent(): boolean } }
+      ).streamingUI.hasActiveThinkingComponent(),
+    ).toBe(false);
+  });
+
+  it('attach to a session that is still busy on the post-subscribe recheck leaves the real turn.ended to finalize exactly once (F2b)', async () => {
+    const session = makeAttachSession('ses-attached');
+    session.getStatus.mockResolvedValue({
+      model: 'k2',
+      thinkingEffort: 'off',
+      permission: 'manual',
+      planMode: false,
+      contextTokens: 10,
+      maxContextTokens: 100,
+      contextUsage: 0.1,
+      // Busy on BOTH the pre-attach seed and the post-subscribe recheck —
+      // the turn is genuinely still running.
+      busy: true,
+    });
+    let sessionEventListener: ((event: Event) => void) | undefined;
+    session.onEvent.mockImplementation((listener) => {
+      sessionEventListener = listener;
+      return () => {
+        sessionEventListener = undefined;
+      };
+    });
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(driver.state.appState.streamingPhase).toBe('waiting');
+
+    // Give the post-subscribe recheck a turn to run and confirm it left the
+    // seeded phase alone (still busy, so it must not finalize speculatively).
+    await vi.waitFor(() => {
+      expect(session.getStatus).toHaveBeenCalledTimes(2);
+    });
+    expect(driver.state.appState.streamingPhase).toBe('waiting');
+
+    // The real turn now genuinely ends, through the listener the recheck
+    // correctly left untouched.
+    sessionEventListener?.({
+      type: 'turn.ended',
+      agentId: 'main',
+      sessionId: 'ses-attached',
+      turnId: 0,
+      reason: 'completed',
+    } as Event);
+
+    expect(driver.state.appState.streamingPhase).toBe('idle');
+  });
+
+  it('Ctrl+C while attached to an already-busy session cancels the turn — the same session.cancel() path the main chat surface uses (A3)', async () => {
+    // Attach to a session that is ALREADY busy server-side. Ctrl+C's
+    // cancel-vs-arm-exit decision (editor-keyboard.ts's onCtrlC) reads
+    // `appState.streamingPhase` — the same field the busy-seed test above
+    // (R9 I1) proves gets seeded to 'waiting' from the real status on
+    // attach. Assert on the call, not on rendering: this is what actually
+    // reaches the server (Session.cancel() -> rpc.cancel() -> wire
+    // transport's `:abort`), regardless of how the transcript repaints.
+    const session = makeAttachSession('ses-attached');
+    session.getStatus.mockResolvedValue({
+      model: 'k2',
+      thinkingEffort: 'off',
+      permission: 'manual',
+      planMode: false,
+      contextTokens: 10,
+      maxContextTokens: 100,
+      contextUsage: 0.1,
+      busy: true,
+    });
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(driver.state.appState.streamingPhase).toBe('waiting');
+
+    driver.state.editor.onCtrlC?.();
+
+    expect(session.cancel).toHaveBeenCalled();
+  });
+
+  it('Ctrl+C while attached and a turn starts live (not busy at attach time) also cancels it (A3)', async () => {
+    const session = makeAttachSession('ses-attached');
+    session.getStatus.mockResolvedValue({
+      model: 'k2',
+      thinkingEffort: 'off',
+      permission: 'manual',
+      planMode: false,
+      contextTokens: 10,
+      maxContextTokens: 100,
+      contextUsage: 0.1,
+      busy: false,
+    });
+    let sessionEventListener: ((event: Event) => void) | undefined;
+    session.onEvent.mockImplementation((listener: (event: Event) => void) => {
+      sessionEventListener = listener;
+      return () => {
+        sessionEventListener = undefined;
+      };
+    });
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(driver.state.appState.streamingPhase).toBe('idle');
+
+    sessionEventListener?.({
+      type: 'turn.started',
+      agentId: 'main',
+      sessionId: 'ses-attached',
+      turnId: 1,
+    } as Event);
+    sessionEventListener?.({
+      type: 'assistant.delta',
+      agentId: 'main',
+      sessionId: 'ses-attached',
+      turnId: 1,
+      delta: 'hello',
+    } as Event);
+
+    expect(driver.state.appState.streamingPhase).not.toBe('idle');
+
+    driver.state.editor.onCtrlC?.();
+
+    expect(session.cancel).toHaveBeenCalled();
+  });
+
+  it('Ctrl+C while attached and idle does NOT cancel — it arms the same double-press exit hint the main chat surface uses (A3)', async () => {
+    // Required behavior #2: idle Ctrl+C must match the main chat surface,
+    // not the roster's own arm/confirm (that's a separate mechanism gated
+    // on `state.agentsView`, untouched here — see the roster-level Ctrl+C
+    // tests). A single idle Ctrl+C must not call session.cancel(); it
+    // arms `armPendingExit('ctrl-c', ...)`, requiring a second press
+    // within the window to quit.
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+    const stop = vi.spyOn(driver, 'stop').mockResolvedValue(undefined);
+
+    driver.onOpenSession('ses-attached');
+
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(driver.state.appState.streamingPhase).toBe('idle');
+
+    driver.state.editor.onCtrlC?.();
+
+    expect(session.cancel).not.toHaveBeenCalled();
+    expect(stop).not.toHaveBeenCalled();
+
+    // Second press within the window behaves exactly like main chat: quits.
+    driver.state.editor.onCtrlC?.();
+    expect(stop).toHaveBeenCalled();
+  });
+
+  it('a second turn.started with no intervening turn.ended finalizes the previous turn instead of concatenating its text into the new one (adjacent fix)', async () => {
+    const session = makeAttachSession('ses-attached');
+    session.getStatus.mockResolvedValue({
+      model: 'k2',
+      thinkingEffort: 'off',
+      permission: 'manual',
+      planMode: false,
+      contextTokens: 10,
+      maxContextTokens: 100,
+      contextUsage: 0.1,
+      busy: true,
+    });
+    let sessionEventListener: ((event: Event) => void) | undefined;
+    session.onEvent.mockImplementation((listener) => {
+      sessionEventListener = listener;
+      return () => {
+        sessionEventListener = undefined;
+      };
+    });
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+
+    driver.onOpenSession('ses-attached');
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(sessionEventListener).toBeDefined();
+
+    const streamingUI = (
+      driver as unknown as {
+        streamingUI: { flushNow(): void; hasActiveThinkingComponent(): boolean };
+      }
+    ).streamingUI;
+
+    // Turn A starts and produces real thinking content — mounts a live
+    // spinner — but never receives its own turn.ended.
+    sessionEventListener?.({
+      type: 'turn.started',
+      agentId: 'main',
+      sessionId: 'ses-attached',
+      turnId: 100,
+    } as Event);
+    sessionEventListener?.({
+      type: 'thinking.delta',
+      agentId: 'main',
+      sessionId: 'ses-attached',
+      turnId: 100,
+      delta: 'turn A reasoning',
+    } as Event);
+    streamingUI.flushNow();
+
+    // Turn B starts — a different turnId, no turn.ended(100) in between.
+    sessionEventListener?.({
+      type: 'turn.started',
+      agentId: 'main',
+      sessionId: 'ses-attached',
+      turnId: 101,
+    } as Event);
+
+    // Without the fix, turn A's thinking component is still live here and
+    // turn B's own delta would concatenate onto it instead of starting fresh.
+    const finalizedAfterTurnB = driver.state.transcriptContainer.children.filter(
+      (c) => c.constructor.name === 'ThinkingComponent' && (c as unknown as { mode: string }).mode === 'finalized',
+    );
+    expect(finalizedAfterTurnB).toHaveLength(1);
+    expect((finalizedAfterTurnB[0] as unknown as { text: string }).text).toBe('turn A reasoning');
+
+    sessionEventListener?.({
+      type: 'thinking.delta',
+      agentId: 'main',
+      sessionId: 'ses-attached',
+      turnId: 101,
+      delta: 'turn B reasoning',
+    } as Event);
+    streamingUI.flushNow();
+    sessionEventListener?.({
+      type: 'assistant.delta',
+      agentId: 'main',
+      sessionId: 'ses-attached',
+      turnId: 101,
+      delta: 'ok',
+    } as Event);
+    streamingUI.flushNow();
+    sessionEventListener?.({
+      type: 'turn.ended',
+      agentId: 'main',
+      sessionId: 'ses-attached',
+      turnId: 101,
+      reason: 'completed',
+    } as Event);
+
+    const allThinkingComponents = driver.state.transcriptContainer.children.filter(
+      (c) => c.constructor.name === 'ThinkingComponent',
+    );
+    expect(allThinkingComponents).toHaveLength(2);
+    expect(allThinkingComponents.map((c) => (c as unknown as { text: string }).text)).toEqual([
+      'turn A reasoning',
+      'turn B reasoning',
+    ]);
+    expect(streamingUI.hasActiveThinkingComponent()).toBe(false);
+  });
+
+  it('attach with a pending roster reply to the same row awaits its settlement before resuming, then renders the reply bubble (R9 Q1a)', async () => {
+    const session = makeAttachSession('ses-attached');
+    session.getResumeState.mockReturnValue(
+      createResumeState({
+        replay: [
+          {
+            time: Date.now(),
+            type: 'message',
+            message: {
+              role: 'user',
+              content: [{ type: 'text', text: 'reply from roster' }],
+              toolCalls: [],
+            },
+          },
+        ],
+      }),
+    );
+    const { harness, wirePrompt } = makeAgentsHarness(session, { withWireReply: true });
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+
+    let resolvePrompt: (() => void) | undefined;
+    wirePrompt!.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolvePrompt = resolve;
+        }),
+    );
+
+    vi.useFakeTimers();
+    try {
+      const component = driver.state.agentsView!.component;
+      component.handleInput('[B'); // down: select the only row
+      component.handleInput(' '); // space: enter reply mode
+      driver.state.agentsView!.dispatch.editor.onSubmit?.('reply from roster');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(driver.state.agentsView?.pendingReplyIds.has('ses-attached')).toBe(true);
+
+      // Enter attaches immediately, before the reply RPC has settled — this
+      // must not race ahead of the reply's own durability.
+      driver.onOpenSession('ses-attached');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.resumeSession).not.toHaveBeenCalled();
+
+      resolvePrompt?.();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(harness.resumeSession).toHaveBeenCalledWith({
+        id: 'ses-attached',
+        replayTurnLimit: REPLAY_TURN_LIMIT,
+      });
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+      // The reply's own bubble is present on the FIRST hydrate pass — no
+      // second attach needed to see it.
+      expect(
+        driver.state.transcriptEntries.some(
+          (entry) => entry.kind === 'user' && entry.content === 'reply from roster',
+        ),
+      ).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('normal mode keeps the streaming switch guard', async () => {
+    const session = makeSession();
+    const harness = makeHarness(session);
+    const driver = makeDriver(harness, makeStartupInput()) as unknown as AttachDriver;
+    await driver.init();
+    driver.state.appState.streamingPhase = 'waiting';
+    const showError = vi.spyOn(driver, 'showError').mockImplementation(() => {});
+
+    await expect(driver.resumeSession('ses-other')).resolves.toBe(false);
+
+    expect(showError).toHaveBeenCalledWith(
+      'Cannot switch sessions while streaming — press Esc or Ctrl-C first.',
+    );
+    expect(harness.resumeSession).not.toHaveBeenCalled();
+    expect(driver.state.appState.sessionId).toBe('ses-1');
+  });
+
+  // ── ← return-to-view + attach footer badge ──
+
+  it('returnToAgentsView remounts the view over the live roster and clears the badge', async () => {
+    const session = makeAttachSession('ses-attached');
+    const { harness, emit } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+    driver.onOpenSession('ses-attached');
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    const view = driver.state.agentsView;
+    expect(view?.detached).toBe(true);
+
+    // The attached session's own work never enters the COUNTED segments —
+    // it is on screen, not "other agents" news. I4: the badge itself is
+    // still showing at this point — its standing return-to-agents hint is
+    // unconditional on being attached from the roster, regardless of any
+    // other session's counts.
+    emit({
+      type: 'event.session.work_changed',
+      sessionId: 'ses-attached',
+      busy: true,
+      pending_interaction: 'none',
+    } as Event);
+    expect(driver.state.footer.render(120)[0]).toContain('[← to return to agents]');
+
+    // Another VIEW-OWNED session working DOES reach the badge while attached.
+    // (A session created by another client is not in the registry — its
+    // created event is gated out and never moves the badge.)
+    emit({
+      type: 'event.session.created',
+      session: {
+        id: 'ses-other',
+        title: 'other title',
+        metadata: { cwd: '/tmp/proj-b' },
+        updated_at: new Date(2_000).toISOString(),
+        busy: true,
+        pending_interaction: 'none',
+      },
+    } as Event);
+    expect(driver.state.footer.render(120)[0]).toContain('[← to return to agents · 1 working]');
+
+    expect(driver.returnToAgentsView()).toBe(true);
+
+    // Same component remounted, roster state survived, badge cleared.
+    expect(view?.detached).toBe(false);
+    expect(driver.state.ui.children).toContain(view?.component);
+    expect(view?.roster.counts().working).toBe(2);
+    expect(driver.state.footer.render(120)[0]).not.toContain('←');
+  });
+
+  it('returnToAgentsView is a no-op outside attach (view mounted or normal mode)', async () => {
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+
+    // View mounted (not attached): the key must fall through.
+    expect(driver.returnToAgentsView()).toBe(false);
+    expect(driver.state.agentsView?.detached).toBe(false);
+
+    // Normal mode: zero behavior change.
+    const plainSession = makeSession();
+    const plainDriver = makeDriver(makeHarness(plainSession), makeStartupInput()) as unknown as AttachDriver;
+    await plainDriver.init();
+    expect(plainDriver.returnToAgentsView()).toBe(false);
+  });
+
+  // ── R4 parity: ← return sets the origin row ("session you came from") ──
+
+  it('returnToAgentsView passes the just-left session as the origin', async () => {
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+    driver.onOpenSession('ses-attached');
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+    expect(driver.state.agentsView?.originSessionId).toBeUndefined();
+
+    expect(driver.returnToAgentsView()).toBe(true);
+
+    await vi.waitFor(() => {
+      expect(driver.state.agentsView?.detached).toBe(false);
+    });
+    expect(driver.state.agentsView?.originSessionId).toBe('ses-attached');
+  });
+
+  it('cold open (never attached) has no origin', async () => {
+    const session = makeAttachSession('ses-attached');
+    const { harness } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    expect(driver.state.agentsView?.originSessionId).toBeUndefined();
+  });
+
+  it('seeds the badge excluding the session being attached (already-awaiting attach)', async () => {
+    // Regression (review round 2): the seed runs before switchToSession sets
+    // appState.sessionId, so it must exclude the TARGET id — an attach target
+    // that already awaits input must not appear in its own badge.
+    const session = makeAttachSession('ses-attached');
+    const { harness, emit } = makeAgentsHarness(session);
+    const driver = await bootAgentsView(harness);
+    vi.spyOn(driver, 'showStatus').mockImplementation(() => {});
+    emit({
+      type: 'event.session.work_changed',
+      sessionId: 'ses-attached',
+      busy: false,
+      pending_interaction: 'approval',
+    } as Event);
+
+    driver.onOpenSession('ses-attached');
+    await vi.waitFor(() => {
+      expect(driver.state.appState.sessionId).toBe('ses-attached');
+    });
+
+    // I4: the standing return-to-agents hint still shows (attached from the
+    // roster) — the regression this test actually guards is that the
+    // attaching session's own awaiting-approval status never becomes a
+    // COUNTED "awaiting input" segment about itself.
+    const line1 = driver.state.footer.render(120)[0];
+    expect(line1).toContain('[← to return to agents]');
+    expect(line1).not.toContain('awaiting input');
+  });
+});
+
 function uiContainsFooter(driver: StartupDriver): boolean {
   const target: unknown = driver.state.footer;
   const visit = (node: unknown): boolean => {
@@ -1830,3 +3608,417 @@ function uiContainsFooter(driver: StartupDriver): boolean {
   };
   return visit(driver.state.ui);
 }
+
+// ── Agents-view dispatch skill-menu warm-up (R6 review fix) ──
+//
+// The dispatch composer's skill menu is normally sourced from
+// `skillCommands`, populated only once a session has attached this run
+// (`refreshSkillCommands(session)`). `warmAgentsViewSkillMenu` closes that
+// gap via `KimiHarness.listWorkspaceSkills` — the one session-independent
+// skill route the SDK has — so the menu offers skills on a completely cold
+// `kimi agents` launch too. These drive the real `KimiTUI`, not a fake
+// `AgentsViewHost`, to prove the actual wiring (not just the contract).
+
+describe('KimiTUI agents-view dispatch skill warm-up', () => {
+  interface WarmDriver extends StartupDriver {
+    agentsViewController: { show(): Promise<void> };
+    session: { id: string } | undefined;
+  }
+
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  function skillSummary(name: string): SkillSummary {
+    return {
+      name,
+      description: `${name} description`,
+      path: `/tmp/proj-a/.kimi/skills/${name}/SKILL.md`,
+      source: 'project',
+    };
+  }
+
+  async function bootColdAgentsView(listWorkspaceSkills: ReturnType<typeof vi.fn>): Promise<WarmDriver> {
+    const homeDir = mkdtempSync(join(tmpdir(), 'kimi-agents-warm-'));
+    dirs.push(homeDir);
+    // Empty view registry: a cold `kimi agents` launch has never dispatched
+    // or attached to anything yet.
+    writeFileSync(join(homeDir, 'agents-view.json'), JSON.stringify({ pins: [], sessions: [] }));
+    const harness = makeHarness(makeSession(), {
+      homeDir,
+      listSessions: vi.fn(async () => []),
+      listWorkspaceSkills,
+      onEvent: () => () => {},
+    });
+    const driver = makeDriver(harness, {
+      ...makeStartupInput(),
+      startupAgentsView: true,
+    }) as unknown as WarmDriver;
+    await driver.init();
+    expect(driver.state.startupState).toBe('agents-view');
+    await driver.agentsViewController.show();
+    expect(driver.state.agentsView).toBeDefined();
+    return driver;
+  }
+
+  async function slashMenuItems(driver: StartupDriver): Promise<string[]> {
+    const provider = (
+      driver.state.agentsView?.dispatch.editor as unknown as
+        | {
+            autocompleteProvider: {
+              getSuggestions(
+                lines: string[],
+                cursorLine: number,
+                cursorCol: number,
+                options: { signal: AbortSignal },
+              ): Promise<{ items: { value: string }[] } | null>;
+            };
+          }
+        | undefined
+    )?.autocompleteProvider;
+    if (provider === undefined) return [];
+    const suggestions = await provider.getSuggestions(['/'], 0, 1, { signal: new AbortController().signal });
+    return suggestions?.items.map((item) => item.value).toSorted() ?? [];
+  }
+
+  it('warms the dispatch composer skill menu via listWorkspaceSkills before any session attaches', async () => {
+    const listWorkspaceSkills = vi.fn(async () => [skillSummary('reviewcode')]);
+    const driver = await bootColdAgentsView(listWorkspaceSkills);
+
+    await vi.waitFor(async () => {
+      expect(await slashMenuItems(driver)).toContain('skill:reviewcode');
+    });
+
+    expect(listWorkspaceSkills).toHaveBeenCalledWith('/tmp/proj-a');
+    // The menu populated without ever creating or attaching a session —
+    // the whole point of a session-independent warm route.
+    expect(driver.session).toBeUndefined();
+  });
+
+  // R9 Q4b: the R6 warm-up above always mocked `listWorkspaceSkills`
+  // itself — a mock of a method whose real wire-transport implementation
+  // didn't exist would always pass, which is exactly how the wire override
+  // stayed broken through R6. This drives the SAME warm path with a REAL
+  // `SDKRpcClientWire`/`WireHttpClient` pair: `listWorkspaceSkills` is not
+  // mocked, only `fetch` is (the HTTP/route layer), so the transport
+  // override added for R9 is genuinely exercised end-to-end.
+  it('warms the dispatch composer skill menu through the REAL wire transport — listWorkspaceSkills itself is not mocked, only fetch is', async () => {
+    const base = 'http://127.0.0.1:58627';
+    const wireHomeDir = mkdtempSync(join(tmpdir(), 'kimi-wire-skills-home-'));
+    dirs.push(wireHomeDir);
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token: 'test-token', homeDir: wireHomeDir });
+
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      const method = init?.method ?? 'GET';
+      if (url === `${base}/api/v1/workspaces` && method === 'POST') {
+        return new Response(
+          JSON.stringify({
+            code: 0,
+            msg: 'ok',
+            data: {
+              id: 'ws_warm_1',
+              root: '/tmp/proj-a',
+              name: 'proj-a',
+              created_at: new Date().toISOString(),
+              last_opened_at: new Date().toISOString(),
+              session_count: 0,
+            },
+            request_id: 'r1',
+          }),
+          { status: 200 },
+        );
+      }
+      if (url === `${base}/api/v1/workspaces/ws_warm_1/skills` && method === 'GET') {
+        return new Response(
+          JSON.stringify({
+            code: 0,
+            msg: 'ok',
+            data: {
+              skills: [
+                {
+                  name: 'reviewcode',
+                  description: 'review code',
+                  path: '/tmp/proj-a/.kimi/skills/reviewcode/SKILL.md',
+                  source: 'project',
+                },
+              ],
+            },
+            request_id: 'r2',
+          }),
+          { status: 200 },
+        );
+      }
+      throw new Error(`unexpected fetch: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    try {
+      // The exact one-line delegation `KimiHarness.listWorkspaceSkills` does
+      // in production (`return this.rpc.listWorkspaceSkills(workDir)`): the
+      // point of this test is that SDKRpcClientWire's own method — and
+      // WireHttpClient underneath it — run for real, unmocked.
+      const listWorkspaceSkills = vi.fn((workDir: string) => rpc.listWorkspaceSkills(workDir));
+      const driver = await bootColdAgentsView(listWorkspaceSkills);
+
+      await vi.waitFor(async () => {
+        expect(await slashMenuItems(driver)).toContain('skill:reviewcode');
+      });
+
+      // Both real HTTP calls fired, in order — the workspace registration
+      // (workDir → workspace_id) THEN the read — proving the resolution
+      // step actually happened rather than a direct pass-through that would
+      // 404 against the real server.
+      expect(fetchMock).toHaveBeenCalledWith(
+        `${base}/api/v1/workspaces`,
+        expect.objectContaining({ method: 'POST' }),
+      );
+      expect(fetchMock).toHaveBeenCalledWith(
+        `${base}/api/v1/workspaces/ws_warm_1/skills`,
+        expect.objectContaining({ method: 'GET' }),
+      );
+    } finally {
+      vi.stubGlobal('fetch', originalFetch);
+    }
+  });
+
+  it('leaves the plugin section empty pre-attach — the skill warm never touches plugin state', async () => {
+    const listWorkspaceSkills = vi.fn(async () => [skillSummary('reviewcode')]);
+    const driver = await bootColdAgentsView(listWorkspaceSkills);
+
+    await vi.waitFor(async () => {
+      expect(await slashMenuItems(driver)).toContain('skill:reviewcode');
+    });
+
+    const names = await slashMenuItems(driver);
+    expect(names.some((name) => name.includes(':') && !name.startsWith('skill:'))).toBe(false);
+  });
+});
+
+// ── Agents-view exit confirmation (embedded server) ──
+
+describe('KimiTUI agents-view exit confirmation', () => {
+  interface ExitConfirmDriver extends StartupDriver {
+    setAgentsView(value: unknown): void;
+    agentsViewController: { show(): Promise<void>; close(): void };
+    onExit?: (code?: number) => Promise<void>;
+  }
+
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  function makeExitHarness() {
+    const homeDir = mkdtempSync(join(tmpdir(), 'kimi-agents-exit-'));
+    dirs.push(homeDir);
+    return makeHarness(makeSession(), {
+      homeDir,
+      onEvent: () => () => {},
+    });
+  }
+
+  function findConfirm(driver: StartupDriver): AgentsExitConfirmComponent | undefined {
+    return driver.state.ui.children.find(
+      (child): child is AgentsExitConfirmComponent =>
+        child instanceof AgentsExitConfirmComponent,
+    );
+  }
+
+  /** Boots into the agents view with the stop()-shutdown I/O stubbed. */
+  async function bootAgentsView(guard: (() => Promise<number>) | undefined) {
+    const harness = makeExitHarness();
+    const driver = makeDriver(harness, {
+      ...makeStartupInput(),
+      startupAgentsView: true,
+      agentsViewExitGuard: guard,
+    }) as unknown as ExitConfirmDriver;
+    await driver.init();
+    expect(driver.state.startupState).toBe('agents-view');
+    // pi-tui stop/drain touch the real TTY — stub the shutdown I/O.
+    vi.spyOn(driver.state.ui, 'stop').mockImplementation(() => {});
+    vi.spyOn(driver.state.terminal, 'drainInput').mockImplementation(async () => {});
+    driver.onExit = vi.fn(async () => {});
+    await driver.agentsViewController.show();
+    expect(driver.state.agentsView).toBeDefined();
+    return { harness, driver };
+  }
+
+  it('embedded + running sessions: y confirms the interruption and shutdown proceeds', async () => {
+    const guard = vi.fn(async () => 3);
+    const { harness, driver } = await bootAgentsView(guard);
+
+    const stopPromise = driver.stop(0);
+    await vi.waitFor(() => {
+      expect(findConfirm(driver)).toBeDefined();
+    });
+
+    findConfirm(driver)?.handleInput('y');
+    await stopPromise;
+
+    expect(guard).toHaveBeenCalledOnce();
+    expect(harness.close).toHaveBeenCalledOnce();
+    expect(driver.onExit).toHaveBeenCalledWith(0);
+  });
+
+  it('declining keeps the TUI alive and the view mounted; a later stop re-asks', async () => {
+    const guard = vi.fn(async () => 2);
+    const { harness, driver } = await bootAgentsView(guard);
+    const view = driver.state.agentsView;
+    // Spied after the boot mount: a decline must not rebuild anything.
+    const show = vi.spyOn(driver.agentsViewController, 'show');
+
+    const first = driver.stop(0);
+    await vi.waitFor(() => {
+      expect(findConfirm(driver)).toBeDefined();
+    });
+    findConfirm(driver)?.handleInput('n');
+    await first;
+
+    expect(harness.close).not.toHaveBeenCalled();
+    expect(driver.onExit).not.toHaveBeenCalled();
+    expect(driver.state.agentsView).toBe(view);
+    expect(driver.state.ui.children).toContain(view?.component);
+    expect(view?.component.focused).toBe(true);
+    expect(show).not.toHaveBeenCalled();
+
+    // Fully reversible: quitting again re-asks from scratch.
+    const second = driver.stop(0);
+    await vi.waitFor(() => {
+      expect(findConfirm(driver)).toBeDefined();
+    });
+    findConfirm(driver)?.handleInput('y');
+    await second;
+    expect(harness.close).toHaveBeenCalledOnce();
+    expect(driver.onExit).toHaveBeenCalledWith(0);
+  });
+
+  it('declining on the Esc/q quit path (view already closed) rebuilds the view', async () => {
+    const guard = vi.fn(async () => 1);
+    const { harness, driver } = await bootAgentsView(guard);
+    const show = vi.spyOn(driver.agentsViewController, 'show');
+
+    // The production quit path: controller.close() → setAgentsView(undefined)
+    // → stop(). The confirm must gate BEFORE the shutdown sequence, and a
+    // decline puts the user back in the view.
+    driver.agentsViewController.close();
+    await vi.waitFor(() => {
+      expect(findConfirm(driver)).toBeDefined();
+    });
+    expect(driver.state.agentsView).toBeUndefined();
+
+    findConfirm(driver)?.handleInput('n');
+
+    await vi.waitFor(() => {
+      expect(driver.state.agentsView).toBeDefined();
+    });
+    expect(show).toHaveBeenCalledOnce();
+    expect(harness.close).not.toHaveBeenCalled();
+    expect(driver.onExit).not.toHaveBeenCalled();
+  });
+
+  it('embedded + no running sessions: no dialog, shutdown proceeds', async () => {
+    const guard = vi.fn(async () => 0);
+    const { harness, driver } = await bootAgentsView(guard);
+
+    // A mounted dialog would await key input forever — resolving proves none.
+    await driver.stop(0);
+
+    expect(guard).toHaveBeenCalledOnce();
+    expect(findConfirm(driver)).toBeUndefined();
+    expect(harness.close).toHaveBeenCalledOnce();
+    expect(driver.onExit).toHaveBeenCalledWith(0);
+  });
+
+  it('attached mode wires no exit guard: no dialog, sessions keep running server-side', async () => {
+    const { harness, driver } = await bootAgentsView(undefined);
+
+    await driver.stop(0);
+
+    expect(findConfirm(driver)).toBeUndefined();
+    expect(harness.close).toHaveBeenCalledOnce();
+    expect(driver.onExit).toHaveBeenCalledWith(0);
+  });
+
+  it('signal-driven stop (SIGTERM, exit 143) skips the dialog and shuts down straight away', async () => {
+    // Folded review item: there is no user to answer an interactive confirm
+    // on the signal path — stop(143) must not mount one, and the graceful
+    // shutdown below settles sessions (state is on disk). User quit in the
+    // same state (stop(0) above) still shows the dialog.
+    const guard = vi.fn(async () => 3);
+    const { harness, driver } = await bootAgentsView(guard);
+
+    // A mounted dialog would await key input forever — resolving proves none.
+    await driver.stop(143);
+
+    expect(guard).not.toHaveBeenCalled();
+    expect(findConfirm(driver)).toBeUndefined();
+    expect(harness.close).toHaveBeenCalledOnce();
+    expect(driver.onExit).toHaveBeenCalledWith(143);
+  });
+
+  it('a failed session count never traps the user — shutdown proceeds without the dialog', async () => {
+    const guard = vi.fn(async (): Promise<number> => {
+      throw new Error('server unreachable');
+    });
+    const { harness, driver } = await bootAgentsView(guard);
+
+    await driver.stop(0);
+
+    expect(harness.close).toHaveBeenCalledOnce();
+    expect(driver.onExit).toHaveBeenCalledWith(0);
+  });
+
+  it('normal mode never consults the guard, even if one was wired', async () => {
+    const guard = vi.fn(async () => 5);
+    const harness = makeHarness(makeSession());
+    const driver = makeDriver(harness, {
+      ...makeStartupInput(),
+      agentsViewExitGuard: guard,
+    }) as unknown as ExitConfirmDriver;
+    await driver.init();
+    expect(driver.state.startupState).toBe('ready');
+    vi.spyOn(driver.state.ui, 'stop').mockImplementation(() => {});
+    vi.spyOn(driver.state.terminal, 'drainInput').mockImplementation(async () => {});
+    driver.onExit = vi.fn(async () => {});
+
+    await driver.stop(0);
+
+    expect(guard).not.toHaveBeenCalled();
+    expect(harness.close).toHaveBeenCalledOnce();
+    expect(driver.onExit).toHaveBeenCalledWith(0);
+  });
+});
+
+describe('KimiTUI agents-view slash-command palette', () => {
+  interface PaletteDriver extends StartupDriver {
+    getSlashCommands(): readonly { readonly name: string }[];
+  }
+
+  // Kept in step with `unavailableInAgentsView` in the builtin registry.
+  const UNAVAILABLE = ['plugins', 'add-dir', 'experiments', 'reload'];
+
+  async function paletteNames(startupAgentsView: boolean): Promise<string[]> {
+    const driver = makeDriver(makeHarness(), {
+      ...makeStartupInput(),
+      startupAgentsView,
+    }) as unknown as PaletteDriver;
+    await driver.init();
+    expect(driver.state.startupState).toBe(startupAgentsView ? 'agents-view' : 'ready');
+    return driver.getSlashCommands().map((command) => command.name);
+  }
+
+  it('hides the commands the wire transport cannot serve', async () => {
+    const names = await paletteNames(true);
+    for (const name of UNAVAILABLE) expect(names).not.toContain(name);
+    // A neighbour that stays: proves the filter is selective, not empty.
+    expect(names).toContain('reload-tui');
+  });
+
+  it('offers all of them in a normal session', async () => {
+    const names = await paletteNames(false);
+    for (const name of UNAVAILABLE) expect(names).toContain(name);
+  });
+});

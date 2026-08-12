@@ -1,0 +1,1845 @@
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { AGENT_WIRE_PROTOCOL_VERSION, ErrorCodes } from '@moonshot-ai/agent-core';
+import {
+  IAgentLifecycleService,
+  IAgentPermissionModeService,
+  IAgentProfileService,
+  ISessionMetadata,
+  getLiveSessionById,
+} from '@moonshot-ai/agent-core-v2';
+import {
+  startServer,
+  type RunningServer,
+  type ServerHostIdentity,
+} from '@moonshot-ai/kap-server';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+
+import { createKimiHarnessWire } from '#/index';
+import { WireHttpClient, type WirePromptSubmission } from '#/wire/http-client';
+import type {
+  WireApprovalRequest,
+  WireMessage,
+  WireQuestionRequest,
+  WireSessionStatus,
+  WireTask,
+} from '#/wire/protocol';
+import { collectReplayMessages } from '#/wire/resume-replay';
+import { InteractionBridge } from '#/wire/reverse-rpc';
+import { SDKRpcClientWire, toWireContent } from '#/wire/sdk-rpc-client-wire';
+
+import { TEST_IDENTITY } from './test-identity';
+
+// ---------------------------------------------------------------------------
+// InteractionBridge — stub-based (no live server). The stub implements the
+// WireHttpClient resolve/answer/dismiss subset and records every call.
+// ---------------------------------------------------------------------------
+
+interface StubCall {
+  readonly method: 'resolveApproval' | 'answerQuestion' | 'dismissQuestion';
+  readonly args: unknown[];
+}
+
+function createStubHttp() {
+  const calls: StubCall[] = [];
+  return {
+    calls,
+    resolveApproval: async (...args: unknown[]) => {
+      calls.push({ method: 'resolveApproval', args });
+    },
+    answerQuestion: async (...args: unknown[]) => {
+      calls.push({ method: 'answerQuestion', args });
+    },
+    dismissQuestion: async (...args: unknown[]) => {
+      calls.push({ method: 'dismissQuestion', args });
+    },
+  };
+}
+
+/** The bridge resolves fire-and-forget; microtasks all settle before this. */
+const flush = () => new Promise((r) => setImmediate(r));
+
+const APPROVAL_WIRE = {
+  approval_id: 'a1',
+  session_id: 's1',
+  turn_id: 3,
+  tool_call_id: 'tc1',
+  tool_name: 'Bash',
+  action: 'run command',
+  tool_input_display: { command: 'ls' },
+  created_at: '2026-07-30T00:00:00.000Z',
+  expires_at: '2026-07-30T01:00:00.000Z',
+} satisfies WireApprovalRequest;
+
+const QUESTION_WIRE = {
+  question_id: 'q1',
+  session_id: 's1',
+  turn_id: 4,
+  tool_call_id: 'tc2',
+  questions: [
+    {
+      id: 'q_0',
+      question: 'Pick one',
+      options: [
+        { id: 'opt_0_0', label: 'Yes' },
+        { id: 'opt_0_1', label: 'No' },
+      ],
+      allow_other: true,
+    },
+    {
+      id: 'q_1',
+      question: 'Pick many',
+      multi_select: true,
+      options: [
+        { id: 'opt_1_0', label: 'A' },
+        { id: 'opt_1_1', label: 'B' },
+        { id: 'opt_1_2', label: 'C' },
+      ],
+      allow_other: true,
+    },
+  ],
+  created_at: '2026-07-30T00:00:00.000Z',
+} satisfies WireQuestionRequest;
+
+describe('InteractionBridge', () => {
+  it('routes approval.requested to the handler and POSTs the decision', async () => {
+    const http = createStubHttp();
+    const handled: unknown[] = [];
+    const bridge = new InteractionBridge({
+      http,
+      requestApproval: async (req) => {
+        handled.push(req);
+        return { decision: 'approved', scope: 'session' };
+      },
+      requestQuestion: async () => null,
+      hasApprovalHandler: () => true,
+      hasQuestionHandler: () => true,
+    });
+    bridge.handleEvent({
+      type: 'event.approval.requested',
+      ...APPROVAL_WIRE,
+      agentId: 'main',
+      sessionId: 's1',
+    });
+    await flush();
+    expect(handled).toEqual([
+      {
+        turnId: 3,
+        toolCallId: 'tc1',
+        toolName: 'Bash',
+        action: 'run command',
+        display: { command: 'ls' },
+        sessionId: 's1',
+        agentId: 'main',
+      },
+    ]);
+    expect(http.calls).toEqual([
+      {
+        method: 'resolveApproval',
+        args: ['s1', 'a1', { decision: 'approved', scope: 'session' }],
+      },
+    ]);
+  });
+
+  it('maps the approval response back to the wire shape', async () => {
+    const http = createStubHttp();
+    const bridge = new InteractionBridge({
+      http,
+      requestApproval: async () => ({
+        decision: 'rejected',
+        feedback: 'too dangerous',
+        selectedLabel: 'No, and explain',
+      }),
+      requestQuestion: async () => null,
+      hasApprovalHandler: () => true,
+      hasQuestionHandler: () => true,
+    });
+    bridge.handleEvent({ type: 'event.approval.requested', ...APPROVAL_WIRE });
+    await flush();
+    expect(http.calls[0]?.args[2]).toEqual({
+      decision: 'rejected',
+      scope: undefined,
+      feedback: 'too dangerous',
+      selected_label: 'No, and explain',
+    });
+  });
+
+  it('routes question.requested and converts option labels back to wire ids', async () => {
+    const http = createStubHttp();
+    const handled: unknown[] = [];
+    const bridge = new InteractionBridge({
+      http,
+      requestApproval: async () => ({ decision: 'cancelled' }),
+      requestQuestion: async (req) => {
+        handled.push(req);
+        return { 'Pick one': 'Yes', 'Pick many': 'A, B' };
+      },
+      hasApprovalHandler: () => true,
+      hasQuestionHandler: () => true,
+    });
+    bridge.handleEvent({ type: 'event.question.requested', ...QUESTION_WIRE, sessionId: 's1' });
+    await flush();
+    expect(handled).toEqual([
+      {
+        turnId: 4,
+        toolCallId: 'tc2',
+        questions: [
+          {
+            question: 'Pick one',
+            header: undefined,
+            body: undefined,
+            options: [
+              { label: 'Yes', description: undefined },
+              { label: 'No', description: undefined },
+            ],
+            multiSelect: undefined,
+            otherLabel: undefined,
+            otherDescription: undefined,
+          },
+          {
+            question: 'Pick many',
+            header: undefined,
+            body: undefined,
+            options: [
+              { label: 'A', description: undefined },
+              { label: 'B', description: undefined },
+              { label: 'C', description: undefined },
+            ],
+            multiSelect: true,
+            otherLabel: undefined,
+            otherDescription: undefined,
+          },
+        ],
+        sessionId: 's1',
+        agentId: 'main',
+      },
+    ]);
+    expect(http.calls).toEqual([
+      {
+        method: 'answerQuestion',
+        args: [
+          's1',
+          'q1',
+          {
+            answers: {
+              q_0: { kind: 'single', option_id: 'opt_0_0' },
+              q_1: { kind: 'multi', option_ids: ['opt_1_0', 'opt_1_1'] },
+            },
+            method: undefined,
+          },
+        ],
+      },
+    ]);
+  });
+
+  it('sends free-form answers as kind other and forwards the response method', async () => {
+    const http = createStubHttp();
+    const bridge = new InteractionBridge({
+      http,
+      requestApproval: async () => ({ decision: 'cancelled' }),
+      requestQuestion: async () => ({
+        answers: { 'Pick one': 'something else' },
+        method: 'enter',
+      }),
+      hasApprovalHandler: () => true,
+      hasQuestionHandler: () => true,
+    });
+    bridge.handleEvent({ type: 'event.question.requested', ...QUESTION_WIRE });
+    await flush();
+    expect(http.calls).toEqual([
+      {
+        method: 'answerQuestion',
+        args: [
+          's1',
+          'q1',
+          {
+            answers: { q_0: { kind: 'other', text: 'something else' } },
+            method: 'enter',
+          },
+        ],
+      },
+    ]);
+  });
+
+  it('dismisses the question when the handler result is null', async () => {
+    const http = createStubHttp();
+    const bridge = new InteractionBridge({
+      http,
+      requestApproval: async () => ({ decision: 'cancelled' }),
+      requestQuestion: async () => null,
+      hasApprovalHandler: () => true,
+      hasQuestionHandler: () => true,
+    });
+    bridge.handleEvent({ type: 'event.question.requested', ...QUESTION_WIRE });
+    await flush();
+    expect(http.calls).toEqual([{ method: 'dismissQuestion', args: ['s1', 'q1'] }]);
+  });
+
+  it('fails safe with a cancelled approval when the handler throws', async () => {
+    const http = createStubHttp();
+    const bridge = new InteractionBridge({
+      http,
+      requestApproval: async () => {
+        throw new Error('handler exploded');
+      },
+      requestQuestion: async () => null,
+      hasApprovalHandler: () => true,
+      hasQuestionHandler: () => true,
+    });
+    expect(() =>
+      bridge.handleEvent({ type: 'event.approval.requested', ...APPROVAL_WIRE }),
+    ).not.toThrow();
+    await flush();
+    expect(http.calls).toEqual([
+      {
+        method: 'resolveApproval',
+        args: ['s1', 'a1', expect.objectContaining({ decision: 'cancelled' })],
+      },
+    ]);
+  });
+
+  it('fails safe with a dismiss when the question handler throws', async () => {
+    const http = createStubHttp();
+    const bridge = new InteractionBridge({
+      http,
+      requestApproval: async () => ({ decision: 'cancelled' }),
+      requestQuestion: async () => {
+        throw new Error('handler exploded');
+      },
+      hasApprovalHandler: () => true,
+      hasQuestionHandler: () => true,
+    });
+    bridge.handleEvent({ type: 'event.question.requested', ...QUESTION_WIRE });
+    await flush();
+    expect(http.calls).toEqual([{ method: 'dismissQuestion', args: ['s1', 'q1'] }]);
+  });
+
+  it('ignores malformed interaction events without touching the handler', async () => {
+    const http = createStubHttp();
+    const warnings: unknown[] = [];
+    const bridge = new InteractionBridge({
+      http,
+      requestApproval: async () => ({ decision: 'approved' }),
+      requestQuestion: async () => null,
+      hasApprovalHandler: () => true,
+      hasQuestionHandler: () => true,
+      logger: (level, msg) => warnings.push([level, msg]),
+    });
+    expect(() =>
+      bridge.handleEvent({ type: 'event.approval.requested', approval_id: 'a1' }),
+    ).not.toThrow();
+    bridge.handleEvent({ type: 'assistant.delta', text: 'hi' });
+    await flush();
+    expect(http.calls).toEqual([]);
+    expect(warnings.length).toBeGreaterThan(0);
+  });
+
+  it('replayPending re-feeds snapshot items and dedupes against live events', async () => {
+    const http = createStubHttp();
+    const approvalHandled: unknown[] = [];
+    const questionHandled: unknown[] = [];
+    const bridge = new InteractionBridge({
+      http,
+      requestApproval: async (req) => {
+        approvalHandled.push(req);
+        return { decision: 'approved' };
+      },
+      requestQuestion: async (req) => {
+        questionHandled.push(req);
+        return null;
+      },
+      hasApprovalHandler: () => true,
+      hasQuestionHandler: () => true,
+    });
+    const snapshot = {
+      pending_approvals: [APPROVAL_WIRE],
+      pending_questions: [QUESTION_WIRE],
+    };
+    // Live event first, then a snapshot replay carrying the same items.
+    bridge.handleEvent({ type: 'event.approval.requested', ...APPROVAL_WIRE });
+    bridge.replayPending('s1', snapshot);
+    // A second replay (e.g. after a resync) must not re-invoke either.
+    bridge.replayPending('s1', snapshot);
+    await flush();
+    expect(approvalHandled.length).toBe(1);
+    expect(questionHandled.length).toBe(1);
+    expect(http.calls.map((c) => c.method)).toEqual(['resolveApproval', 'dismissQuestion']);
+  });
+
+  it('queues replayed pending items when no handler is registered yet', async () => {
+    const http = createStubHttp();
+    const approvalHandled: unknown[] = [];
+    const questionHandled: unknown[] = [];
+    const bridge = new InteractionBridge({
+      http,
+      requestApproval: async (req) => {
+        approvalHandled.push(req);
+        return { decision: 'approved' };
+      },
+      requestQuestion: async (req) => {
+        questionHandled.push(req);
+        return null;
+      },
+      hasApprovalHandler: () => false,
+      hasQuestionHandler: () => false,
+    });
+    bridge.replayPending('s1', {
+      pending_approvals: [APPROVAL_WIRE],
+      pending_questions: [QUESTION_WIRE],
+    });
+    await flush();
+    // No handler ⇒ no handler call and, critically, no resolve/dismiss POST:
+    // the interactions stay pending on the server.
+    expect(approvalHandled).toEqual([]);
+    expect(questionHandled).toEqual([]);
+    expect(http.calls).toEqual([]);
+  });
+
+  it('queues a live interaction event that arrives before handler registration', async () => {
+    const http = createStubHttp();
+    const approvalHandled: unknown[] = [];
+    let registered = false;
+    const bridge = new InteractionBridge({
+      http,
+      requestApproval: async (req) => {
+        approvalHandled.push(req);
+        return { decision: 'approved' };
+      },
+      requestQuestion: async () => null,
+      hasApprovalHandler: () => registered,
+      hasQuestionHandler: () => true,
+    });
+    bridge.handleEvent({ type: 'event.approval.requested', ...APPROVAL_WIRE });
+    await flush();
+    expect(approvalHandled).toEqual([]);
+    expect(http.calls).toEqual([]);
+    registered = true;
+    bridge.flush('s1', 'approval');
+    await flush();
+    expect(approvalHandled.length).toBe(1);
+    expect(http.calls.map((c) => c.method)).toEqual(['resolveApproval']);
+  });
+
+  it('flush fires each queued pending id exactly once with the mapped request', async () => {
+    const http = createStubHttp();
+    const approvalHandled: unknown[] = [];
+    let registered = false;
+    const bridge = new InteractionBridge({
+      http,
+      requestApproval: async (req) => {
+        approvalHandled.push(req);
+        return { decision: 'approved' };
+      },
+      requestQuestion: async () => null,
+      hasApprovalHandler: () => registered,
+      hasQuestionHandler: () => true,
+    });
+    const snapshot = { pending_approvals: [APPROVAL_WIRE], pending_questions: [] };
+    bridge.replayPending('s1', snapshot);
+    // A duplicate replay within the same attach stays deduped in the queue.
+    bridge.replayPending('s1', snapshot);
+    registered = true;
+    bridge.flush('s1', 'approval');
+    // A second flush is a no-op — the queue drained with the first.
+    bridge.flush('s1', 'approval');
+    await flush();
+    expect(approvalHandled).toEqual([
+      {
+        turnId: 3,
+        toolCallId: 'tc1',
+        toolName: 'Bash',
+        action: 'run command',
+        display: { command: 'ls' },
+        sessionId: 's1',
+        agentId: 'main',
+      },
+    ]);
+    expect(http.calls).toEqual([
+      { method: 'resolveApproval', args: ['s1', 'a1', { decision: 'approved' }] },
+    ]);
+  });
+
+  it('forgetSession clears dedupe so a reattach re-presents a still-pending item', async () => {
+    const http = createStubHttp();
+    const approvalHandled: unknown[] = [];
+    const bridge = new InteractionBridge({
+      http,
+      requestApproval: async (req) => {
+        approvalHandled.push(req);
+        return { decision: 'approved' };
+      },
+      requestQuestion: async () => null,
+      hasApprovalHandler: () => true,
+      hasQuestionHandler: () => true,
+    });
+    // The snapshot still lists the item because it stayed pending on the
+    // server (the consumer detached without answering).
+    const snapshot = { pending_approvals: [APPROVAL_WIRE], pending_questions: [] };
+    bridge.replayPending('s1', snapshot);
+    await flush();
+    expect(approvalHandled.length).toBe(1);
+    // Detach → reattach: the replay of the same snapshot must fire again.
+    bridge.forgetSession('s1');
+    bridge.replayPending('s1', snapshot);
+    await flush();
+    expect(approvalHandled.length).toBe(2);
+    expect(http.calls.map((c) => c.method)).toEqual(['resolveApproval', 'resolveApproval']);
+  });
+
+  it('forgetSession also drops queued entries that never fired', async () => {
+    const http = createStubHttp();
+    const approvalHandled: unknown[] = [];
+    const bridge = new InteractionBridge({
+      http,
+      requestApproval: async (req) => {
+        approvalHandled.push(req);
+        return { decision: 'approved' };
+      },
+      requestQuestion: async () => null,
+      hasApprovalHandler: () => false,
+      hasQuestionHandler: () => true,
+    });
+    bridge.replayPending('s1', { pending_approvals: [APPROVAL_WIRE], pending_questions: [] });
+    bridge.forgetSession('s1');
+    // The next attach's flush has nothing left from the previous attach.
+    bridge.flush('s1', 'approval');
+    await flush();
+    expect(approvalHandled).toEqual([]);
+    expect(http.calls).toEqual([]);
+  });
+
+  it('forgetSession only touches the named session — a second session keeps its dedupe and queue', async () => {
+    const http = createStubHttp();
+    const approvalHandled: unknown[] = [];
+    const bridge = new InteractionBridge({
+      http,
+      requestApproval: async (req) => {
+        approvalHandled.push(req);
+        return { decision: 'approved' };
+      },
+      requestQuestion: async () => null,
+      hasApprovalHandler: (sessionId) => sessionId === 's1',
+      hasQuestionHandler: () => true,
+    });
+    const approvalS1 = APPROVAL_WIRE;
+    const approvalS2 = { ...APPROVAL_WIRE, approval_id: 'a2', session_id: 's2' };
+
+    // s1 has a handler and fires immediately; s2 has none and queues.
+    bridge.replayPending('s1', { pending_approvals: [approvalS1], pending_questions: [] });
+    bridge.replayPending('s2', { pending_approvals: [approvalS2], pending_questions: [] });
+    await flush();
+    expect(approvalHandled.length).toBe(1);
+
+    bridge.forgetSession('s1');
+
+    // s2's dedupe survives: replaying the same item again must NOT re-fire it
+    // (it is still only queued, never delivered).
+    bridge.replayPending('s2', { pending_approvals: [approvalS2], pending_questions: [] });
+    await flush();
+    expect(approvalHandled.length).toBe(1);
+
+    // s2's queue survives too: flushing it delivers the original entry once.
+    bridge.flush('s2', 'approval');
+    await flush();
+    expect(approvalHandled.length).toBe(2);
+    expect(approvalHandled[1]).toMatchObject({ sessionId: 's2' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDKRpcClientWire — live kap-server fixture (file scope; the stub-based
+// InteractionBridge describes above never touch these).
+// ---------------------------------------------------------------------------
+
+const TEST_HOST_IDENTITY: ServerHostIdentity = {
+  productName: 'test-host',
+  version: '0.0.0-test',
+  platform: 'test_platform',
+};
+
+let server: RunningServer;
+let home: string;
+let token: string;
+let base: string;
+// Real on-disk workspace root — session creation rejects a non-existent cwd
+// (server code 40409).
+let cwd: string;
+
+// Minimal provider config so prompt submission is accepted (the turn tests
+// below submit prompts). The stub endpoint is unreachable — the turn fails
+// asynchronously, which the REST assertions do not depend on. Mirrors the
+// fixture in wire-rest.test.ts.
+const STUB_PROVIDER_TOML = [
+  'default_model = "stub"',
+  '',
+  '[providers.stub]',
+  'type = "openai"',
+  'base_url = "http://127.0.0.1:9999"',
+  'api_key = "stub"',
+  '',
+  '[models.stub]',
+  'provider = "stub"',
+  'model = "stub"',
+  'max_context_size = 1000',
+  '',
+].join('\n');
+
+beforeAll(async () => {
+  home = await mkdtemp(join(tmpdir(), 'kimi-wire-client-'));
+  await writeFile(join(home, 'config.toml'), STUB_PROVIDER_TOML, 'utf-8');
+  cwd = join(home, 'workspace');
+  await mkdir(cwd);
+  server = await startServer({
+    hostIdentity: TEST_HOST_IDENTITY,
+    host: '127.0.0.1',
+    port: 0,
+    homeDir: home,
+    logLevel: 'silent',
+  });
+  token = server.authTokenService.getToken();
+  base = `http://127.0.0.1:${server.port}`;
+});
+
+afterAll(async () => {
+  await server.close();
+  await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+});
+
+/** Poll until `cond` holds (WS delivery is async; HTTP responses don't await it). */
+async function waitFor(cond: () => boolean, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error('waitFor timed out');
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+describe('SDKRpcClientWire lifecycle', () => {
+  it('lists/creates/renames/archives sessions and streams events', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const events: string[] = [];
+    rpc.onEvent((e) => events.push(`${e.sessionId}:${e.type}`));
+
+    const created = await rpc.createSession({ workDir: cwd });
+    expect(created.workDir).toBe(cwd);
+
+    const list = await rpc.listSessions({});
+    expect(list.some((s) => s.id === created.id)).toBe(true);
+
+    await rpc.renameSession({ id: created.id, title: 'wired' });
+    expect((await rpc.listSessions({})).find((s) => s.id === created.id)?.title).toBe('wired');
+
+    await rpc.deleteSession({ sessionId: created.id });
+    // The default list excludes archived sessions (server contract)…
+    const listed = await rpc.listSessions({});
+    expect(listed.some((s) => s.id === created.id)).toBe(false);
+    // …and the session itself reads back archived:
+    const http = new WireHttpClient({ baseUrl: base, token });
+    expect((await http.getSession(created.id)).archived).toBe(true);
+
+    // session.meta.updated (from the rename) flowed through supervisor + translator:
+    await waitFor(() => events.some((t) => t.endsWith(':session.meta.updated')));
+    await rpc.close();
+  });
+
+  it('maps lastAssistantText onto SessionSummary through listSessions (wireSessionToSummary)', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+
+    // lastAssistantText is engine-derived (written reactively off turn.ended
+    // by AgentConversationUndoService) — there is no public RPC to set it
+    // directly, so seed it through the running server's own session scope
+    // and assert the public listSessions() surface, which is what exercises
+    // the private wireSessionToSummary mapping.
+    const live = getLiveSessionById(server.core.accessor, created.id);
+    expect(live).toBeDefined();
+    await live!.accessor.get(ISessionMetadata).update({ lastAssistantText: 'the answer is 42' });
+
+    const list = await rpc.listSessions({});
+    expect(list.find((s) => s.id === created.id)?.lastAssistantText).toBe('the answer is 42');
+
+    await rpc.close();
+  });
+
+  it('resumeSession subscribes with the snapshot cursor and closeSession only detaches', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    const resumed = await rpc.resumeSession({ id: created.id });
+    expect(resumed.id).toBe(created.id);
+    expect(resumed.sessionMetadata.workDir).toBe(cwd);
+    await rpc.closeSession({ sessionId: created.id });
+    // the session must still exist and be resumable (detach, not close):
+    const again = await rpc.resumeSession({ id: created.id });
+    expect(again.id).toBe(created.id);
+    await rpc.close();
+  });
+
+  it('forks a session over :fork', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    const forked = await rpc.forkSession({ id: created.id, title: 'forked' });
+    expect(forked.id).not.toBe(created.id);
+    expect(forked.workDir).toBe(cwd);
+    expect(forked.title).toBe('forked');
+    await rpc.close();
+  });
+
+  it('forwards caller metadata on create and round-trips it on read', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({
+      workDir: cwd,
+      metadata: { origin: 'wire-sdk-test', attempt: 2 },
+    });
+    // v1/v2 return the caller's metadata verbatim on create:
+    expect(created.metadata).toEqual({ origin: 'wire-sdk-test', attempt: 2 });
+
+    // …and the custom keys survived server-side, readable on the wire row
+    // (merged next to the authoritative cwd):
+    const http = new WireHttpClient({ baseUrl: base, token });
+    const row = await http.getSession(created.id);
+    expect(row.metadata).toMatchObject({ origin: 'wire-sdk-test', attempt: 2, cwd });
+    const listed = await rpc.listSessions({});
+    expect(listed.find((s) => s.id === created.id)?.metadata).toMatchObject({
+      origin: 'wire-sdk-test',
+      attempt: 2,
+    });
+    await rpc.close();
+  });
+
+  it('forwards explicit model/permission on create to the main agent', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    // The REST create route drops every option outside metadata/title; the
+    // client must apply the explicit ones through the agent_config profile
+    // patch, mirroring the in-process transports' create-time bind.
+    const created = await rpc.createSession({
+      workDir: cwd,
+      model: 'stub',
+      permission: 'auto',
+    });
+    const live = getLiveSessionById(server.core.accessor, created.id);
+    const main = live?.accessor.get(IAgentLifecycleService).get('main');
+    expect(main?.accessor.get(IAgentProfileService).data().modelAlias).toBe('stub');
+    expect(main?.accessor.get(IAgentPermissionModeService).mode).toBe('auto');
+    await rpc.close();
+  });
+
+  it('binds the config default_model on the first prompt of a model-less session', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    // No model at create (the agents-view dispatch shape): the session is
+    // created model-less…
+    const created = await rpc.createSession({ workDir: cwd });
+    const live = getLiveSessionById(server.core.accessor, created.id);
+    expect(live?.accessor.get(IAgentLifecycleService).get('main')).toBeUndefined();
+    // …and the first prompt binds the default profile with the server
+    // config's default_model — the fallback the in-process createSession
+    // applies eagerly (kap-server's `ensureMainAgentBound`).
+    await rpc.prompt({ sessionId: created.id, input: [{ type: 'text', text: 'hi' }] });
+    const profile = live?.accessor.get(IAgentLifecycleService).get('main')?.accessor
+      .get(IAgentProfileService).data();
+    expect(profile?.profileName).toBe('agent');
+    expect(profile?.modelAlias).toBe('stub');
+    // The stub provider's turn retries against an unreachable endpoint —
+    // abort it so the test leaves nothing running.
+    await rpc.cancel({ sessionId: created.id });
+    await rpc.close();
+  });
+
+  it('resolves workspace trust for a session; a missing session reads back undefined', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const created = await rpc.createSession({ workDir: cwd });
+    // The workspace auto-registered on session creation, so the trust read is a boolean.
+    await expect(rpc.getWorkspaceTrustForSession(created.id)).resolves.toEqual(
+      expect.any(Boolean),
+    );
+    await expect(rpc.getWorkspaceTrustForSession('no-such-session')).resolves.toBeUndefined();
+    await rpc.close();
+  });
+
+  // R9 Q4b: listWorkspaceSkills had no wire override — every call fell
+  // through to getRpc() and threw not_implemented unconditionally.
+  it('listWorkspaceSkills resolves a bare workDir with no prior session, registering its workspace on the fly', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const freshDir = join(home, 'workspace-skills-fresh');
+    await mkdir(freshDir);
+    const skills = await rpc.listWorkspaceSkills(freshDir);
+    // Builtins are code-defined (not discovered from disk) — stable
+    // regardless of the fresh directory's contents.
+    expect(skills.some((s) => s.name === 'mcp-config' && s.source === 'builtin')).toBe(true);
+    await rpc.close();
+  });
+
+  it('listSessionRows returns the full wire rows that SessionSummary drops', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    const rows = await rpc.listSessionRows();
+    const row = rows.find((r) => r.id === created.id);
+    expect(row).toBeDefined();
+    expect(row?.busy).toBe(false);
+    expect(row?.workspace_id).toBeTruthy();
+    expect(row?.metadata.cwd).toBe(cwd);
+    await rpc.close();
+  });
+
+  it('onConnectionState forwards supervisor connection transitions', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const states: boolean[] = [];
+    const off = rpc.onConnectionState((connected) => states.push(connected));
+    await rpc.start();
+    // Registered before start(): the initial connect's transition reaches it.
+    expect(states).toEqual([true]);
+    off();
+    await rpc.close();
+  });
+
+  it('rejects a non-loopback serverUrl', () => {
+    expect(() => new SDKRpcClientWire({ serverUrl: 'http://192.168.1.10:58627', token: 't' })).toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDKRpcClientWire turns and state — prompt/steer/cancel + status/history
+// reads against the live server (the stub provider makes every turn fail
+// asynchronously; the REST assertions below do not depend on turn output).
+// ---------------------------------------------------------------------------
+
+/** Async variant of `waitFor` — the condition itself performs HTTP reads. */
+async function waitForAsync(cond: () => Promise<boolean>, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await cond())) {
+    if (Date.now() > deadline) throw new Error('waitForAsync timed out');
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+describe('SDKRpcClientWire turns and state', () => {
+  it('prompts, steers, cancels, and reads status/context/usage/warnings', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    await rpc.resumeSession({ id: created.id });
+
+    await rpc.prompt({ sessionId: created.id, input: [{ type: 'text', text: 'hi' }] });
+
+    const status = await rpc.getStatus({ sessionId: created.id });
+    expect(status).toMatchObject({
+      thinkingEffort: expect.any(String),
+      permission: expect.any(String),
+      planMode: expect.any(Boolean),
+      swarmMode: expect.any(Boolean),
+      contextTokens: expect.any(Number),
+      maxContextTokens: expect.any(Number),
+      contextUsage: expect.any(Number),
+    });
+
+    const context = await rpc.getContext({ sessionId: created.id });
+    expect(context.tokenCount).toEqual(expect.any(Number));
+    expect(
+      context.history.some(
+        (m) => m.role === 'user' && m.content.some((p) => p.type === 'text' && p.text === 'hi'),
+      ),
+    ).toBe(true);
+
+    const usage = await rpc.getUsage({ sessionId: created.id });
+    expect(usage.total).toMatchObject({
+      inputOther: expect.any(Number),
+      output: expect.any(Number),
+      inputCacheRead: expect.any(Number),
+      inputCacheCreation: expect.any(Number),
+    });
+
+    // The stub endpoint refuses connections but the first turn is still in its
+    // retry backoff by now, so the steer submission queues and is steered into
+    // the active turn through the `prompts:steer` route.
+    await rpc.steer({ sessionId: created.id, input: [{ type: 'text', text: 'focus' }] });
+    await rpc.cancel({ sessionId: created.id });
+
+    const warnings = await rpc.getSessionWarnings({ sessionId: created.id });
+    expect(Array.isArray(warnings)).toBe(true);
+    await rpc.close();
+  });
+
+  it('undoes the last prompt over :undo', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const http = new WireHttpClient({ baseUrl: base, token });
+    const created = await rpc.createSession({ workDir: cwd });
+    await rpc.prompt({ sessionId: created.id, input: [{ type: 'text', text: 'undo me' }] });
+    // The stub provider's turn now retries instead of dying instantly — abort
+    // it (the retry sleep is abortable) and wait for the settle so the undo is
+    // deterministic.
+    await rpc.cancel({ sessionId: created.id });
+    await waitForAsync(async () => !(await http.getSession(created.id)).busy);
+    await rpc.undoHistory({ sessionId: created.id, count: 1 });
+    const context = await rpc.getContext({ sessionId: created.id });
+    expect(context.history.some((m) => m.role === 'user')).toBe(false);
+    await rpc.close();
+  });
+
+  it('routes compact to :compact and surfaces compaction.unable on an empty history', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    // A fresh session has no compactable prefix: the server maps
+    // `compaction.unable` onto envelope code 40910.
+    await expect(
+      rpc.compact({ sessionId: created.id, instruction: 'keep it short' }),
+    ).rejects.toMatchObject({ code: 40910 });
+    await rpc.close();
+  });
+
+  it('unimplemented methods fail loudly with not_implemented', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await expect(rpc.getCronTasks({ sessionId: 's' })).rejects.toMatchObject({
+      code: ErrorCodes.NOT_IMPLEMENTED,
+    });
+    await rpc.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDKRpcClientWire activateSkill — the base surface had no wire override for
+// this method: every call fell through to getRpc() and threw not_implemented
+// unconditionally, so skill dispatch from the agents view (which always
+// talks over the wire) has never worked live.
+// ---------------------------------------------------------------------------
+
+describe('SDKRpcClientWire activateSkill', () => {
+  it('activates a builtin skill over :activate and titles the session, on a freshly created cold session', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    // No resumeSession() beforehand — matches the roster dispatch path,
+    // which activates immediately after createSession.
+    await rpc.activateSkill({ sessionId: created.id, name: 'update-config', args: '--help' });
+    const listed = await rpc.listSessions({});
+    expect(listed.find((s) => s.id === created.id)?.title).toBe('/update-config --help');
+    await rpc.close();
+  });
+
+  it('rejects an unknown skill with the server envelope code', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    await expect(
+      rpc.activateSkill({ sessionId: created.id, name: 'does-not-exist' }),
+    ).rejects.toMatchObject({ code: 40415 });
+    await rpc.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDKRpcClientWire config and model — `/login`'s post-auth
+// `harness.getConfig({ reload: true })` → `session.setModel(model)` →
+// `session.setThinking(effort)` sequence had no wire override for any of the
+// three: every call fell through to getRpc() and threw not_implemented
+// unconditionally, so `/login` always printed "Authentication successful,
+// but failed to refresh config: [not_implemented] This SDK method is not
+// available on the wire transport."
+// ---------------------------------------------------------------------------
+
+describe('SDKRpcClientWire config and model', () => {
+  it('reads the live config, mapping the wire snake_case shape onto KimiConfig', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const config = await rpc.getConfig();
+    expect(config.defaultModel).toBe('stub');
+    expect(config.providers['stub']).toMatchObject({ type: 'openai' });
+    // The wire never returns the real credential, redacted or otherwise.
+    expect(config.providers['stub']).not.toHaveProperty('apiKey');
+    await rpc.close();
+  });
+
+  it('sends the setConfig patch snake_cased at every depth, and reads the change back mapped to camelCase', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = vi.spyOn(WireHttpClient.prototype, 'setConfig');
+    const config = await rpc.setConfig({ defaultProvider: 'stub' });
+    expect(spy.mock.calls[0]?.[0]).toEqual({ default_provider: 'stub' });
+    expect(config.defaultProvider).toBe('stub');
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it("sets a session's model and thinking effort, applying live to the main agent", async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+
+    const setModelSpy = vi.spyOn(WireHttpClient.prototype, 'setModel');
+    const result = await rpc.setModel({ sessionId: created.id, model: 'stub' });
+    expect(setModelSpy).toHaveBeenCalledWith(created.id, 'stub');
+    expect(result).toEqual({ model: 'stub' });
+    setModelSpy.mockRestore();
+
+    const setThinkingSpy = vi.spyOn(WireHttpClient.prototype, 'setThinking');
+    // 'off' is universally accepted regardless of what the model declares.
+    await rpc.setThinking({ sessionId: created.id, effort: 'off' });
+    expect(setThinkingSpy).toHaveBeenCalledWith(created.id, 'off');
+    setThinkingSpy.mockRestore();
+
+    const status = await rpc.getStatus({ sessionId: created.id });
+    expect(status).toMatchObject({ model: 'stub', thinkingEffort: 'off' });
+    await rpc.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDKRpcClientWire getGoal — the root fix for the attach crash: the wire
+// transport previously had no override, so every attach's
+// `Promise.all([getStatus(), getGoal()])` rejected with not_implemented.
+// ---------------------------------------------------------------------------
+
+describe('SDKRpcClientWire getGoal', () => {
+  it('wraps the http read in the GoalToolResult { goal } shape', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const snapshot = {
+      goalId: 'g1',
+      objective: 'ship the fix',
+      status: 'active' as const,
+      turnsUsed: 2,
+      tokensUsed: 500,
+      wallClockMs: 1000,
+      budget: {
+        tokenBudget: null,
+        turnBudget: null,
+        wallClockBudgetMs: null,
+        remainingTokens: null,
+        remainingTurns: null,
+        remainingWallClockMs: null,
+        tokenBudgetReached: false,
+        turnBudgetReached: false,
+        wallClockBudgetReached: false,
+        overBudget: false,
+      },
+    };
+    const spy = vi.spyOn(WireHttpClient.prototype, 'getSessionGoal').mockResolvedValue(snapshot);
+    await expect(rpc.getGoal({ sessionId: 's1' })).resolves.toEqual({ goal: snapshot });
+    expect(spy).toHaveBeenCalledWith('s1');
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('resolves { goal: null } against the live server when no goal is active', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    await expect(rpc.getGoal({ sessionId: created.id })).resolves.toEqual({ goal: null });
+    await rpc.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDKRpcClientWire startBtw — no wire override existed; every call fell
+// through to getRpc() and threw not_implemented.
+// ---------------------------------------------------------------------------
+
+describe('SDKRpcClientWire startBtw', () => {
+  it('starts the btw agent over :btw and returns its agent id, without sending agent_id', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    // The btw side-channel needs an existing main agent to attach next to —
+    // a session with no prompt yet has none (server-v2 gap G10: the main
+    // agent is not created on session creation).
+    await rpc.prompt({ sessionId: created.id, input: [{ type: 'text', text: 'warm up main' }] });
+    // Call-through spy: asserts the exact call the live server accepted.
+    const spy = vi.spyOn(WireHttpClient.prototype, 'startBtw');
+    const agentId = await rpc.startBtw({ sessionId: created.id });
+    expect(agentId).toBeTruthy();
+    expect(spy).toHaveBeenCalledWith(created.id);
+    spy.mockRestore();
+    await rpc.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDKRpcClientWire background tasks — no wire override existed for any of
+// the three; every call fell through to getRpc() and threw not_implemented.
+// The kind-projection tests below mock WireHttpClient (kap-server's tasks
+// route has no primitive for spawning a real subagent/bash/question task
+// from a test), the same way the getGoal mock test above stands in for a
+// live active goal; the plumbing itself (URL/query construction, envelope
+// unwrap, error mapping) is exercised against the live server in
+// wire-rest.test.ts.
+// ---------------------------------------------------------------------------
+
+describe('SDKRpcClientWire background tasks', () => {
+  const SUBAGENT_TASK: WireTask = {
+    id: 'task_agent_1',
+    session_id: 's1',
+    kind: 'subagent',
+    description: 'investigate the failure',
+    status: 'running',
+    created_at: '2026-08-01T00:00:00.000Z',
+    started_at: '2026-08-01T00:00:01.000Z',
+  };
+  const BASH_TASK: WireTask = {
+    id: 'task_bash_1',
+    session_id: 's1',
+    kind: 'bash',
+    description: 'run the test suite',
+    status: 'completed',
+    command: 'npm test',
+    created_at: '2026-08-01T00:00:00.000Z',
+    completed_at: '2026-08-01T00:00:05.000Z',
+  };
+
+  it('projects only subagent-kind tasks into BackgroundTaskInfo, dropping bash/tool kinds', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = vi
+      .spyOn(WireHttpClient.prototype, 'listTasks')
+      .mockResolvedValue([SUBAGENT_TASK, BASH_TASK]);
+    const tasks = await rpc.listBackgroundTasks({ sessionId: 's1' });
+    expect(tasks).toEqual([
+      {
+        kind: 'agent',
+        taskId: 'task_agent_1',
+        description: 'investigate the failure',
+        status: 'running',
+        startedAt: Date.parse('2026-08-01T00:00:01.000Z'),
+        endedAt: null,
+        agentId: 'task_agent_1',
+      },
+    ]);
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('maps activeOnly to the route\'s running status filter', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = vi.spyOn(WireHttpClient.prototype, 'listTasks').mockResolvedValue([]);
+    await rpc.listBackgroundTasks({ sessionId: 's1', activeOnly: true });
+    expect(spy).toHaveBeenCalledWith('s1', { status: 'running' });
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('caps the mapped result client-side when limit is given (the route has no limit query param)', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const many = Array.from({ length: 3 }, (_, i) => ({ ...SUBAGENT_TASK, id: `task_${String(i)}` }));
+    const spy = vi.spyOn(WireHttpClient.prototype, 'listTasks').mockResolvedValue(many);
+    const tasks = await rpc.listBackgroundTasks({ sessionId: 's1', limit: 2 });
+    expect(tasks).toHaveLength(2);
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('maps a cancelled wire status onto v1\'s "killed" status', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = vi
+      .spyOn(WireHttpClient.prototype, 'listTasks')
+      .mockResolvedValue([{ ...SUBAGENT_TASK, status: 'cancelled' }]);
+    const tasks = await rpc.listBackgroundTasks({ sessionId: 's1' });
+    expect(tasks[0]?.status).toBe('killed');
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it("maps tail onto output_bytes and requests with_output, returning the task's output preview", async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = vi
+      .spyOn(WireHttpClient.prototype, 'getTask')
+      .mockResolvedValue({ ...SUBAGENT_TASK, output_preview: 'hello output' });
+    const output = await rpc.getBackgroundTaskOutput({
+      sessionId: 's1',
+      taskId: 'task_agent_1',
+      tail: 4096,
+    });
+    expect(output).toBe('hello output');
+    expect(spy).toHaveBeenCalledWith('s1', 'task_agent_1', { with_output: true, output_bytes: 4096 });
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('resolves an empty string when the task has no output yet', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = vi.spyOn(WireHttpClient.prototype, 'getTask').mockResolvedValue(SUBAGENT_TASK);
+    await expect(
+      rpc.getBackgroundTaskOutput({ sessionId: 's1', taskId: 'task_agent_1' }),
+    ).resolves.toBe('');
+    expect(spy).toHaveBeenCalledWith('s1', 'task_agent_1', {
+      with_output: true,
+      output_bytes: undefined,
+    });
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('stops a background task over the :cancel route, without forwarding reason (the route accepts no body)', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = vi.spyOn(WireHttpClient.prototype, 'cancelTask').mockResolvedValue(undefined);
+    await rpc.stopBackgroundTask({
+      sessionId: 's1',
+      taskId: 'task_agent_1',
+      reason: 'no longer needed',
+    });
+    expect(spy).toHaveBeenCalledWith('s1', 'task_agent_1');
+    spy.mockRestore();
+    await rpc.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDKRpcClientWire removeProvider — no wire override existed; every call
+// fell through to getRpc() and threw not_implemented.
+// ---------------------------------------------------------------------------
+
+describe('SDKRpcClientWire removeProvider', () => {
+  it('deletes the provider (204, no body) and re-reads the resulting config through getConfig', async () => {
+    const providerId = `wire-client-remove-${String(Date.now())}`;
+    const createRes = await fetch(`${base}/api/v1/providers`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        id: providerId,
+        type: 'openai',
+        api_key: 'stub',
+        base_url: 'http://127.0.0.1:9999',
+        models: [{ model: 'throwaway-model', max_context_size: 1000 }],
+      }),
+    });
+    expect(createRes.status).toBe(201);
+
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const deleteSpy = vi.spyOn(WireHttpClient.prototype, 'deleteProvider');
+    const getConfigSpy = vi.spyOn(WireHttpClient.prototype, 'getConfig');
+    const config = await rpc.removeProvider(providerId);
+    expect(deleteSpy).toHaveBeenCalledWith(providerId);
+    expect(getConfigSpy).toHaveBeenCalled();
+    expect(config.providers[providerId]).toBeUndefined();
+    // Untouched providers survive — this is a live re-read, not a stale echo.
+    expect(config.providers['stub']).toBeDefined();
+    deleteSpy.mockRestore();
+    getConfigSpy.mockRestore();
+    await rpc.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDKRpcClientWire exportSession — SHAPE MISMATCH: the route streams a zip
+// with no JSON envelope on success, so this downloads it to `outputPath`
+// instead of parsing a config-style response. No wire override existed
+// before; every call fell through to getRpc() and threw not_implemented.
+// ---------------------------------------------------------------------------
+
+describe('SDKRpcClientWire exportSession', () => {
+  it('downloads the streamed zip to outputPath and returns a best-effort manifest', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    // Real content on disk before exporting — a session directory with
+    // nothing written to it yet has no exportable files server-side.
+    await rpc.prompt({ sessionId: created.id, input: [{ type: 'text', text: 'export me' }] });
+
+    const outputPath = join(home, 'exports', 'debug.zip');
+    const result = await rpc.exportSession({
+      id: created.id,
+      outputPath,
+      version: '1.2.3-test',
+      installSource: 'npm-global',
+    });
+
+    expect(result.zipPath).toBe(outputPath);
+    const archive = await readFile(outputPath);
+    // zip local-file-header magic number — proves the stream landed intact.
+    expect(archive.subarray(0, 4)).toEqual(Buffer.from([0x50, 0x4b, 0x03, 0x04]));
+
+    // Deliberate degrades: never fabricated, matching the class's other
+    // wire-transport reads.
+    expect(result.entries).toEqual([]);
+    expect(result.sessionDir).toBe('');
+    expect(result.manifest).toMatchObject({
+      sessionId: created.id,
+      kimiCodeVersion: '1.2.3-test',
+      wireProtocolVersion: AGENT_WIRE_PROTOCOL_VERSION,
+      installSource: 'npm-global',
+      os: process.platform,
+      nodejsVersion: process.version,
+    });
+    await rpc.close();
+  });
+
+  it('defaults outputPath to kimi-debug-<shortId>-<timestamp>.zip under the cwd, mirroring v1', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    await rpc.prompt({ sessionId: created.id, input: [{ type: 'text', text: 'default path' }] });
+
+    const scratch = await mkdtemp(join(tmpdir(), 'kimi-export-default-'));
+    const originalCwd = process.cwd();
+    try {
+      process.chdir(scratch);
+      const result = await rpc.exportSession({ id: created.id, version: '1.0.0' });
+      expect(result.zipPath).toMatch(
+        new RegExp(`kimi-debug-${created.id.slice(0, 8)}-\\d{8}-\\d{6}\\.zip$`),
+      );
+      const info = await stat(result.zipPath);
+      expect(info.size).toBeGreaterThan(0);
+    } finally {
+      process.chdir(originalCwd);
+      await rm(scratch, { recursive: true, force: true });
+    }
+    await rpc.close();
+  });
+
+  it('rejects exporting an unknown session with the server envelope code', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await expect(
+      rpc.exportSession({ id: 'no-such-session', outputPath: join(home, 'never.zip'), version: '1.0.0' }),
+    ).rejects.toMatchObject({ code: 40401 });
+    await rpc.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDKRpcClientWire degrade surface: empty collections for surfaces kap-server
+// has no routes for, immediate profile-route setPermission/setPlanMode, and
+// model/profile passthrough.
+// Body assertions stub at the WireHttpClient.submitPrompt boundary — the body
+// object it receives is stringified verbatim into the HTTP request
+// (WireHttpClient.request), so recording it IS inspecting the HTTP body.
+// ---------------------------------------------------------------------------
+
+function stubSubmitPrompt(status: 'running' | 'queued' = 'running') {
+  const bodies: WirePromptSubmission[] = [];
+  const spy = vi
+    .spyOn(WireHttpClient.prototype, 'submitPrompt')
+    .mockImplementation(async (_id, body) => {
+      bodies.push(body);
+      return {
+        prompt_id: 'p_stub',
+        user_message_id: 'm_stub',
+        status,
+        content: [{ type: 'text', text: 'stub' }],
+        created_at: '2026-07-30T00:00:00.000Z',
+      };
+    });
+  return { bodies, spy };
+}
+
+describe('SDKRpcClientWire degrade surface', () => {
+  it('degrades plugin/skill/MCP surfaces to empty collections', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await expect(rpc.listPlugins()).resolves.toEqual([]);
+    await expect(rpc.listPluginCommands({ sessionId: 's' })).resolves.toEqual([]);
+    await expect(rpc.listSkills({ sessionId: 's' })).resolves.toEqual([]);
+    await expect(rpc.listMcpServers()).resolves.toEqual([]);
+    await expect(rpc.getMcpStartupMetrics({ sessionId: 's' })).resolves.toEqual({
+      durationMs: 0,
+    });
+    await rpc.close();
+  });
+
+  it('setPermission posts the session profile agent_config immediately', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = vi
+      .spyOn(WireHttpClient.prototype, 'setPermission')
+      .mockResolvedValue({} as never);
+    await rpc.setPermission({ sessionId: 's1', mode: 'yolo' });
+    expect(spy).toHaveBeenCalledWith('s1', 'yolo');
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('setPlanMode posts the session profile agent_config immediately', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = vi.spyOn(WireHttpClient.prototype, 'setPlanMode').mockResolvedValue({} as never);
+    await rpc.setPlanMode({ sessionId: 's1', enabled: true });
+    expect(spy).toHaveBeenCalledWith('s1', true);
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('prompt and steer bodies carry no permission/plan mode', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const { bodies, spy } = stubSubmitPrompt();
+    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'first' }] });
+    await rpc.steer({ sessionId: 's1', input: [{ type: 'text', text: 'second' }] });
+    expect(bodies[0]?.permission_mode).toBeUndefined();
+    expect(bodies[0]?.plan_mode).toBeUndefined();
+    expect(bodies[1]?.permission_mode).toBeUndefined();
+    expect(bodies[1]?.plan_mode).toBeUndefined();
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('passes model/profile through on prompt and steer bodies', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const { bodies, spy } = stubSubmitPrompt();
+    await rpc.prompt({
+      sessionId: 's1',
+      input: [{ type: 'text', text: 'hi' }],
+      model: 'k2',
+      profile: 'coder',
+    });
+    expect(bodies[0]).toMatchObject({ model: 'k2', profile: 'coder' });
+    await rpc.steer({
+      sessionId: 's1',
+      input: [{ type: 'text', text: 'hi' }],
+      model: 'k2',
+      profile: 'coder',
+    });
+    expect(bodies[1]).toMatchObject({ model: 'k2', profile: 'coder' });
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('omits model/profile from the body when not provided', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const { bodies, spy } = stubSubmitPrompt();
+    await rpc.prompt({ sessionId: 's1', input: [{ type: 'text', text: 'hi' }] });
+    expect(bodies[0]?.model).toBeUndefined();
+    expect(bodies[0]?.profile).toBeUndefined();
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('the live profile route accepts permission/plan agent_config changes', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const created = await rpc.createSession({ workDir: cwd });
+    // A schema rejection would surface here as an envelope error.
+    await expect(
+      rpc.setPermission({ sessionId: created.id, mode: 'manual' }),
+    ).resolves.toBeUndefined();
+    await expect(rpc.setPlanMode({ sessionId: created.id, enabled: true })).resolves.toBeUndefined();
+    await rpc.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDKRpcClientWire getStatus — a straight pass-through of the server's status
+// read. Permission/plan mode changes go through the profile route immediately
+// (see the degrade-surface block above), so the client holds no pending value
+// to overlay.
+// ---------------------------------------------------------------------------
+
+describe('SDKRpcClientWire getStatus', () => {
+  const SERVER_STATUS: WireSessionStatus = {
+    busy: false,
+    thinking_level: 'medium',
+    permission: 'manual',
+    plan_mode: false,
+    swarm_mode: false,
+    context_tokens: 0,
+    max_context_tokens: 100_000,
+    context_usage: 0,
+  };
+
+  function stubGetSessionStatus(status: WireSessionStatus) {
+    return vi.spyOn(WireHttpClient.prototype, 'getSessionStatus').mockResolvedValue(status);
+  }
+
+  it('reports the server permission/plan values verbatim', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const spy = stubGetSessionStatus(SERVER_STATUS);
+    const status = await rpc.getStatus({ sessionId: 's1' });
+    expect(status.permission).toBe('manual');
+    expect(status.planMode).toBe(false);
+    spy.mockRestore();
+    await rpc.close();
+  });
+
+  it('does not overlay a just-set mode — the profile route owns applying it', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    const statusSpy = stubGetSessionStatus(SERVER_STATUS);
+    const permSpy = vi
+      .spyOn(WireHttpClient.prototype, 'setPermission')
+      .mockResolvedValue({} as never);
+    await rpc.setPermission({ sessionId: 's1', mode: 'yolo' });
+    // The client keeps no local copy of the mode: getStatus reflects whatever
+    // the server reports (stubbed here as still 'manual'; a real server has
+    // applied the mode by the time the setPermission call resolves).
+    const status = await rpc.getStatus({ sessionId: 's1' });
+    expect(status.permission).toBe('manual');
+    permSpy.mockRestore();
+    statusSpy.mockRestore();
+    await rpc.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDKRpcClientWire wire-supported surface — a structural guard against the
+// bug class items 1-3 of dogfood round 2 are instances 3-5 of: the wire
+// client inherits ~60 base RPC methods it never overrides, every one of
+// which throws not_implemented at runtime with nothing failing at compile
+// time, and the unit-test harness never notices because it implements the
+// methods locally. This derives the expectation mechanically instead of
+// eyeballing the class body: each SUPPORTED_METHODS entry must be the wire
+// class's OWN prototype property, not one it merely inherits.
+//
+// The list is scoped to what apps/kimi-code/src/tui actually calls while
+// running under this transport (`kimi agents` boots the whole KimiTUI app —
+// not just the roster — on a wire harness; see
+// apps/kimi-code/src/cli/sub/agents-run.ts), currently every method already
+// overridden above plus the four fixed by the config/model section and the
+// six fixed by the tier-1 section below. A wider TUI-wide grep turns up
+// further reached-but-unoverridden methods (e.g. getPlan, createGoal,
+// setPluginEnabled, …) that are pre-existing gaps outside this round's
+// scope, not something this guard silently signs off on — they are simply
+// not in SUPPORTED_METHODS yet.
+// ---------------------------------------------------------------------------
+
+describe('SDKRpcClientWire wire-supported surface', () => {
+  const SUPPORTED_METHODS = [
+    'listSessions',
+    'createSession',
+    'resumeSession',
+    'closeSession',
+    'deleteSession',
+    'renameSession',
+    'forkSession',
+    'prompt',
+    'steer',
+    'cancel',
+    'getStatus',
+    'getContext',
+    'getUsage',
+    'compact',
+    'undoHistory',
+    'getSessionWarnings',
+    'getGoal',
+    'activateSkill',
+    'listWorkspaceSkills',
+    'listPlugins',
+    'listPluginCommands',
+    'listSkills',
+    'listMcpServers',
+    'getMcpStartupMetrics',
+    'setPermission',
+    // Fixed by the wire pending-state round: setPlanMode shares setPermission's
+    // deferred-submission shape (see the getStatus mode overlay tests above).
+    'setPlanMode',
+    // Fixed by this round's config/model section (item 2):
+    'getConfig',
+    'setConfig',
+    'setModel',
+    'setThinking',
+    // Fixed by this round's tier-1 section — six overrides against routes
+    // that already existed server-side (no server work involved):
+    'removeProvider',
+    'listBackgroundTasks',
+    'getBackgroundTaskOutput',
+    'stopBackgroundTask',
+    'startBtw',
+    'exportSession',
+  ] as const;
+
+  // Methods the TUI also reaches over the wire that this transport has
+  // reviewed and deliberately left on the throwing base implementation —
+  // reserved for a genuine "the server has no primitive for this" case.
+  // Empty today: kap-server turns out to expose a route for every gap this
+  // audit found (including session export), so nothing currently qualifies —
+  // this list exists so a real future case has a reviewed home instead of
+  // silently staying unimplemented.
+  const NOT_SUPPORTED_METHODS: readonly string[] = [];
+
+  function ownMethodNames(): Set<string> {
+    return new Set(
+      Object.getOwnPropertyNames(SDKRpcClientWire.prototype).filter(
+        (name) => name !== 'constructor',
+      ),
+    );
+  }
+
+  it('overrides every method SUPPORTED_METHODS lists, instead of inheriting the throwing base', () => {
+    const own = ownMethodNames();
+    const missing = SUPPORTED_METHODS.filter((name) => !own.has(name));
+    const report = missing
+      .map(
+        (name) =>
+          `"${name}" is not its own override on SDKRpcClientWire — it falls through to ` +
+          `getRpc(), which throws not_implemented the first time the agents-view TUI reaches it ` +
+          `live. Add a real override in packages/node-sdk/src/wire/sdk-rpc-client-wire.ts (or, if ` +
+          `the wire genuinely cannot support it, move "${name}" into NOT_SUPPORTED_METHODS in ` +
+          `this test instead of SUPPORTED_METHODS).`,
+      )
+      .join('\n');
+    expect(report).toBe('');
+  });
+
+  it('leaves every method NOT_SUPPORTED_METHODS lists on the throwing base implementation', () => {
+    const own = ownMethodNames();
+    const wronglyOverridden = NOT_SUPPORTED_METHODS.filter((name) => own.has(name));
+    const report = wronglyOverridden
+      .map(
+        (name) =>
+          `"${name}" is now overridden on SDKRpcClientWire but is still listed in ` +
+          `NOT_SUPPORTED_METHODS — move it to SUPPORTED_METHODS in this test so the guard above ` +
+          `actually exercises it.`,
+      )
+      .join('\n');
+    expect(report).toBe('');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// toWireContent — the kosong PromptPart → protocol message content mapping
+// the prompt/steer submissions depend on. Pure unit tests (no live server).
+// ---------------------------------------------------------------------------
+
+describe('toWireContent', () => {
+  it('maps text parts verbatim', () => {
+    expect(toWireContent({ type: 'text', text: 'hi' })).toEqual({ type: 'text', text: 'hi' });
+  });
+
+  it('maps image/video URL parts to url-kind media sources, forwarding the file id', () => {
+    expect(
+      toWireContent({
+        type: 'image_url',
+        imageUrl: { url: 'https://example.com/a.png', id: 'file_1' },
+      }),
+    ).toEqual({
+      type: 'image',
+      source: { kind: 'url', url: 'https://example.com/a.png', id: 'file_1' },
+    });
+    expect(
+      toWireContent({ type: 'video_url', videoUrl: { url: 'https://example.com/v.mp4' } }),
+    ).toEqual({
+      type: 'video',
+      source: { kind: 'url', url: 'https://example.com/v.mp4', id: undefined },
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDKRpcClientWire resume replay — the replay-fidelity contract: the wire
+// resume state must carry what the TUI's hydrateFromReplay consumes
+// (apps/kimi-code session-replay.ts): agents.main.{replay, context, config,
+// permission, plan, swarmMode, background, tools}. The stub provider makes
+// every turn fail fast, but the user message persists before the turn runs —
+// that is the history replay must render.
+// ---------------------------------------------------------------------------
+
+function replayUserTexts(main: { readonly replay: readonly unknown[] }): string[] {
+  return (main.replay as Array<{ type: string; message?: { role: string; content: Array<{ type: string; text?: string }> } }>)
+    .filter((record) => record.type === 'message' && record.message?.role === 'user')
+    .map((record) =>
+      (record.message?.content ?? [])
+        .map((part) => (part.type === 'text' ? (part.text ?? '') : ''))
+        .join(''),
+    );
+}
+
+describe('SDKRpcClientWire resume replay', () => {
+  it('populates agents.main replay state from the snapshot and messages', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const http = new WireHttpClient({ baseUrl: base, token });
+    const created = await rpc.createSession({ workDir: cwd });
+    // The stub provider's turn now retries instead of dying instantly, so
+    // abort each turn to settle the session quickly; the user message is
+    // persisted on submit, before the turn runs — that is the history replay
+    // must render.
+    await rpc.prompt({ sessionId: created.id, input: [{ type: 'text', text: 'replay-one' }] });
+    await rpc.cancel({ sessionId: created.id });
+    await waitForAsync(async () => !(await http.getSession(created.id)).busy);
+    await rpc.prompt({ sessionId: created.id, input: [{ type: 'text', text: 'replay-two' }] });
+    await rpc.cancel({ sessionId: created.id });
+    await waitForAsync(async () => !(await http.getSession(created.id)).busy);
+
+    const resumed = await rpc.resumeSession({ id: created.id, replayTurnLimit: 10 });
+    const main = resumed.agents['main'];
+    expect(main).toBeDefined();
+    expect(main?.type).toBe('main');
+
+    // The replay records hydrateFromReplay renders: user/assistant/tool
+    // messages with a numeric time each.
+    for (const record of main?.replay ?? []) {
+      expect(record.time).toEqual(expect.any(Number));
+    }
+    const userTexts = replayUserTexts(main ?? { replay: [] });
+    expect(userTexts).toContain('replay-one');
+    expect(userTexts).toContain('replay-two');
+
+    // The snapshot fields appStateFromResumeAgent / hydrateSnapshot read.
+    expect(main?.config.cwd).toBe(cwd);
+    expect(main?.config.modelCapabilities.max_context_tokens).toBeGreaterThan(0);
+    expect(main?.context.tokenCount).toEqual(expect.any(Number));
+    expect(main?.context.history.some((m) => m.role === 'user')).toBe(true);
+    expect(['manual', 'yolo', 'auto']).toContain(main?.permission.mode);
+    expect(main?.plan).toBeNull();
+    expect(main?.swarmMode).toEqual(expect.any(Boolean));
+    expect(Array.isArray(main?.background)).toBe(true);
+    expect(Array.isArray(main?.tools)).toBe(true);
+    await rpc.close();
+  });
+
+  it('trims the replay to replayTurnLimit user turns', async () => {
+    const rpc = new SDKRpcClientWire({ serverUrl: base, token, homeDir: home });
+    await rpc.start();
+    const http = new WireHttpClient({ baseUrl: base, token });
+    const created = await rpc.createSession({ workDir: cwd });
+    await rpc.prompt({ sessionId: created.id, input: [{ type: 'text', text: 'trim-one' }] });
+    await rpc.cancel({ sessionId: created.id });
+    await waitForAsync(async () => !(await http.getSession(created.id)).busy);
+    await rpc.prompt({ sessionId: created.id, input: [{ type: 'text', text: 'trim-two' }] });
+    await rpc.cancel({ sessionId: created.id });
+    await waitForAsync(async () => !(await http.getSession(created.id)).busy);
+
+    const resumed = await rpc.resumeSession({ id: created.id, replayTurnLimit: 1 });
+    const userTexts = replayUserTexts(resumed.agents['main'] ?? { replay: [] });
+    expect(userTexts).toContain('trim-two');
+    expect(userTexts).not.toContain('trim-one');
+    await rpc.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// collectReplayMessages — the older-history paging behind the resume replay.
+// Stubbed page source: the messages route serves newest-first pages, the
+// helper must prepend them oldest-first and stop at the turn limit or at the
+// end of history.
+// ---------------------------------------------------------------------------
+
+describe('collectReplayMessages', () => {
+  function stubPageSource(pages: Array<{ items: WireMessage[]; has_more: boolean }>) {
+    const calls: Array<string | undefined> = [];
+    const fetchPage = async (beforeId?: string) => {
+      calls.push(beforeId);
+      const page = pages[calls.length - 1];
+      if (page === undefined) throw new Error('unexpected extra page fetch');
+      return page;
+    };
+    return { calls, fetchPage };
+  }
+
+  function stubMessage(id: string, text: string, role: 'user' | 'assistant' = 'user'): WireMessage {
+    return {
+      id,
+      session_id: 's1',
+      role,
+      content: [{ type: 'text', text }],
+      created_at: '2026-07-30T00:00:00.000Z',
+    };
+  }
+
+  it('pages older history until the turn limit is covered, oldest-first', async () => {
+    // Snapshot page (ascending): the newest three messages, one user turn.
+    const firstPage = {
+      items: [stubMessage('m3', 'newest'), stubMessage('m4', 'reply', 'assistant'), stubMessage('m5', 'latest')],
+      has_more: true,
+    };
+    // Messages route page (newest-first): two older user turns.
+    const olderPage = {
+      items: [stubMessage('m2', 'second'), stubMessage('m1', 'first')],
+      has_more: false,
+    };
+    const { calls, fetchPage } = stubPageSource([olderPage]);
+    const messages = await collectReplayMessages(fetchPage, firstPage, 3);
+    expect(calls).toEqual(['m3']);
+    expect(messages.map((m) => m.id)).toEqual(['m1', 'm2', 'm3', 'm4', 'm5']);
+  });
+
+  it('does not page when the snapshot already covers the turn limit', async () => {
+    const firstPage = {
+      items: [stubMessage('m1', 'only turn')],
+      has_more: true,
+    };
+    const { calls, fetchPage } = stubPageSource([]);
+    const messages = await collectReplayMessages(fetchPage, firstPage, 1);
+    expect(calls).toEqual([]);
+    expect(messages.map((m) => m.id)).toEqual(['m1']);
+  });
+
+  it('pages to the end of history when no turn limit is given', async () => {
+    const firstPage = { items: [stubMessage('m3', 'c')], has_more: true };
+    const pageTwo = { items: [stubMessage('m2', 'b')], has_more: true };
+    const pageThree = { items: [stubMessage('m1', 'a')], has_more: false };
+    const { calls, fetchPage } = stubPageSource([pageTwo, pageThree]);
+    const messages = await collectReplayMessages(fetchPage, firstPage, undefined);
+    expect(calls).toEqual(['m3', 'm2']);
+    expect(messages.map((m) => m.id)).toEqual(['m1', 'm2', 'm3']);
+  });
+
+  it('stops paging when a page makes no progress (pivot not found)', async () => {
+    const firstPage = { items: [stubMessage('m3', 'c')], has_more: true };
+    // The server answers with a page whose oldest id is the pivot itself —
+    // continuing would loop forever on the same page.
+    const stuckPage = { items: [stubMessage('m3', 'c')], has_more: true };
+    const { calls, fetchPage } = stubPageSource([stuckPage, stuckPage]);
+    const messages = await collectReplayMessages(fetchPage, firstPage, 5);
+    expect(calls).toEqual(['m3']);
+    expect(messages.map((m) => m.id)).toEqual(['m3']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// createKimiHarnessWire — the factory wires SDKRpcClientWire into a
+// KimiHarness (awaiting the supervisor start before returning). Live server
+// fixture from the lifecycle describes above.
+// ---------------------------------------------------------------------------
+
+describe('createKimiHarnessWire', () => {
+  it('creates a harness that drives a full session lifecycle over the wire', async () => {
+    const harness = await createKimiHarnessWire({
+      serverUrl: base,
+      token,
+      homeDir: home,
+      identity: TEST_IDENTITY,
+    });
+    const session = await harness.createSession({ workDir: cwd });
+    expect(session.id).toBeTruthy();
+    const summaries = await harness.listSessions({});
+    expect(summaries.some((s) => s.id === session.id)).toBe(true);
+
+    const resumed = await harness.resumeSession({ id: session.id });
+    expect(resumed.id).toBe(session.id);
+
+    await harness.deleteSession(session.id);
+    // The default list excludes archived sessions (server contract)…
+    const after = await harness.listSessions({});
+    expect(after.some((s) => s.id === session.id)).toBe(false);
+    // …and the session itself reads back archived:
+    const http = new WireHttpClient({ baseUrl: base, token });
+    expect((await http.getSession(session.id)).archived).toBe(true);
+    await harness.close();
+  });
+
+  /**
+   * Regression for the agents-view "dispatch then immediately attach" bug:
+   * `createSession()` registers the session in `activeSessions` with
+   * `resumeState` undefined (a create-time summary has no
+   * `sessionMetadata`/`agents`). Attaching right after dispatch calls
+   * `resumeSession` on that same, still-cached id with no `kaos`/
+   * `agentProfile` — the exact shape agents-view's attach uses. The cache
+   * hit must not hand back the untouched, unhydrated Session: it needs a
+   * real resume (snapshot + subscribe) merged in, so the attached view can
+   * render history and receive live events instead of "Session history is
+   * unavailable for this session."
+   */
+  it('hydrates resume state on an immediate resume after createSession', async () => {
+    const harness = await createKimiHarnessWire({
+      serverUrl: base,
+      token,
+      homeDir: home,
+      identity: TEST_IDENTITY,
+    });
+    try {
+      const session = await harness.createSession({ workDir: cwd });
+      expect(session.getResumeState()).toBeUndefined();
+      await session.prompt('hi');
+
+      const resumed = await harness.resumeSession({ id: session.id });
+
+      // Identity is preserved (kaos-rebind / matching-profile callers rely
+      // on getting the SAME Session object back on a cache hit) …
+      expect(resumed).toBe(session);
+      // … but it must now carry real resume state instead of the stale
+      // create-time summary.
+      expect(resumed.getResumeState()?.agents['main']).toBeDefined();
+
+      await harness.deleteSession(session.id);
+    } finally {
+      await harness.close();
+    }
+  });
+});

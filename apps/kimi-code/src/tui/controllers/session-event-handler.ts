@@ -28,6 +28,7 @@ import type {
   TurnStepCompletedEvent,
   TurnStepInterruptedEvent,
   TurnStepStartedEvent,
+  TokenUsage,
   WarningEvent,
 } from '@moonshot-ai/kimi-code-sdk';
 
@@ -104,6 +105,9 @@ export interface SessionEventHost {
   showNotice(title: string, detail?: string): void;
   updateActivityPane(): void;
   track(event: string, props?: Record<string, unknown>): void;
+  recordSessionActivity(): void;
+  noteStepUsage(usage: TokenUsage | undefined): void;
+  noteCompactionFinished(): void;
   mountEditorReplacement(panel: Component & Focusable): void;
   restoreEditor(): void;
   restoreInputText(text: string): void;
@@ -317,8 +321,18 @@ export class SessionEventHandler {
       this.pluginCommandTurns.set(String(event.turnId), event.origin.pluginId);
     }
     this.clearAgentSwarmProgress();
+    this.host.streamingUI.flushNow();
     this.host.streamingUI.resetToolUi();
     this.host.streamingUI.setStep(0);
+    // A new turn.started with no intervening turn.ended for whatever the
+    // previous turn was (its own turn.ended can be lost the same way a
+    // fresh attach can miss events — see reconcileStreamingPhaseAfterAttach)
+    // must not leave that turn's thinking/assistant draft dangling into this
+    // one: it would otherwise keep accumulating into the same shared
+    // _activeThinkingComponent/_thinkingDraft, concatenating unrelated
+    // turns' text together. Same close-out handleStepBegin already does at
+    // step boundaries, applied here at the coarser turn boundary too.
+    this.host.streamingUI.finalizeLiveTextBuffers('waiting');
     this.host.patchLivePane({
       mode: 'waiting',
       pendingApproval: null,
@@ -327,6 +341,7 @@ export class SessionEventHandler {
     this.host.setAppState({
       streamingPhase: 'waiting',
       streamingStartTime: Date.now(),
+      streamingStartApprox: false,
     });
   }
 
@@ -365,6 +380,7 @@ export class SessionEventHandler {
     }
     this.host.streamingUI.resetToolUi();
     this.host.streamingUI.finalizeTurn(sendQueued);
+    this.host.recordSessionActivity();
     this.renderPendingModelBlockedFallback();
     this.currentTurnHasAssistantText = false;
     this.goalCompletionTurnEnded = true;
@@ -397,14 +413,15 @@ export class SessionEventHandler {
       pendingApproval: null,
       pendingQuestion: null,
     });
-    this.host.setAppState({
-      streamingPhase: 'waiting',
-      streamingStartTime: Date.now(),
-    });
+    // A step boundary within the SAME turn — not a new turn, so the elapsed
+    // clock (streamingStartTime) is intentionally left untouched (see
+    // handleTurnBegin for the actual per-turn reset).
+    this.host.setAppState({ streamingPhase: 'waiting' });
   }
 
   private handleStepCompleted(event: TurnStepCompletedEvent): void {
     this.host.streamingUI.flushNow();
+    this.host.noteStepUsage(event.usage);
     this.maybeShowDebugTiming(event);
 
     if (event.providerFinishReason === 'filtered') {
@@ -492,8 +509,10 @@ export class SessionEventHandler {
     if (event.delta.trim().length === 0 && !streamingUI.hasThinkingDraft()) return;
     streamingUI.appendThinkingDelta(event.delta);
     this.host.patchLivePane({ mode: 'idle' });
+    // A phase change within the same turn — the elapsed clock is turn-scoped
+    // (see handleTurnBegin), so streamingStartTime is deliberately untouched.
     if (state.appState.streamingPhase !== 'thinking') {
-      this.host.setAppState({ streamingPhase: 'thinking', streamingStartTime: Date.now() });
+      this.host.setAppState({ streamingPhase: 'thinking' });
     }
     streamingUI.scheduleFlush();
   }
@@ -515,8 +534,9 @@ export class SessionEventHandler {
       pendingApproval: null,
       pendingQuestion: null,
     });
+    // Same-turn phase change — streamingStartTime is intentionally left alone.
     if (state.appState.streamingPhase !== 'composing') {
-      this.host.setAppState({ streamingPhase: 'composing', streamingStartTime: Date.now() });
+      this.host.setAppState({ streamingPhase: 'composing' });
     }
     streamingUI.scheduleFlush();
   }
@@ -588,8 +608,9 @@ export class SessionEventHandler {
       pendingApproval: null,
       pendingQuestion: null,
     });
+    // Same-turn phase change — streamingStartTime is intentionally left alone.
     if (state.appState.streamingPhase !== 'composing') {
-      this.host.setAppState({ streamingPhase: 'composing', streamingStartTime: Date.now() });
+      this.host.setAppState({ streamingPhase: 'composing' });
     }
     streamingUI.scheduleFlush();
   }
@@ -944,6 +965,13 @@ export class SessionEventHandler {
           'textMuted',
         );
         return;
+      case 'removed':
+        this.finalizeMcpServerStatusRow(
+          server.name,
+          `MCP server "${server.name}" removed`,
+          'textMuted',
+        );
+        return;
       case 'pending':
         this.showMcpServerStatusSpinner(server.name);
         return;
@@ -1024,10 +1052,12 @@ export class SessionEventHandler {
 
   private handleCompactionBegin(event: CompactionStartedEvent): void {
     this.host.streamingUI.finalizeLiveTextBuffers('waiting');
+    // isCompacting hides the activity pane outright (resolveActivityPaneMode),
+    // and a mid-turn compaction must not disturb that turn's elapsed clock —
+    // so streamingStartTime is deliberately left alone here.
     this.host.setAppState({
       isCompacting: true,
       streamingPhase: 'waiting',
-      streamingStartTime: Date.now(),
     });
     this.host.streamingUI.beginCompaction(event.instruction);
   }
@@ -1041,6 +1071,12 @@ export class SessionEventHandler {
       event.result.tokensAfter,
       event.result.summary,
     );
+    // A completed compaction just refreshed and shrank the cached context —
+    // count it as activity so the next submit isn't judged against the
+    // pre-compaction timestamp, and reset the cache-break baseline (the drop
+    // is expected). Cancellations do neither: the context was not cut.
+    this.host.recordSessionActivity();
+    this.host.noteCompactionFinished();
     this.finishCompaction(sendQueued);
   }
 

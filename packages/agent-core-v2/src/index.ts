@@ -10,7 +10,33 @@ export * from '#/_base/di/instantiation';
 export * from '#/_base/di/instantiationService';
 export * from '#/_base/di/lifecycle';
 export * from '#/_base/di/scope';
+export * from './app/scopes';
 export * from '#/_base/di/serviceCollection';
+export * from '#/_base/di/cascadeEngine';
+export * from '#/_base/di/dependencyGraph';
+export * from '#/_base/lifecycle/ledger';
+export {
+  collection,
+  isCollectionToken,
+  type CollectionChange,
+  type CollectionRecord,
+  type CollectionToken,
+  type CollectionView,
+} from '#/_base/di/collection';
+export {
+  FiberProtocolError,
+  FiberState,
+  ScopeUnits,
+  ServiceRecipeError,
+  setFiberEventResolver,
+  type ConfigSchema,
+  type Fiber,
+  type FiberHandle,
+  type FiberProvideOptions,
+  type RecipeStatics,
+  type ServiceRecipe,
+} from '#/_base/di/fiber';
+export { Service } from '#/_base/di/service';
 export * from './errors';
 
 export * from '#/_base/log/log';
@@ -20,6 +46,7 @@ export * from '#/_base/log/fileLog';
 export * from '#/_base/log/logService';
 export * from '#/wire/wire';
 export * from '#/wire/wireService';
+export * from '#/wire/wireContribution';
 export * from '#/wire/record';
 export * from '#/wire/migration/migration';
 export * from '#/session/sessionLog/sessionLogService';
@@ -32,12 +59,14 @@ export * from '#/app/telemetry/consoleAppender';
 export * from '#/app/telemetry/cloudAppender';
 export * from '#/app/bootstrap/bootstrap';
 export * from '#/app/bootstrap/bootstrapService';
+export * from '#/os/interface/hostClock';
 export * from '#/os/interface/hostEnvironment';
 export * from '#/os/interface/hostFileSystem';
 export * from '#/os/interface/hostFsWatch';
 export * from '#/os/interface/hostProcess';
 export * from '#/os/interface/terminal';
 export * from '#/os/interface/terminalErrors';
+export * from '#/os/backends/node-local/hostClockService';
 export * from '#/os/backends/node-local/hostEnvironmentService';
 export * from '#/os/backends/node-local/hostFsService';
 export * from '#/os/backends/node-local/hostFsWatchService';
@@ -62,12 +91,15 @@ import '#/app/task/taskService';
 export { TaskService } from '#/app/task/taskService';
 import '#/app/event/eventBusService';
 import '#/app/event/eventService';
+import '#/app/event/fiberEventResolver';
 export { IEventBus, type DomainEvent } from '#/app/event/eventBus';
 export { IEventService, type DomainEvent as GlobalEvent } from '#/app/event/event';
 export * from '#/_base/state/stateRegistry';
 export * from '#/_base/contribution/registry';
-export * from '#/app/state/state';
-import '#/app/state/stateService';
+export * from '#/app/state/appState';
+import '#/app/state/appStateService';
+export * from '#/workspace/state/workspaceState';
+import '#/workspace/state/workspaceStateService';
 export * from '#/session/state/sessionState';
 import '#/session/state/sessionStateService';
 export * from '#/agent/state/agentState';
@@ -89,20 +121,28 @@ export type {
 
 export * from '#/app/sessionIndex/sessionIndex';
 export * from '#/app/sessionIndex/sessionIndexService';
+export * from '#/app/sessionIndex/sessionIndexMirrorService';
 export * from '#/session/sessionMetadata/sessionMetadata';
 export * from '#/session/sessionMetadata/sessionMetadataService';
 export * from '#/session/sessionActivity/sessionActivity';
 export * from '#/session/sessionActivity/sessionActivityService';
+export * from '#/session/sessionActivity/sessionOutcomeMirror';
+export * from '#/session/sessionActivity/sessionOutcomeMirrorService';
 export * from '#/session/sessionToolPolicy/sessionToolPolicy';
 export * from '#/session/sessionToolPolicy/sessionToolPolicyService';
 export * from '#/app/config/config';
 export * from '#/app/config/configService';
+export * from '#/app/config/configSectionContributions';
 import '#/app/kosongConfig/configSection';
 export * from '#/kosong/provider/provider';
 export * from '#/kosong/provider/providerService';
 export * from '#/kosong/provider/providerDefinition';
 export * from '#/kosong/provider/protocolAdapterRegistry';
 import '#/app/skillCatalog/configSection';
+import '#/app/agentIdentity/configSection';
+export * from '#/app/agentIdentity/configSection';
+export * from '#/app/agentIdentity/agentIdentity';
+export * from '#/app/agentIdentity/agentIdentityService';
 import '#/kosong/protocol/errors';
 export * from '#/kosong/protocol/errors';
 export * from '#/kosong/protocol/protocol';
@@ -120,18 +160,12 @@ export * from '#/kosong/model/catalog';
 export * from '#/kosong/model/catalogService';
 export * from '#/kosong/model/modelRequester';
 import '#/kosong/model/errors';
-// `ModelCatalogConfig` / `MODEL_CATALOG_SECTION` live in the configSection
-// side-effect module but the edge (kap-server's refresh scheduler) consumes
-// them from the package root — re-export here.
 export {
   MODEL_CATALOG_SECTION,
   ModelCatalogConfigSchema,
   type ModelCatalogConfig,
 } from '#/app/kosongConfig/configSection';
 export type { SecondaryModelConfig } from '#/app/kosongConfig/configSection';
-// The secondary-model derived-entry overlay: the edge (kap-server's
-// `GET /models` route) hides the reserved id from pickers, and tests drive
-// the overlay directly — re-export from the package root.
 export {
   SECONDARY_DERIVED_MODEL_ID,
   secondaryModelOverlay,
@@ -141,6 +175,7 @@ export * from '#/app/kosongConfig/kosongConfig';
 export * from '#/app/kosongConfig/kosongConfigService';
 export * from '#/kosong/model/modelOAuth';
 export * from '#/app/kosongConfig/oauthTokenAdapter';
+export * from '#/app/kosongConfig/hostRequestHeadersAdapter';
 export * from '#/app/kosongConfig/discovery';
 export * from '#/app/kosongConfig/discoveryService';
 export * from '#/app/kosongConfig/errors';
@@ -148,9 +183,6 @@ export * from '#/app/kosongConfig/modelsDevImport';
 export * from '#/app/kosongConfig/modelsDevImportService';
 export * from '#/app/kosongConfig/modelsDevUpstream';
 export * from '#/app/kosongConfig/modelsDev';
-// kosong wire composition roots — importing these modules registers the four
-// protocol bases and every provider definition (kimi + the canonical vendor
-// endpoints); without them the adapter registry stays empty.
 import '#/kosong/provider/bases/anthropic/index';
 import '#/kosong/provider/bases/google-genai/index';
 import '#/kosong/provider/bases/openai/index';
@@ -170,14 +202,10 @@ export {
   _clearAgentProfileContributionsForTests,
 } from '#/app/agentProfileCatalog/contribution';
 export * from '#/workspace/workspaceAgentProfileLoader/configSection';
-// Public agent-file primitives consumed out-of-package (the v2 print CLI's
-// `--agent-file` path); everything else under `internal/` stays domain-private.
 export { parseAgentFileText } from '#/workspace/workspaceAgentProfileLoader/internal/agentFile';
 export { resolveAgentPath } from '#/workspace/workspaceAgentProfileLoader/internal/paths';
-export * from '#/workspace/workspaceAgentProfileLoader/agentCatalogRuntimeOptions';
 export * from '#/workspace/workspaceAgentProfileLoader/userAgentProfileLoader';
 export * from '#/workspace/workspaceAgentProfileLoader/userAgentProfileLoaderService';
-export * from '#/app/hostIdentity/hostIdentity';
 export * from '#/app/plugin/types';
 export * from '#/app/plugin/commands';
 export * from '#/app/plugin/manifest';
@@ -188,6 +216,20 @@ export * from '#/app/plugin/archive';
 export * from '#/app/plugin/manager';
 export * from '#/app/plugin/plugin';
 export * from '#/app/plugin/pluginService';
+export * from '#/app/capability/capability';
+export * from '#/app/capability/capabilityService';
+export * from '#/app/capability/errors';
+export * from '#/app/capability/types';
+export * from '#/app/feature/featureManager';
+import '#/app/feature/featureManagerService';
+export * from '#/features/feature';
+export * from '#/features/featureAssembly';
+export * from '#/features/featureRegistry';
+import '#/features/featureAssemblyService';
+export * from '#/agent/command/agentCommand';
+export * from '#/agent/command/commandContribution';
+import '#/agent/command/agentCommandService';
+export * from '#/debug/index';
 export * from '#/workspace/workspaceAgentProfileLoader/pluginAgentProfileLoader';
 export * from '#/workspace/workspaceAgentProfileLoader/pluginAgentProfileLoaderService';
 
@@ -198,7 +240,6 @@ export * from '#/agent/skill/skill';
 export * from '#/agent/skill/skillService';
 export * from '#/app/skillCatalog/types';
 export * from '#/app/skillCatalog/configSection';
-export * from '#/app/skillCatalog/skillCatalogRuntimeOptions';
 export * from '#/app/skillCatalog/parser';
 export * from '#/app/skillCatalog/registry';
 export * from '#/app/skillCatalog/errors';
@@ -248,15 +289,22 @@ export * from '#/app/flag/flagService';
 
 export * from '#/agent/activityView/activityView';
 import '#/agent/activityView/activityViewService';
-import '#/agent/plan/profile/plan';
-export * from '#/agent/tools/plan/enter-plan-mode/enter-plan-mode';
-import '#/agent/tools/plan/enter-plan-mode/enterPlanModeTool';
-export * from '#/agent/tools/plan/exit-plan-mode/exit-plan-mode';
-import '#/agent/tools/plan/exit-plan-mode/exitPlanModeTool';
-import '#/agent/plan/configSection';
-export * from '#/agent/plan/plan';
-export * from '#/agent/plan/planOps';
-export * from '#/agent/plan/planService';
+export * from '#/features/btw/btw';
+export * from '#/features/btw/btwService';
+import '#/features/btw/btwFeature';
+import '#/features/plan/profile/plan';
+export * from '#/features/plan/tools/enter-plan-mode/enter-plan-mode';
+import '#/features/plan/tools/enter-plan-mode/enterPlanModeTool';
+export * from '#/features/plan/tools/exit-plan-mode/exit-plan-mode';
+import '#/features/plan/tools/exit-plan-mode/exitPlanModeTool';
+export * from '#/features/plan/configSection';
+export * from '#/features/plan/plan';
+export * from '#/features/plan/planOps';
+export * from '#/features/plan/planService';
+import '#/features/plan/planFeature';
+export * from '#/features/debugEvents/debugEvents';
+export * from '#/features/debugEvents/debugEventsService';
+import '#/features/debugEvents/debugEventsFeature';
 export * from '#/agent/tools/goal/create-goal/create-goal';
 import '#/agent/tools/goal/create-goal/createGoalTool';
 export * from '#/agent/tools/goal/get-goal/get-goal';
@@ -278,6 +326,8 @@ export * from '#/agent/usage/usage';
 export * from '#/agent/usage/usageService';
 export * from '#/agent/toolDedupe/toolDedupe';
 export * from '#/agent/toolDedupe/toolDedupeService';
+export * from '#/agent/agentsMdReminder/agentsMdReminder';
+export * from '#/agent/agentsMdReminder/agentsMdReminderService';
 import '#/agent/toolSelect/flag';
 export * from '#/agent/tools/select-tools/select-tools';
 import '#/agent/tools/select-tools/selectToolsTool';
@@ -358,9 +408,9 @@ export * from '#/app/workspaceLifecycle/workspaceLifecycle';
 export * from '#/app/workspaceLifecycle/workspaceLifecycleService';
 export * from '#/app/workspaceLifecycle/sessionLookup';
 export * from '#/workspace/workspaceContext/workspaceContext';
-export * from '#/workspace/workspaceHandler/workspaceHandler';
-export * from '#/workspace/workspaceHandler/workspaceHandlerService';
-export * from '#/workspace/workspaceHandler/addressing';
+export * from '#/workspace/sessionLifecycle/sessionLifecycle';
+export * from '#/workspace/sessionLifecycle/sessionLifecycleService';
+export * from '#/workspace/sessionLifecycle/internal/addressing';
 export * from '#/session/sessionLifecycleHooks/sessionLifecycleHooks';
 export * from '#/session/externalHooks/externalHooks';
 export * from '#/session/externalHooks/externalHooksService';
@@ -379,7 +429,12 @@ export * from '#/session/sessionContext/sessionContext';
 
 import '#/session/approval/approval';
 import '#/session/approval/approvalService';
-export { ISessionApprovalService } from '#/session/approval/approval';
+export {
+  ISessionApprovalService,
+  type ApprovalDecision,
+  type ApprovalRequest as SessionApprovalRequest,
+  type ApprovalResponse as SessionApprovalResponse,
+} from '#/session/approval/approval';
 export * from '#/session/question/question';
 export * from '#/session/question/questionService';
 export * from '#/agent/tools/ask-user-question/ask-user-question';
@@ -405,14 +460,14 @@ import '#/app/bashParser/bashParserService';
 export * from '#/session/process/processRunner';
 export * from '#/session/process/processRunnerService';
 export * from '#/workspace/workspaceProcess/workspaceProcessRunnerService';
-export * from '#/workspace/workspaceFs/errors';
+export * from '#/workspace/workspaceFs/internal/errors';
 export * from '#/workspace/workspaceFs/fs';
 export * from '#/workspace/workspaceFs/fsService';
 export * from '#/workspace/workspaceFs/fsWatch';
 export * from '#/workspace/workspaceFs/fsWatchService';
 export * from '#/session/agentLifecycle/profile/gitContext';
-export * from '#/workspace/workspaceFs/rgLocator';
-export * from '#/workspace/workspaceFs/runRg';
+export * from '#/workspace/workspaceFs/internal/rgLocator';
+export * from '#/workspace/workspaceFs/internal/runRg';
 export * from '#/workspace/workspaceGit/workspaceGit';
 export * from '#/workspace/workspaceGit/workspaceGitService';
 export * from '#/session/sessionToolPolicyGate/sessionToolPolicyGate';
@@ -500,16 +555,17 @@ export * from '#/agent/contextMemory/conversationUndoParticipants';
 export * from '#/agent/contextMemory/conversationTime';
 export * from '#/agent/contextMemory/loopEventFold';
 export * from '#/agent/contextMemory/messageId';
-export * from '#/agent/contextMemory/messageProjection';
 export * from '#/agent/contextMemory/contextTranscript';
 export * from '#/agent/contextMemory/types';
 export * from '#/agent/systemReminder/systemReminder';
 export * from '#/agent/systemReminder/systemReminderService';
+export * from '#/agent/dateChange/dateChange';
+export * from '#/agent/dateChange/dateChangeService';
 export * from '#/agent/contextProjector/contextProjector';
 export * from '#/agent/contextProjector/contextProjectorService';
-export * from '#/agent/contextSize/contextSize';
-export * from '#/agent/contextSize/contextSizeOps';
-export * from '#/agent/contextSize/contextSizeService';
+export * from '#/agent/tokenCounting/tokenCounting';
+export * from '#/agent/tokenCounting/tokenCountingOps';
+export * from '#/agent/tokenCounting/tokenCountingService';
 export * from '#/agent/contextInjector/contextInjector';
 export * from '#/agent/contextInjector/contextInjectorService';
 export * from '#/agent/plugin/agentPlugin';
@@ -525,12 +581,18 @@ export * from '#/agent/fullCompaction/types';
 export * from '#/agent/llmRequester/llmRequester';
 export * from '#/agent/llmRequester/llmRequesterService';
 export * from '#/agent/llmRequester/llmRequestOps';
+export * from '#/_base/utils/promise';
 export * from '#/_base/utils/retry';
+export * from '#/_base/utils/env';
+export * from '#/_base/utils/timer';
 import '#/agent/loop/configSection';
 export * from '#/agent/loop/loop';
 export * from '#/agent/loop/loopService';
 export * from '#/agent/loop/loopContinuation';
 export * from '#/agent/loop/loopContinuationService';
+export * from '#/agent/interruptionReminder/interruptionReminder';
+export * from '#/agent/interruptionReminder/interruptionReminderService';
+export * from '#/agent/interruptionReminder/interruptionReminderOps';
 export * from '#/agent/mcp/mcp';
 export * from '#/agent/mcp/mcpService';
 export * from '#/agent/mcp/mcpDiscoveryOps';
@@ -559,9 +621,6 @@ export * from '#/agent/profile/profileService';
 export * from '#/agent/profile/context';
 export * from '#/agent/prompt/prompt';
 export * from '#/agent/prompt/promptService';
-import '#/app/messageLegacy/errors';
-export * from '#/app/messageLegacy/messageLegacy';
-export * from '#/app/messageLegacy/messageLegacyService';
 export * from '#/agent/replayBuilder/types';
 export * from '#/agent/undo/undo';
 export * from '#/agent/undo/undoService';
@@ -573,8 +632,6 @@ export * from '#/agent/rpc/prompt-metadata';
 export * from '#/agent/scopeContext/scopeContext';
 export * from '#/agent/stepRetry/stepRetry';
 export * from '#/agent/stepRetry/stepRetryService';
-export * from '#/session/btw/btw';
-export * from '#/session/btw/btwService';
 export * from '#/session/sessionInit/sessionInit';
 export * from '#/session/sessionInit/sessionInitService';
 export * from '#/session/sessionInit/profile/init';
@@ -598,8 +655,8 @@ import '#/agent/toolRegistry/toolRegistry';
 import '#/agent/toolRegistry/toolRegistryService';
 export { IAgentToolActivationService } from '#/agent/toolActivation/toolActivation';
 export { IAgentToolRegistryService } from '#/agent/toolRegistry/toolRegistry';
-export { registerAgentToolService } from '#/agent/toolRegistry/toolContribution';
-export type { AgentToolContribution, AgentToolContributionOptions } from '#/agent/toolRegistry/toolContribution';
+export { registerAgentToolService, AgentToolContribution } from '#/agent/toolRegistry/toolContribution';
+export type { AgentToolContributionOptions } from '#/agent/toolRegistry/toolContribution';
 export * from '#/agent/userTool/userTool';
 export * from '#/agent/userTool/userToolOps';
 export * from '#/agent/userTool/userToolService';

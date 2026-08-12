@@ -207,6 +207,22 @@ export class FooterComponent implements Component {
    */
   private backgroundBashTaskCount = 0;
   private backgroundAgentCount = 0;
+  /**
+   * Agents-view attach badge: live roster counts of the OTHER sessions
+   * while the user is attached to one. Fed by the agents view controller
+   * (its roster subscription survives the attach); both zero hides it.
+   */
+  private attachAgentsCount = 0;
+  private attachAwaitingCount = 0;
+  /**
+   * I4: true while the session on screen was attached FROM the roster (the
+   * agents view is detached, not closed) — the same condition
+   * `KimiTUI.returnToAgentsView()` checks. Esc/← are the only way back and
+   * neither was ever advertised on screen; this leads the attach badge's
+   * segments with a standing hint so it is, regardless of whether any OTHER
+   * roster session is busy enough to populate the counts above.
+   */
+  private attachedFromRoster = false;
 
   constructor(state: AppState, onRefresh: () => void = () => {}) {
     this.state = state;
@@ -266,6 +282,20 @@ export class FooterComponent implements Component {
   setBackgroundCounts(counts: { bashTasks: number; agentTasks: number }): void {
     this.backgroundBashTaskCount = Math.max(0, counts.bashTasks);
     this.backgroundAgentCount = Math.max(0, counts.agentTasks);
+  }
+
+  /**
+   * Sync the attach-mode badge with live roster counts. Each non-zero count
+   * adds its segment to `← N working · M awaiting input`; both zero hides it.
+   */
+  setAttachCounts(counts: { agents: number; awaiting: number }): void {
+    this.attachAgentsCount = Math.max(0, counts.agents);
+    this.attachAwaitingCount = Math.max(0, counts.awaiting);
+  }
+
+  /** I4: set alongside {@link setAttachCounts} — see {@link attachedFromRoster}. */
+  setAttachedFromRoster(value: boolean): void {
+    this.attachedFromRoster = value;
   }
 
   invalidate(): void {}
@@ -412,6 +442,27 @@ export class FooterComponent implements Component {
     // tasks (background subagents) stay separate so the user can tell them
     // apart at a glance.
     const taskBadges: string[] = [];
+    // Agents-view attach badge leads: it points back to the view (`←`) the
+    // other badges have no relation to.
+    const attachSegments: string[] = [];
+    // I4: the return affordance itself leads the badge's own segments,
+    // standing even when neither count below has anything to show — Esc/←
+    // are otherwise unadvertised anywhere on screen.
+    if (this.attachedFromRoster) {
+      attachSegments.push('to return to agents');
+    }
+    if (this.attachAgentsCount > 0) {
+      // M6: the roster header calls this same bucket "working" (only busy
+      // rows, not every listed session) — match its term instead of the
+      // more sweeping-sounding "agents".
+      attachSegments.push(`${String(this.attachAgentsCount)} working`);
+    }
+    if (this.attachAwaitingCount > 0) {
+      attachSegments.push(`${String(this.attachAwaitingCount)} awaiting input`);
+    }
+    if (attachSegments.length > 0) {
+      taskBadges.push(chalk.hex(colors.primary)(`[← ${attachSegments.join(' · ')}]`));
+    }
     if (this.backgroundBashTaskCount > 0) {
       const noun = this.backgroundBashTaskCount === 1 ? 'task' : 'tasks';
       taskBadges.push(

@@ -12,6 +12,14 @@ export interface KimiSlashCommand<Name extends string = string> extends SlashCom
   /** When set, the command is hidden from the palette and blocked unless this flag is enabled. */
   readonly experimentalFlag?: FlagId;
   /**
+   * Set on commands whose RPC the wire transport cannot serve. Agents view
+   * runs the whole TUI on that transport, so without this the command sits in
+   * the palette and answers a raw `not_implemented` when picked. Same
+   * hide-and-refuse shape as {@link experimentalFlag}, for a capability gap
+   * rather than a feature flag.
+   */
+  readonly unavailableInAgentsView?: boolean;
+  /**
    * Generic argument autocompletion. `argumentPrefix` is the text typed after
    * `/<command> `; return suggestions or `null`. Declared as a plain function
    * property (not a method) so passing it around is `this`-free. Adapted to

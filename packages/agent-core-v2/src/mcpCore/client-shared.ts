@@ -1,5 +1,5 @@
 /**
- * `mcpCore` domain (L2) — shared MCP client helpers — request options, liveness probes, result conversion.
+ * `mcpCore` domain — shared MCP client helpers — request options, liveness probes, result conversion.
  */
 
 import { getCoreVersion } from '#/_base/version';
@@ -30,36 +30,12 @@ export function isMcpTransportFailure(error: unknown): boolean {
   return !(error instanceof McpError);
 }
 
-/**
- * Timeout for the liveness probe sent after an ambiguous tool-call failure.
- * Kept short: the probe runs on an already-failed call, so it must not add
- * anywhere near a tool-call timeout to the turn.
- */
 export const MCP_LIVENESS_PROBE_TIMEOUT_MS = 5_000;
 
-/**
- * True when the error is a client-side validation failure of an otherwise
- * well-formed JSON-RPC response: the SDK rejects with a `ZodError` when the
- * result of `tools/call` does not match `CallToolResultSchema`
- * (shared/protocol.js rejects with `parseResult.error`). The server did
- * answer, so reconnecting is pointless — but the error is not an `McpError`,
- * so `isMcpTransportFailure` alone cannot tell it apart from a dead
- * transport. Matched by name because the repo carries more than one zod
- * copy, which makes `instanceof` unreliable.
- */
 export function isMcpMalformedResultError(error: unknown): boolean {
   return error instanceof Error && error.name === 'ZodError';
 }
 
-/**
- * Probes whether the client's transport is still usable by sending a ping.
- * A server that answers in any way — including `MethodNotFound`, a JSON-RPC
- * error, or an unparseable result — counts as alive; only errors that prove
- * the bytes never made a round trip (closed connection, fetch failures) or
- * a probe that itself timed out (alive socket, unresponsive server) count
- * as dead. Never rejects; an abort surfaces as a dead verdict and is the
- * caller's job to detect via the signal.
- */
 export async function probeMcpLiveness(client: MCPClient, signal: AbortSignal): Promise<boolean> {
   try {
     await client.ping(signal);
@@ -103,11 +79,21 @@ export function toMcpToolDefinition(tool: SdkListedTool): MCPToolDefinition {
 
 export function toMcpToolResult(result: unknown): MCPToolResult {
   if (typeof result === 'object' && result !== null && 'content' in result) {
-    const typed = result as { content: unknown; isError?: unknown };
+    const typed = result as {
+      content: unknown;
+      isError?: unknown;
+      structuredContent?: unknown;
+      _meta?: unknown;
+    };
     if (Array.isArray(typed.content)) {
       return {
         content: typed.content as MCPToolResult['content'],
         isError: typed.isError === true,
+        structuredContent: typed.structuredContent,
+        _meta:
+          typeof typed._meta === 'object' && typed._meta !== null
+            ? (typed._meta as Record<string, unknown>)
+            : undefined,
       };
     }
   }

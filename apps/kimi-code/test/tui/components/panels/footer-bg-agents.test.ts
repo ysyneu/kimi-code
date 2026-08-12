@@ -104,3 +104,89 @@ describe('FooterComponent — background task / agent badges', () => {
     expect(strip(line1!)).not.toMatch(/\[3 agents running\]/);
   });
 });
+
+
+// ── Attach-mode badge `← N working · M awaiting input` ──
+
+describe('FooterComponent — attach agents badge', () => {
+  it('is hidden while both counts are zero', () => {
+    const footer = new FooterComponent(baseState());
+    const out = strip(footer.render(120)[0]!);
+    expect(out).not.toContain('←');
+  });
+
+  it('renders only the working segment when awaiting is zero', () => {
+    const footer = new FooterComponent(baseState());
+    footer.setAttachCounts({ agents: 2, awaiting: 0 });
+    const out = strip(footer.render(120)[0]!);
+    expect(out).toContain('[← 2 working]');
+    expect(out).not.toContain('awaiting input');
+  });
+
+  it('renders only the awaiting segment when the working count is zero', () => {
+    const footer = new FooterComponent(baseState());
+    footer.setAttachCounts({ agents: 0, awaiting: 1 });
+    const out = strip(footer.render(120)[0]!);
+    expect(out).toContain('[← 1 awaiting input]');
+    expect(out).not.toMatch(/← \d+ working/);
+  });
+
+  it('renders both segments joined by · when both are non-zero', () => {
+    const footer = new FooterComponent(baseState());
+    footer.setAttachCounts({ agents: 2, awaiting: 1 });
+    const out = strip(footer.render(120)[0]!);
+    expect(out).toContain('[← 2 working · 1 awaiting input]');
+  });
+
+  it('M6: "working" matches the roster header\'s term for the same bucket — no "agent(s)" noun', () => {
+    const footer = new FooterComponent(baseState());
+    footer.setAttachCounts({ agents: 1, awaiting: 0 });
+    const out = strip(footer.render(120)[0]!);
+    expect(out).toContain('[← 1 working]');
+    expect(out).not.toContain('agent');
+  });
+
+  it('updates live and hides again when counts return to zero', () => {
+    const footer = new FooterComponent(baseState());
+    footer.setAttachCounts({ agents: 1, awaiting: 2 });
+    expect(strip(footer.render(120)[0]!)).toContain('[← 1 working · 2 awaiting input]');
+    footer.setAttachCounts({ agents: 0, awaiting: 0 });
+    expect(strip(footer.render(120)[0]!)).not.toContain('←');
+  });
+});
+
+// ── I4: the badge's standing return-to-agents hint — a session attached
+// from the roster otherwise advertises no way back on screen at all. ──
+
+describe('FooterComponent — attach badge return-to-agents hint (I4)', () => {
+  it('shows the hint alone when attached from the roster with nothing else to report', () => {
+    const footer = new FooterComponent(baseState());
+    footer.setAttachedFromRoster(true);
+    const out = strip(footer.render(120)[0]!);
+    expect(out).toContain('[← to return to agents]');
+  });
+
+  it('leads the counted segments, joined by the same · register', () => {
+    const footer = new FooterComponent(baseState());
+    footer.setAttachedFromRoster(true);
+    footer.setAttachCounts({ agents: 2, awaiting: 1 });
+    const out = strip(footer.render(120)[0]!);
+    expect(out).toContain('[← to return to agents · 2 working · 1 awaiting input]');
+  });
+
+  it('hides again once cleared (e.g. back on the roster)', () => {
+    const footer = new FooterComponent(baseState());
+    footer.setAttachedFromRoster(true);
+    expect(strip(footer.render(120)[0]!)).toContain('to return to agents');
+    footer.setAttachedFromRoster(false);
+    expect(strip(footer.render(120)[0]!)).not.toContain('←');
+  });
+
+  it('setAttachCounts alone never shows the hint — attachment is a separate signal from the counts', () => {
+    const footer = new FooterComponent(baseState());
+    footer.setAttachCounts({ agents: 2, awaiting: 1 });
+    const out = strip(footer.render(120)[0]!);
+    expect(out).not.toContain('to return to agents');
+    expect(out).toContain('[← 2 working · 1 awaiting input]');
+  });
+});

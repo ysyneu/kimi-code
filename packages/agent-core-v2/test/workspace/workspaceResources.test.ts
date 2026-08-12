@@ -3,7 +3,7 @@
  * phase-3 behavior contract).
  *
  * Drives the REAL handler chain (WorkspaceLifecycleService →
- * WorkspaceHandlerService) with the real Workspace-scope resource services
+ * SessionLifecycleService) with the real Workspace-scope resource services
  * and proves: one shared MCP connection manager (and one initial connect)
  * for two sessions of the same workspace, no skill rescan when the second
  * session lists skills, and the fs-watch fan-out refreshing a live session's
@@ -17,9 +17,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'pathe';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-
+import { LifecycleScope } from '#/app/scopes';
 import {
-  LifecycleScope,
   ScopeActivation,
   _clearScopedRegistryForTests,
   registerScopedService,
@@ -32,24 +31,24 @@ import { IAgentProfileRegistry } from '#/app/agentProfileCatalog/agentProfileReg
 import { AgentProfileRegistryService } from '#/app/agentProfileCatalog/agentProfileRegistryService';
 import { IBuiltinAgentProfileLoader } from '#/app/agentProfileCatalog/builtinAgentProfileLoader';
 import { BuiltinAgentProfileLoaderService } from '#/app/agentProfileCatalog/builtinAgentProfileLoaderService';
-import { IAgentCatalogRuntimeOptions } from '#/workspace/workspaceAgentProfileLoader/agentCatalogRuntimeOptions';
 import { IUserAgentProfileLoader } from '#/workspace/workspaceAgentProfileLoader/userAgentProfileLoader';
 import { UserAgentProfileLoaderService } from '#/workspace/workspaceAgentProfileLoader/userAgentProfileLoaderService';
 import { IPluginAgentProfileLoader } from '#/workspace/workspaceAgentProfileLoader/pluginAgentProfileLoader';
 import { PluginAgentProfileLoaderService } from '#/workspace/workspaceAgentProfileLoader/pluginAgentProfileLoaderService';
-import { IBootstrapService } from '#/app/bootstrap/bootstrap';
+import { IBootstrapService, resolveHostArgs } from '#/app/bootstrap/bootstrap';
 import { IConfigService } from '#/app/config/config';
 import { ICronTaskPersistence } from '#/app/cron/cronTaskPersistence';
 import { IEventService } from '#/app/event/event';
 import { IPluginService } from '#/app/plugin/plugin';
 import { IProjectLocalConfigService } from '#/app/projectLocalConfig/projectLocalConfig';
-import { ISessionIndex } from '#/app/sessionIndex/sessionIndex';
+import { ISessionIndex, ISessionIndexMirror } from '#/app/sessionIndex/sessionIndex';
 import { ITelemetryService, noopTelemetryService } from '#/app/telemetry/telemetry';
 import { FileSkillDiscovery } from '#/app/skillCatalog/fileSkillDiscovery';
 import { InMemorySkillDiscovery } from '#/app/skillCatalog/inMemorySkillDiscovery';
-import { ISkillCatalogRuntimeOptions } from '#/app/skillCatalog/skillCatalogRuntimeOptions';
 import { ISkillDiscovery } from '#/app/skillCatalog/skillDiscovery';
 import { BuiltinSkillSource, IBuiltinSkillSource } from '#/app/skillCatalog/builtinSkillSource';
+import { IAgentIdentity } from '#/app/agentIdentity/agentIdentity';
+import { AgentIdentityService } from '#/app/agentIdentity/agentIdentityService';
 import { IUserFileSkillSource, UserFileSkillSource } from '#/app/skillCatalog/userFileSkillSource';
 import { IWorkspaceLifecycleService } from '#/app/workspaceLifecycle/workspaceLifecycle';
 import { WorkspaceLifecycleService } from '#/app/workspaceLifecycle/workspaceLifecycleService';
@@ -70,10 +69,14 @@ import { ISessionSkillCatalog } from '#/session/sessionSkillCatalog/skillCatalog
 import { SessionSkillCatalogService } from '#/session/sessionSkillCatalog/skillCatalogService';
 import { ISessionStateService } from '#/session/state/sessionState';
 import { SessionStateService } from '#/session/state/sessionStateService';
+import { IAppStateService } from '#/app/state/appState';
+import { AppStateService } from '#/app/state/appStateService';
+import { IWorkspaceStateService } from '#/workspace/state/workspaceState';
+import { WorkspaceStateService } from '#/workspace/state/workspaceStateService';
 import { ISessionToolPolicy } from '#/session/sessionToolPolicy/sessionToolPolicy';
 import { ISessionProcessRunner } from '#/session/process/processRunner';
-import { IWorkspaceHandlerService } from '#/workspace/workspaceHandler/workspaceHandler';
-import { WorkspaceHandlerService } from '#/workspace/workspaceHandler/workspaceHandlerService';
+import { ISessionLifecycleService } from '#/workspace/sessionLifecycle/sessionLifecycle';
+import { SessionLifecycleService } from '#/workspace/sessionLifecycle/sessionLifecycleService';
 import { IWorkspaceToolPolicy } from '#/workspace/workspaceToolPolicy/workspaceToolPolicy';
 import { WorkspaceToolPolicyService } from '#/workspace/workspaceToolPolicy/workspaceToolPolicyService';
 import { IWorkspaceAgentProfileLoader } from '#/workspace/workspaceAgentProfileLoader/workspaceAgentProfileLoader';
@@ -170,10 +173,10 @@ describe('workspace resource sharing (handler chain)', () => {
     );
     registerScopedService(
       LifecycleScope.Workspace,
-      IWorkspaceHandlerService,
-      WorkspaceHandlerService,
+      ISessionLifecycleService,
+      SessionLifecycleService,
       ScopeActivation.OnScopeCreated,
-      'workspaceHandler',
+      'sessionLifecycle',
     );
     registerScopedService(
       LifecycleScope.Workspace,
@@ -247,7 +250,10 @@ describe('workspace resource sharing (handler chain)', () => {
       'workspaceDirs',
     );
     registerScopedService(LifecycleScope.Session, ISessionSkillCatalog, SessionSkillCatalogService, ScopeActivation.OnScopeCreated, 'sessionSkillCatalog');
+    registerScopedService(LifecycleScope.App, IAppStateService, AppStateService, ScopeActivation.OnScopeCreated, 'state');
+    registerScopedService(LifecycleScope.Workspace, IWorkspaceStateService, WorkspaceStateService, ScopeActivation.OnScopeCreated, 'state');
     registerScopedService(LifecycleScope.Session, ISessionStateService, SessionStateService, ScopeActivation.OnScopeCreated, 'state');
+    registerScopedService(LifecycleScope.App, IAgentIdentity, AgentIdentityService, ScopeActivation.OnDemand, 'agentIdentity');
     registerScopedService(LifecycleScope.App, IBuiltinSkillSource, BuiltinSkillSource, ScopeActivation.OnDemand, 'skillCatalog');
     registerScopedService(LifecycleScope.App, IUserFileSkillSource, UserFileSkillSource, ScopeActivation.OnDemand, 'skillCatalog');
     registerScopedService(LifecycleScope.App, IAgentProfileRegistry, AgentProfileRegistryService, ScopeActivation.OnDemand, 'agentProfileCatalog');
@@ -272,6 +278,7 @@ describe('workspace resource sharing (handler chain)', () => {
         _serviceBrand: undefined,
         homeDir,
         osHomeDir: homeDir,
+        args: resolveHostArgs(undefined),
         scope: (name: string) => name,
       } as unknown as IBootstrapService),
       stubPair(IHostEnvironment, {
@@ -291,12 +298,6 @@ describe('workspace resource sharing (handler chain)', () => {
       } as unknown as IConfigService),
       stubPair(ITelemetryService, noopTelemetryService),
       stubPair(ISkillDiscovery, discovery),
-      stubPair(ISkillCatalogRuntimeOptions, {
-        _serviceBrand: undefined,
-      } as unknown as ISkillCatalogRuntimeOptions),
-      stubPair(IAgentCatalogRuntimeOptions, {
-        _serviceBrand: undefined,
-      } as unknown as IAgentCatalogRuntimeOptions),
       stubPair(IPluginService, pluginStub()),
       stubPair(IWorkspaceService, workspaceCatalogStub()),
       stubPair(ISessionIndex, {
@@ -305,6 +306,12 @@ describe('workspace resource sharing (handler chain)', () => {
         get: () => Promise.resolve(undefined),
         countActive: () => Promise.resolve(0),
       } as unknown as ISessionIndex),
+      stubPair(ISessionIndexMirror, {
+        _serviceBrand: undefined,
+        record: () => {},
+        pending: () => [],
+        drain: () => Promise.resolve(),
+      } as unknown as ISessionIndexMirror),
       stubPair(IAppendLogStore, {
         _serviceBrand: undefined,
         append: () => {},
@@ -378,11 +385,11 @@ describe('workspace resource sharing (handler chain)', () => {
     ]);
   }
 
-  async function handlerFor(root: string): Promise<IWorkspaceHandlerService> {
+  async function handlerFor(root: string): Promise<ISessionLifecycleService> {
     const handler = await (host as ScopedTestHost).app.accessor
       .get(IWorkspaceLifecycleService)
       .handlerFor({ root });
-    return handler.accessor.get(IWorkspaceHandlerService);
+    return handler.accessor.get(ISessionLifecycleService);
   }
 
   it('runs one shared MCP manager and one initial connect for two concurrent sessions', async () => {
@@ -411,6 +418,9 @@ describe('workspace resource sharing (handler chain)', () => {
     const m2 = s2.accessor.get(ISessionMcpHandle);
     expect(m1.connectionManager).toBe(m2.connectionManager);
     expect(connectAll).toHaveBeenCalledTimes(1);
+    // Session creation no longer waits for the initial connect; the seeded
+    // handle's readiness promise is the wait point.
+    await m1.ready;
     expect(m1.connectionManager.get('alpha')?.status).toBe('connected');
   }, 20000);
 
@@ -467,8 +477,6 @@ describe('workspace resource sharing (handler chain)', () => {
       () => {
         expect(catalog.catalog.getSkill('watched-skill')?.description).toBe('from watch');
       },
-      // Real FSEvents delivery + the 200 ms source debounce + a real disk
-      // rescan: under high parallel load the 10 s budget flakes, so allow 30 s.
       { timeout: 30000, interval: 100 },
     );
   }, 60000);

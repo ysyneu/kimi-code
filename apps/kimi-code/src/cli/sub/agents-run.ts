@@ -1,0 +1,185 @@
+/**
+ * `kimi agents` runner — boots a wire-harness KimiTUI straight into the
+ * agents view as its home screen (no startup session is created; the view
+ * mounts via the `startupAgentsView` init branch).
+ *
+ * Mirrors run-shell's preamble, trimmed to what this surface needs:
+ * loadTuiConfig → theme palette → home-dir bootstrap → resolveAgentsServer
+ * (attach to the running kap-server, or embed one in-process) → wire harness
+ * → KimiTUI. No migration check, no agent-profile resolution, and no
+ * telemetry sink — the module-level telemetry client is a safe no-op until
+ * `initializeTelemetry` runs, and this surface has no events of its own to
+ * report (sessions dispatched from the view are tracked server-side).
+ */
+
+import {
+  createKimiHarnessWire,
+  flushDiagnosticLogsSync,
+  log,
+  type KimiHarness,
+  type TelemetryClient,
+} from '@moonshot-ai/kimi-code-sdk';
+import { setTelemetryContext, track, withTelemetryContext } from '@moonshot-ai/kimi-telemetry';
+
+import {
+  countRunningSessions,
+  resolveAgentsServer,
+} from '#/agents-view/server-lifecycle';
+import { loadTuiConfig, TuiConfigParseError, type TuiConfig } from '#/tui/config';
+import { KimiTUI } from '#/tui/index';
+import { currentTheme, getColorPalette } from '#/tui/theme';
+import { restoreTerminalModes } from '#/utils/terminal-restore';
+
+import type { CLIOptions } from '#/cli/options';
+import { createCliTelemetryBootstrap } from '#/cli/telemetry';
+import { createKimiCodeHostIdentity, getVersion } from '#/cli/version';
+
+/** Startup permission/plan flags forwarded from the parent command (`kimi --auto agents`). */
+export type AgentsStartupFlags = Pick<CLIOptions, 'auto' | 'yolo' | 'plan'>;
+
+export async function runAgents(startupFlags: AgentsStartupFlags): Promise<void> {
+  // `kimi agents` never opens a startup chat session itself — only the
+  // permission/plan flags are real, so sessions dispatched from the view
+  // (and ones attached to) honor `--auto`/`--yolo`/`--plan` like the shell.
+  const cliOptions: CLIOptions = {
+    session: undefined,
+    continue: false,
+    yolo: startupFlags.yolo,
+    auto: startupFlags.auto,
+    plan: startupFlags.plan,
+    model: undefined,
+    outputFormat: undefined,
+    prompt: undefined,
+    skillsDirs: [],
+    agent: undefined,
+    agentFiles: [],
+  };
+
+  const version = getVersion();
+
+  let tuiConfig: TuiConfig;
+  let configWarning: string | undefined;
+  try {
+    tuiConfig = await loadTuiConfig();
+  } catch (error) {
+    if (!(error instanceof TuiConfigParseError)) throw error;
+    tuiConfig = error.fallback;
+    configWarning = error.message;
+  }
+
+  // Initialise the global Theme singleton before pi-tui grabs stdin.
+  const palette = await getColorPalette(tuiConfig.theme);
+  currentTheme.setPalette(palette);
+
+  const { homeDir } = createCliTelemetryBootstrap();
+  const telemetry: TelemetryClient = {
+    track,
+    withContext: withTelemetryContext,
+    setContext: setTelemetryContext,
+  };
+  const identity = createKimiCodeHostIdentity(version);
+
+  // Version-mismatched or dead instances are skipped during resolution, so a
+  // failure here means the embedded server itself could not start. Report it
+  // cleanly instead of crashing the TUI boot.
+  let server: Awaited<ReturnType<typeof resolveAgentsServer>>;
+  try {
+    server = await resolveAgentsServer({ homeDir, identity, cliVersion: version });
+  } catch (error) {
+    process.stderr.write(
+      `Failed to start kimi agents: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    process.exit(1);
+  }
+
+  const harness: KimiHarness = await createKimiHarnessWire({
+    serverUrl: server.baseUrl,
+    token: server.token,
+    homeDir,
+    identity,
+    telemetry,
+    sessionStartedProperties: {
+      yolo: startupFlags.yolo,
+      auto: startupFlags.auto,
+      plan: startupFlags.plan,
+      afk: false,
+    },
+  });
+  await harness.ensureConfigFile();
+
+  const tui = new KimiTUI(harness, {
+    cliOptions,
+    tuiConfig,
+    version,
+    workDir: process.cwd(),
+    startupNotice: configWarning,
+    startupAgentsView: true,
+    agentsViewServerLabel: server.mode === 'attached' ? new URL(server.baseUrl).host : 'embedded',
+    // The exit confirmation only matters when this process owns the server:
+    // quitting shuts it down and interrupts its running sessions. An attached
+    // server outlives the CLI — disconnecting needs no confirmation.
+    agentsViewExitGuard:
+      server.mode === 'embedded' ? () => countRunningSessions(server) : undefined,
+  });
+
+  // The same crash safety net run-shell installs: with no unhandledRejection
+  // listener of our own, the telemetry crash handler stays the process's
+  // sole listener and rethrows by design — so any stray rejection, e.g. the
+  // embedded server's engine disposing in-flight turns during the shutdown
+  // below ('Agent loop disposed'), surfaces as a naked crash dump. Log and
+  // exit cleanly instead.
+  const emergencyExit = (exitCode: number): void => {
+    // The crash log above is only enqueued into the async sink; flush it
+    // synchronously or the `process.exit()` below would drop the one line
+    // that explains why we crashed. Best-effort: an exit path must never
+    // throw.
+    try {
+      flushDiagnosticLogsSync();
+    } catch {
+      /* ignore */
+    }
+    restoreTerminalModes();
+    process.exit(exitCode);
+  };
+  const onUncaughtException = (error: unknown): void => {
+    try {
+      log.error('uncaughtException, restoring terminal and exiting', { error: String(error) });
+    } catch {
+      /* ignore */
+    }
+    emergencyExit(1);
+  };
+  const onUnhandledRejection = (reason: unknown): void => {
+    try {
+      log.error('unhandledRejection, restoring terminal and exiting', { reason: String(reason) });
+    } catch {
+      /* ignore */
+    }
+    emergencyExit(1);
+  };
+  process.on('uncaughtException', onUncaughtException);
+  process.on('unhandledRejection', onUnhandledRejection);
+  const removeCrashHandlers = (): void => {
+    process.off('uncaughtException', onUncaughtException);
+    process.off('unhandledRejection', onUnhandledRejection);
+  };
+
+  tui.onExit = async (exitCode = 0) => {
+    // Wire transport: close() only disconnects; an attached server keeps
+    // running, an embedded one is shut down right after (any running
+    // sessions were already confirmed by the stop() exit dialog).
+    await harness.close();
+    await server.shutdown();
+    // The crash handlers stay up through the shutdown above — that is
+    // exactly the window a stray engine rejection needs them — and come
+    // down only once the process is on its way out cleanly.
+    removeCrashHandlers();
+    // The view's sessions run the v2 engine on the kap-server — `kimi
+    // --resume` (v1 storage) can't reopen them, so the
+    // re-entry point is the view itself.
+    process.stderr.write(`\nTo resume your sessions: kimi agents\n`);
+    process.exit(exitCode);
+  };
+
+  await tui.start();
+}

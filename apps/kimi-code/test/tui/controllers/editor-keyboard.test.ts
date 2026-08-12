@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { DOUBLE_ESC_WINDOW_MS } from '#/tui/constant/kimi-tui';
+import { DOUBLE_ESC_WINDOW_MS, NO_ACTIVE_SESSION_MESSAGE } from '#/tui/constant/kimi-tui';
 import {
   EditorKeyboardController,
   type EditorKeyboardHost,
@@ -15,6 +15,9 @@ interface Harness {
   readonly cancelCompaction: ReturnType<typeof vi.fn>;
   readonly btwCancelRunning: ReturnType<typeof vi.fn>;
   readonly btwCloseOrCancel: ReturnType<typeof vi.fn>;
+  readonly returnToAgentsView: ReturnType<typeof vi.fn>;
+  readonly showStatus: ReturnType<typeof vi.fn>;
+  readonly showError: ReturnType<typeof vi.fn>;
 }
 
 function createHarness(options: { streamingPhase?: string; isCompacting?: boolean } = {}): Harness {
@@ -29,6 +32,9 @@ function createHarness(options: { streamingPhase?: string; isCompacting?: boolea
   const cancelCompaction = vi.fn(async () => {});
   const btwCancelRunning = vi.fn(() => false);
   const btwCloseOrCancel = vi.fn(() => false);
+  const returnToAgentsView = vi.fn(() => false);
+  const showStatus = vi.fn();
+  const showError = vi.fn();
   const session = { cancel: vi.fn(async () => {}), cancelCompaction };
 
   const host = {
@@ -46,6 +52,9 @@ function createHarness(options: { streamingPhase?: string; isCompacting?: boolea
     btwPanelController: { cancelRunning: btwCancelRunning, closeOrCancel: btwCloseOrCancel },
     openUndoSelector,
     cancelRunningShellCommand,
+    returnToAgentsView,
+    showStatus,
+    showError,
   } as unknown as EditorKeyboardHost;
 
   const controller = new EditorKeyboardController(
@@ -62,6 +71,9 @@ function createHarness(options: { streamingPhase?: string; isCompacting?: boolea
     cancelCompaction,
     btwCancelRunning,
     btwCloseOrCancel,
+    returnToAgentsView,
+    showStatus,
+    showError,
   };
 }
 
@@ -81,6 +93,10 @@ function pressNonEscape(editor: Harness['editor']): void {
   const handler = editor['onNonEscapeInput'];
   if (handler === undefined) throw new Error('onNonEscapeInput handler not installed');
   (handler as () => void)();
+}
+
+function setComposerText(editor: Harness['editor'], text: string): void {
+  (editor['getText'] as unknown as ReturnType<typeof vi.fn>).mockReturnValue(text);
 }
 
 describe('EditorKeyboardController double-Esc undo', () => {
@@ -142,6 +158,25 @@ describe('EditorKeyboardController double-Esc undo', () => {
     expect(cancelRunningShellCommand).toHaveBeenCalled();
     const session = host.session as unknown as { cancel: ReturnType<typeof vi.fn> };
     expect(session.cancel).toHaveBeenCalled();
+  });
+
+  it('surfaces a failed session.cancel() instead of swallowing it silently (A3)', async () => {
+    // cancelCurrentStream's session.cancel() is fire-and-forget — over the
+    // wire transport (agents-view attach) the abort is a real network call
+    // that can reject. Without a `.catch()` here, a rejection would be a
+    // completely silent no-op: Ctrl+C looks like it did nothing at all.
+    const { editor, host, showError } = createHarness({ streamingPhase: 'waiting' });
+    const session = host.session as unknown as { cancel: ReturnType<typeof vi.fn> };
+    session.cancel = vi.fn(async () => {
+      throw new Error('abort rejected');
+    });
+
+    pressCtrlC(editor);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(session.cancel).toHaveBeenCalled();
+    expect(showError).toHaveBeenCalledWith(expect.stringContaining('abort rejected'));
   });
 });
 
@@ -265,6 +300,19 @@ describe('EditorKeyboardController shell history recall', () => {
     expect(editor['setInputMode'] as unknown as Mock).toHaveBeenCalledWith('prompt');
   });
 
+  it('agents view: the recall filter hides `!` shell entries entirely', () => {
+    // Input history is global/persistent: without this gate, ↑ on an empty
+    // buffer in the agents view could land on a `!` entry and resurrect the
+    // hidden bash input mode (which then submits via runShellCommandFromInput).
+    const { host, editor } = createHarness();
+    (host.state as unknown as { startupState: string }).startupState = 'agents-view';
+    const setHistoryFilter = editor['setHistoryFilter'] as unknown as Mock;
+    const [filter] = setHistoryFilter.mock.calls[0] as [(entry: string) => boolean];
+
+    expect(filter('!cmd')).toBe(false);
+    expect(filter('hello')).toBe(true);
+  });
+
   it('saves the current input mode as the history draft host state', () => {
     const { editor } = createHarness();
     const save = editor['onHistoryDraftSave'] as unknown as () => unknown;
@@ -283,5 +331,191 @@ describe('EditorKeyboardController shell history recall', () => {
     restore('prompt');
 
     expect(editor['setInputMode'] as unknown as Mock).toHaveBeenCalledWith('prompt');
+  });
+});
+
+
+// ── ← on an empty editor returns to the agents view ──
+
+describe('EditorKeyboardController onLeftArrowEmpty', () => {
+  it('delegates to the host and consumes the key when the host returns true', () => {
+    const { editor, returnToAgentsView } = createHarness();
+    returnToAgentsView.mockReturnValue(true);
+    const handler = editor['onLeftArrowEmpty'] as unknown as () => boolean;
+    expect(handler).toBeDefined();
+
+    expect(handler()).toBe(true);
+    expect(returnToAgentsView).toHaveBeenCalledOnce();
+  });
+
+  it('falls through (returns false) when the host is not in agents-attach mode', () => {
+    const { editor, returnToAgentsView } = createHarness();
+    returnToAgentsView.mockReturnValue(false);
+    const handler = editor['onLeftArrowEmpty'] as unknown as () => boolean;
+
+    expect(handler()).toBe(false);
+    expect(returnToAgentsView).toHaveBeenCalledOnce();
+  });
+});
+
+
+// ── I4: Esc on an idle, empty composer returns to the roster the same way
+// ← does — a session attached from the roster otherwise advertises no way
+// back, and Esc means "back" everywhere else in that view. ──
+
+describe('EditorKeyboardController Esc returns to the roster (I4)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('idle + empty composer: delegates to returnToAgentsView and consumes Esc when it returns true', () => {
+    const { editor, returnToAgentsView, openUndoSelector } = createHarness();
+    returnToAgentsView.mockReturnValue(true);
+
+    pressEscape(editor);
+
+    expect(returnToAgentsView).toHaveBeenCalledOnce();
+    expect(openUndoSelector).not.toHaveBeenCalled();
+  });
+
+  it('idle + empty composer, but the host declines (false, e.g. the main REPL): the double-Esc undo shortcut still fires — zero regression outside agents mode', () => {
+    const { editor, returnToAgentsView, openUndoSelector } = createHarness();
+    returnToAgentsView.mockReturnValue(false);
+
+    pressEscape(editor);
+    expect(openUndoSelector).not.toHaveBeenCalled();
+    pressEscape(editor);
+
+    expect(returnToAgentsView).toHaveBeenCalledTimes(2);
+    expect(openUndoSelector).toHaveBeenCalledOnce();
+  });
+
+  it('idle + a non-empty composer never calls returnToAgentsView — only an empty composer qualifies, matching ← (onLeftArrowEmpty)', () => {
+    const { editor, returnToAgentsView } = createHarness();
+    setComposerText(editor, 'draft in progress');
+
+    pressEscape(editor);
+
+    expect(returnToAgentsView).not.toHaveBeenCalled();
+  });
+
+  it('mid-turn Esc keeps the existing interrupt semantics and never calls returnToAgentsView — the way back is a standing footer hint, not a change to what Esc does here', () => {
+    const { editor, host, returnToAgentsView } = createHarness({ streamingPhase: 'waiting' });
+
+    pressEscape(editor);
+
+    expect(returnToAgentsView).not.toHaveBeenCalled();
+    const session = host.session as unknown as { cancel: ReturnType<typeof vi.fn> };
+    expect(session.cancel).toHaveBeenCalled();
+  });
+});
+
+
+// ── `!` bash-input mode is hidden in the agents view ──
+
+describe('EditorKeyboardController bash mode gate', () => {
+  it('vetoes bash mode with a status hint while the agents view is active', () => {
+    const { host, editor, showStatus } = createHarness();
+    (host.state as unknown as { startupState: string }).startupState = 'agents-view';
+    const gate = editor['onBashModeAttempt'] as unknown as () => boolean;
+    expect(gate).toBeDefined();
+
+    expect(gate()).toBe(true);
+    expect(showStatus).toHaveBeenCalledWith(
+      'Shell commands (!) are not available in agents view.',
+    );
+  });
+
+  it('passes through outside the agents view (zero behavior change, no hint)', () => {
+    const { editor, showStatus } = createHarness();
+    const gate = editor['onBashModeAttempt'] as unknown as () => boolean;
+
+    expect(gate()).toBe(false);
+    expect(showStatus).not.toHaveBeenCalled();
+  });
+});
+
+describe('EditorKeyboardController Shift-Tab plan toggle', () => {
+  function createShiftTabHarness(options: { sessionless?: boolean; engineV2?: boolean } = {}) {
+    const editor: Record<string, ((...args: never[]) => unknown) | undefined> = {
+      setHistoryFilter: vi.fn() as unknown as (...args: never[]) => unknown,
+    };
+    const handlePlanToggle = vi.fn();
+    const track = vi.fn();
+    const showError = vi.fn();
+    const ensureSession = vi.fn(async (): Promise<{ id: string } | undefined> => ({ id: 'ses-lazy' }));
+    const host = {
+      state: {
+        editor,
+        activeDialog: null,
+        appState: { streamingPhase: 'idle', isCompacting: false, planMode: false },
+        footer: { setTransientHint: vi.fn() },
+        ui: { requestRender: vi.fn() },
+      },
+      session: options.sessionless ? undefined : { cancel: vi.fn(async () => {}) },
+      engineV2: options.engineV2 ?? false,
+      ensureSession,
+      handlePlanToggle,
+      track,
+      showError,
+      btwPanelController: { cancelRunning: vi.fn(), closeOrCancel: vi.fn() },
+    } as unknown as EditorKeyboardHost;
+
+    new EditorKeyboardController(host, undefined as unknown as ImageAttachmentStore).install();
+    const onShiftTab = editor['onShiftTab'] as unknown as () => void;
+    return { onShiftTab, handlePlanToggle, track, showError, ensureSession };
+  }
+
+  it('toggles plan mode directly with an active session', () => {
+    const { onShiftTab, handlePlanToggle, ensureSession } = createShiftTabHarness();
+
+    onShiftTab();
+
+    expect(ensureSession).not.toHaveBeenCalled();
+    expect(handlePlanToggle).toHaveBeenCalledWith(true);
+  });
+
+  it('reports no active session on v1 when session-less', () => {
+    const { onShiftTab, showError, handlePlanToggle } = createShiftTabHarness({
+      sessionless: true,
+    });
+
+    onShiftTab();
+
+    expect(showError).toHaveBeenCalledWith(NO_ACTIVE_SESSION_MESSAGE);
+    expect(handlePlanToggle).not.toHaveBeenCalled();
+  });
+
+  it('lazy-creates the session before toggling on v2 when session-less', async () => {
+    const { onShiftTab, ensureSession, handlePlanToggle, track } = createShiftTabHarness({
+      sessionless: true,
+      engineV2: true,
+    });
+
+    onShiftTab();
+    expect(handlePlanToggle).not.toHaveBeenCalled();
+
+    await vi.waitFor(() => {
+      expect(handlePlanToggle).toHaveBeenCalledWith(true);
+    });
+    expect(ensureSession).toHaveBeenCalledOnce();
+    expect(track).toHaveBeenCalledWith('shortcut_plan_toggle', { enabled: true });
+  });
+
+  it('does not toggle when the lazy creation fails on v2', async () => {
+    const { onShiftTab, ensureSession, handlePlanToggle } = createShiftTabHarness({
+      sessionless: true,
+      engineV2: true,
+    });
+    ensureSession.mockResolvedValue(undefined);
+
+    onShiftTab();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(handlePlanToggle).not.toHaveBeenCalled();
   });
 });

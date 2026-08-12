@@ -1,0 +1,1180 @@
+/**
+ * AgentsViewApp — full-screen alt-screen takeover listing the view's OWN
+ * sessions (dispatched from or attached through this view — the server-wide
+ * list is filtered controller-side) as a grouped roster, each group
+ * separated by a blank spacer line. Two grouping modes, cycled by Ctrl+S
+ * (A6, `props.onGroupModeToggle`): status (Awaiting input / Working / Pinned
+ * / Completed, the default) and directory (grouped by session workdir,
+ * Pinned still floating out first). Which mode is active and how `props.
+ * groups` gets built for it is entirely the controller's call — this
+ * component just renders whatever group list it's handed, unaware of mode.
+ * Mirrors the TasksBrowserApp mount/render contract: mounted by a
+ * controller via container swap, `render(width)` returns exactly
+ * `terminal.rows` lines (header 4 [brand mark + version / model · cwd /
+ * status counts / trailing blank] + body + footer 1, or 2 while the `?` grid
+ * is open), data flows in via `setProps`, user actions fire the `on*`
+ * callbacks.
+ *
+ * Zero SDK access: the controller owns the roster, delete / rename / pin
+ * side effects and re-pushes props after every action.
+ *
+ * Behaviour notes for the controller:
+ * - Delete confirm (group headers only): while `confirmDeleteId` is set the
+ *   component still routes keys normally (Ctrl+X confirms, everything else
+ *   fires its usual callback); the controller must clear `confirmDeleteId`
+ *   on ANY action callback it receives — including `onQuit` (Esc during
+ *   confirm cancels the confirm instead of quitting).
+ * - Delete arm (B1, roster ROWS): the group-header dialog above doesn't
+ *   apply to rows — a row's first Ctrl+X instead arms it in place
+ *   (`armedDeleteId`/`armedDeleteStopped`; the row's own summary column
+ *   shows the arm, see `rows.ts`'s `RowDeleteArm`). Routes exactly like
+ *   `confirmDeleteId` otherwise: a second Ctrl+X while armed calls
+ *   `onDeleteConfirm` (same callback, keyed by id), Esc cancels the arm
+ *   instead of quitting, and the controller clears it on any other action
+ *   callback, on its own `DELETE_ARM_WINDOW_MS` auto-expire, and if a
+ *   roster refresh removes the armed row outright. Mutually exclusive with
+ *   `confirmDeleteId` — never both set at once.
+ * - Rename: the inline editor starts EMPTY — the user types the new name
+ *   from scratch instead of editing a pre-filled copy of the old title
+ *   (`beginRename` keeps the original only for cancel). Esc during rename
+ *   submits the ORIGINAL title via `onRenameSubmit`; the controller treats
+ *   an unchanged (or blank) title as a cancel (clears `renameDraft`, skips
+ *   the SDK call).
+ * - Dispatch editor: the mounted `dispatchEditor` renders into the bottom
+ *   box. While `dispatchFocused`, every key routes to the editor with two
+ *   exceptions: Esc is the editor's own `onEscape` (the controller wires it
+ *   to unfocus), and Ctrl+R — meaningless inside a text editor — renames
+ *   the selected roster row instead (same rename flow as the list-focused
+ *   Ctrl+R; the modal branch above owns every key from there).
+ *   List-focused, a printable char focuses the editor and feeds it the
+ *   text; the sole printable shortcut (`?`) only acts while the editor is
+ *   EMPTY, once it holds text every printable char belongs to it.
+ * - Open: Enter and → both fire `onOpen` on a row — opening always hands
+ *   off to the session's own full-screen chat, never an in-view detail.
+ * - Mouse: a left click on a row's own screen line does the same thing Enter
+ *   does — selects the row, then opens it via the same `onOpen` call, no
+ *   separate path. A click on any other line (header, footer, spacer, the
+ *   dispatch/reply composer) is a no-op. This only ever fires while mouse
+ *   tracking is on, which the controller turns on for exactly as long as
+ *   this component is mounted (see `handleMouse` and its `clickableRows`
+ *   map, rebuilt every render from the same walk `renderList` already does
+ *   — never a second, independently-derived layout).
+ * - Reply panel: `space` on a row (main composer empty) fires
+ *   `onReplyRequest`, which the controller answers by setting
+ *   `replyTargetId` AND `dispatchFocused` together (this component never
+ *   mounts a second composer — the panel reuses `dispatchEditor`, only its
+ *   target and placeholder differ; `renderReplyPanel` wraps it with the
+ *   row's preview/age content). While the panel is open, `handleInput`
+ *   intercepts space-on-empty-input (toggle close), Ctrl+X (close + start
+ *   the row's delete flow), ↑/↓ (close + move selection, but only while
+ *   `dispatchEditor` isn't showing its own autocomplete dropdown — see
+ *   `handleReplyPanelKey`) and Enter-on-empty (close + attach, same path as
+ *   Enter on the row) BEFORE forwarding to the editor — Esc and
+ *   Enter-with-text still fall through to the editor's own
+ *   `onEscape`/`onSubmit`, which the controller wires to close/submit.
+ * - Reorder: `shift+↑↓` fires `onReorderPinned` only for a PINNED row;
+ *   the callback is a no-op signal for anything else, so the controller
+ *   need not re-check `pinned` itself.
+ * - Esc closes the innermost overlay (rename/dispatch-focused/help each
+ *   absorb it in their own branches above; a pending delete arm/confirm is
+ *   cancelled via `onQuit`, the controller's shared cancel path). Past that
+ *   Esc is a NO-OP — it never quits the view, it is far too easy to hit by
+ *   accident; leaving is Ctrl+C's two-stage confirm or the exit command.
+ *   `props.originId` only drives the row's bold "came from" styling (see
+ *   its own doc comment), a cosmetic marker independent of quit.
+ * - Ctrl+C is a genuine two-stage confirm-to-exit, independent of Esc/origin:
+ *   every press just reports `onCtrlC()` — the component makes no arm/quit
+ *   decision itself and holds no timer. The controller owns the actual
+ *   state machine (mirrors the main REPL's `armPendingExit`/`CTRL_C_HINT`
+ *   pattern) because disarming on a silent timeout needs `state.ui.
+ *   requestRender()` to repaint without a keypress, which only the
+ *   controller (via `host`) has access to. `props.pendingExitArmed` is all
+ *   this component reads back to decide whether the footer shows the
+ *   two-stage hint.
+ * - Empty roster (B10): `props.groups` empty renders `renderEmptyGroups`
+ *   instead of blank chrome — `props.emptyGroupsDisplay` (the controller's
+ *   only mode-derived signal to this otherwise mode-unaware component)
+ *   picks between the STATE-mode band skeleton and directory mode's single
+ *   plain line. Purely cosmetic: never fed into `deriveItems`, so nothing
+ *   it paints is selectable or collapsible.
+ */
+
+import {
+  Container,
+  CURSOR_MARKER,
+  Key,
+  matchesKey,
+  type MouseClickEvent,
+  type Terminal,
+  visibleWidth,
+  type Focusable,
+} from '@moonshot-ai/pi-tui';
+
+import { GROUP_LABELS, type AgentsGroup, type AgentsRosterRow } from '@/tui/agents/roster';
+import { pasteImageKey, type CustomEditor } from '@/tui/components/editor/custom-editor';
+import { getVersion } from '#/cli/version';
+import { PRODUCT_NAME } from '#/constant/app';
+import { currentTheme } from '#/tui/theme';
+import { printableChar, isPrintableChar } from '@/tui/utils/printable-key';
+
+import { renderReplyPanel } from './reply-panel';
+import {
+  fitExactly,
+  renderGroupHeader,
+  renderMoreRow,
+  renderRosterRow,
+  renderSkeletonDescription,
+  withSelectedBg,
+  type RowDeleteArm,
+} from './rows';
+
+export interface AgentsViewProps {
+  readonly groups: readonly AgentsGroup[];
+  /**
+   * B10: which "totally empty" (zero session rows anywhere — `groups` came
+   * back empty) rendering `renderList` uses when `groups` is empty.
+   * `'skeleton'` paints every state-mode band header with its dim
+   * explanatory line, none selectable/collapsible (they never enter
+   * `deriveItems`). `'plain'` paints a single dim "no sessions yet" line,
+   * no headers. Which one applies is entirely the controller's call (state
+   * vs. directory grouping mode) — this component only ever picks between
+   * the two pre-built renderings. Ignored whenever `groups` is non-empty.
+   */
+  readonly emptyGroupsDisplay: 'skeleton' | 'plain';
+  readonly counts: { awaiting: number; working: number; completed: number };
+  /** Selected item: a row id, `group:<id>`, or `more:completed`. */
+  readonly selectedId: string | undefined;
+  /**
+   * The session id this roster-attach lifecycle was last backed out of via
+   * ← (see `returnToAgentsView`), or `undefined` on a fresh open with no
+   * prior attach. Independent of `selectedId` — drives the row's bold
+   * "came from" styling in `rows.ts`, not the cursor pointer.
+   */
+  readonly originId: string | undefined;
+  /**
+   * B2: session ids this TUI PROCESS has attached to at least once —
+   * controller-owned, in-memory only (see `AgentsViewController`'s own
+   * field doc), NOT `selectedId`/`originId`-scoped. Drives the roster
+   * footer's row hint: `enter to open` for an id not in this set, `enter to
+   * return` once it is. Checked by row id (`ViewItem.id`, same as `row.id`).
+   */
+  readonly attachedIds: ReadonlySet<string>;
+  /** "embedded" or host:port of the connected kap-server. Not currently shown
+   *  by the header chrome (the header layout has no server-label slot),
+   *  but kept on the props contract for the host wiring that supplies it. */
+  readonly serverLabel: string;
+  /**
+   * I6: true when closing the agents-view process leaves its sessions
+   * running server-side — false only in embedded mode. Drives the Ctrl+C
+   * armed footer's keep-running note and the empty-skeleton Working-band
+   * description so neither promises a survival the current server mode
+   * doesn't back up.
+   */
+  readonly sessionsSurviveExit: boolean;
+  /** Header label for the model new sessions dispatch with by default. */
+  readonly modelLabel: string;
+  /** Ctrl+X first-press target awaiting a second Ctrl+X — GROUP HEADERS
+   *  only (`group:<id>`). A row's own first Ctrl+X is `armedDeleteId`
+   *  below instead (B1); the two are mutually exclusive. */
+  readonly confirmDeleteId: string | undefined;
+  /**
+   * B1: roster ROW id currently Ctrl+X-armed — the row's summary column
+   * shows the arm (`ctrl+x again to delete`) instead of a dialog; see
+   * `rows.ts`'s `RowDeleteArm` and the class docstring's own note. Mutually
+   * exclusive with `confirmDeleteId`.
+   */
+  readonly armedDeleteId: string | undefined;
+  /**
+   * True when `armedDeleteId`'s row was busy at arm time — its turn was
+   * stopped immediately alongside the arm, so the row's summary reads
+   * `stopped · ctrl+x again to delete` instead of just the arm text.
+   * Meaningless while `armedDeleteId` is undefined.
+   */
+  readonly armedDeleteStopped: boolean;
+  readonly renameDraft: { readonly sessionId: string; readonly text: string } | undefined;
+  readonly flashMessage: string | undefined;
+  readonly dispatchFocused: boolean;
+  /** The assembled dispatch editor (controller-owned); rendered into the bottom box. */
+  readonly dispatchEditor: CustomEditor;
+  /**
+   * Set while the composer targets an EXISTING session (space on a row)
+   * instead of a new one — always paired with `dispatchFocused === true`,
+   * cleared together by the controller on submit/Esc/close. Doubles as the
+   * reply PANEL's own open flag: non-`undefined` is what makes `render()`
+   * swap the plain dispatch composer for `renderReplyPanel` and what makes
+   * `handleInput` intercept the panel's row-scoped shortcuts (see the class
+   * docstring). The row itself is looked up from `groups` via `findRow`,
+   * not carried on this id.
+   */
+  readonly replyTargetId: string | undefined;
+  /**
+   * Rows whose `space`-reply RPC is currently outstanding — renders a
+   * distinct "sending" glyph, never the busy spinner, until the RPC settles.
+   */
+  readonly pendingReplyIds: ReadonlySet<string>;
+  /**
+   * Rows whose last reply attempt failed — rejected, or exceeded the
+   * controller's bounded client-side wait. Persists until the user reopens
+   * the reply panel on that row (which restores the lost text) or a later
+   * send for the same row succeeds.
+   */
+  readonly replyFailureIds: ReadonlySet<string>;
+  /**
+   * True while a first Ctrl+C is armed, waiting on a confirming second press
+   * within the controller's exit-confirm window — drives the footer's
+   * two-stage hint. Controller-owned state (see `onCtrlC`): the component
+   * has no `state.ui` access, so it cannot itself repaint when the window
+   * elapses with no further input.
+   */
+  readonly pendingExitArmed: boolean;
+  onSelect(id: string): void;
+  onOpen(id: string): void;
+  onDeleteRequest(id: string): void;
+  onDeleteConfirm(id: string): void;
+  onRenameBegin(id: string): void;
+  onRenameSubmit(id: string, text: string): void;
+  onPinToggle(id: string): void;
+  /** `space` on a session row: open the reply panel targeting that session. No-op on anything else (the caller only invokes this for a `row`-kind selection). */
+  onReplyRequest(id: string): void;
+  /**
+   * Closes the reply panel and discards its draft — the controller's shared
+   * path behind Esc (via the editor's own `onEscape`), space-on-empty-input,
+   * Ctrl+X, and ↑/↓ while the panel is open (see `handleReplyPanelKey`). A
+   * no-op signal when no panel is open; the caller here only ever invokes it
+   * while `replyTargetId !== undefined`.
+   */
+  onReplyClose(): void;
+  /** `shift+↑↓` on a PINNED row: reorder it within the pins array. No-op on a non-pinned row (the caller only invokes this for a pinned `row`-kind selection). */
+  onReorderPinned(id: string, delta: -1 | 1): void;
+  onHelpToggle(): void;
+  onQuit(): void;
+  /**
+   * Every Ctrl+C press, unconditionally — arm-vs-quit is the controller's
+   * decision (it owns the timer and the repaint access an autonomous
+   * disarm needs; see `pendingExitArmed`).
+   */
+  onCtrlC(): void;
+  onDispatchFocusChange(focused: boolean): void;
+  /**
+   * Ctrl+S (A6): cycles the roster's grouping mode `state ⇄ directory`. Only
+   * reachable at the roster with no overlay open — same gating `handleInput`
+   * already applies to every other global shortcut here (rename/dispatch-
+   * focus/help each early-return above it). The regrouped `props.groups` on
+   * the next `setProps` is the only feedback; no toast/mode-name banner.
+   */
+  onGroupModeToggle(): void;
+}
+
+/** Minimum dimensions before we just print a "too small" message. */
+const MIN_WIDTH = 48;
+const MIN_HEIGHT = 10;
+
+/** Header block: 3 info lines + 1 trailing blank before the first group (the
+ *  blank line lives here, never as a leading spacer item — see `deriveItems`'s
+ *  `moveSelection` invariant docs). */
+const HEADER_HEIGHT = 4;
+
+/** Small brand mark reused from the welcome banner (`chrome/welcome.ts`) —
+ *  no new ASCII art invented for this view. */
+const LOGO = ['▐█▛█▛█▌', '▐█████▌'] as const;
+
+/**
+ * B4: this view's own Ctrl+C arm copy. The main REPL's shared
+ * `CTRL_C_HINT` (`#/tui/constant/kimi-tui.ts`) spells it "Ctrl+C"; the
+ * parity spec calls for the hyphenated "Ctrl-C" here specifically, so this
+ * is a local, deliberately separate string rather than a shared one — other
+ * ctrl-key copy in this view is untouched.
+ */
+const CTRL_C_ARM_HINT = 'Press Ctrl-C again to exit';
+
+let cachedVersion: string | undefined;
+function kimiVersion(): string {
+  cachedVersion ??= getVersion();
+  return cachedVersion;
+}
+
+const MORE_ITEM_ID = 'more:completed';
+
+/**
+ * B10: every state-mode band header + its dim explanatory line, painted by
+ * `renderEmptyGroups` when the roster has zero session rows anywhere in
+ * STATE mode. Labels reuse `GROUP_LABELS` verbatim so the skeleton reads as
+ * the same headers the real bands would use once rows exist. No Pinned
+ * entry: a zero-row roster can never have a pinned session either, so that
+ * band never appears even outside the skeleton.
+ *
+ * I6: the Working band's description promises sessions "keep running even
+ * if you close the terminal" — true only when `sessionsSurviveExit`
+ * (`props.sessionsSurviveExit`); embedded mode drops that tail since
+ * quitting the CLI ends the embedded server and interrupts them instead.
+ */
+function emptyStateSkeleton(
+  sessionsSurviveExit: boolean,
+): readonly { readonly label: string; readonly description: string }[] {
+  return [
+    {
+      label: GROUP_LABELS.awaiting,
+      description: 'Sessions that have a question or need your decision land here',
+    },
+    {
+      label: GROUP_LABELS.working,
+      description: sessionsSurviveExit
+        ? 'Sessions Kimi is actively working on — they keep running even if you close the terminal'
+        : 'Sessions Kimi is actively working on',
+    },
+    { label: GROUP_LABELS.completed, description: 'Finished sessions wait here for you to review' },
+  ];
+}
+
+/** B10: directory mode's own empty-roster line — no headers, just this. */
+const EMPTY_DIRECTORY_MESSAGE = 'no sessions yet';
+
+type ViewItemKind = 'header' | 'row' | 'more' | 'spacer';
+
+interface ViewItem {
+  readonly id: string;
+  readonly kind: ViewItemKind;
+  readonly group: AgentsGroup;
+  readonly row?: AgentsRosterRow;
+}
+
+interface RenameState {
+  readonly id: string;
+  readonly original: string;
+  text: string;
+}
+
+/**
+ * `?` help overlay: a 2-row key/hint grid replacing the single-line footer
+ * (the roster list itself stays visible and scrollable behind it — see
+ * `render`). Column-aligned per row; `undefined` is a blank cell.
+ *
+ * `ctrl+s to switch views` (A6) cycles the roster between the status
+ * grouping (Pinned / Needs input / Working / Completed) and grouping by
+ * directory.
+ */
+type HelpCell = readonly [key: string, hint: string];
+
+const HELP_GRID: readonly (readonly (HelpCell | undefined)[])[] = [
+  [
+    ['↑↓', 'to select'],
+    ['shift+↑↓', 'to reorder'],
+    ['alt+1-9', 'to open'],
+    ['space', 'to reply'],
+    ['@', 'to mention'],
+    // M2: Esc while the grid is open closes the grid (see `handleInput`'s
+    // `helpVisible` branch) — it does not quit the view. `?` below is the
+    // grid's other close key; this is honest about the other one.
+    ['esc', 'to close'],
+  ],
+  [
+    ['ctrl+r', 'to rename'],
+    ['ctrl+t', 'to pin/unpin'],
+    ['ctrl+j', 'for newline'],
+    ['ctrl+x', 'to delete'],
+    ['ctrl+s', 'to switch views'],
+    ['?', 'to close'],
+  ],
+];
+
+/** alt+1..9 quick-open key literals — `Key.alt` needs a `Digit`-typed
+ *  argument, so this stays a typed tuple rather than a plain string loop. */
+const ALT_QUICK_OPEN_DIGITS = ['1', '2', '3', '4', '5', '6', '7', '8', '9'] as const;
+
+export class AgentsViewApp extends Container implements Focusable {
+  focused = false;
+
+  private props: AgentsViewProps;
+  private readonly terminal: Terminal;
+  private selectedIndex = 0;
+  private listScroll = 0;
+  private helpVisible = false;
+  private rename: RenameState | undefined = undefined;
+  /**
+   * Screen row (this component's own output line index) → session row id,
+   * for every row line the last `render()` call actually painted. Rebuilt
+   * from scratch each render inside `renderList` — the only place that
+   * already walks the visible rows in order — never re-derived separately
+   * (see `handleMouse`). Header/footer/spacer/composer lines are simply
+   * absent, which is what makes a click there a no-op.
+   */
+  private clickableRows = new Map<number, string>();
+
+  constructor(props: AgentsViewProps, terminal: Terminal) {
+    super();
+    this.props = props;
+    this.terminal = terminal;
+    this.syncSelectionFromProps();
+  }
+
+  setProps(next: AgentsViewProps): void {
+    this.props = next;
+    this.syncSelectionFromProps();
+    this.invalidate();
+  }
+
+  // ── derived view items (fresh on every call — rows are re-derived by
+  //    the controller between frames, so never cache them) ──────────────
+
+  private hiddenCompletedCount(): number {
+    const completedGroup = this.props.groups.find((g) => g.id === 'completed');
+    // A collapsed completed group already shows its own hidden count in the
+    // header (" (N)") — the "more" row is a windowed-pagination affordance
+    // for an EXPANDED group, a different mechanism from manual collapse.
+    // Reporting both at once produced two numbers, neither of them real.
+    if (completedGroup?.collapsedCount !== undefined) return 0;
+    const pinnedGroup = this.props.groups.find((g) => g.id === 'pinned');
+    // A collapsed pinned group also empties its rows, so its count has to
+    // come from collapsedCount too — otherwise pinnedRows silently reads 0
+    // and the remainder phantom-inflates by however many rows are pinned.
+    const pinnedRows = pinnedGroup?.collapsedCount ?? pinnedGroup?.rows.length ?? 0;
+    // counts.completed covers both the pinned and completed buckets, so the
+    // pinned rows must come out of the remainder or they phantom-inflate it.
+    return Math.max(0, this.props.counts.completed - pinnedRows - (completedGroup?.rows.length ?? 0));
+  }
+
+  private deriveItems(): ViewItem[] {
+    const items: ViewItem[] = [];
+    for (const group of this.props.groups) {
+      // A blank line between groups, never before the first one.
+      if (items.length > 0) items.push({ id: `spacer:${group.id}`, kind: 'spacer', group });
+      items.push({ id: `group:${group.id}`, kind: 'header', group });
+      for (const row of group.rows) items.push({ id: row.id, kind: 'row', group, row });
+      if (group.id === 'completed' && this.hiddenCompletedCount() > 0) {
+        items.push({ id: MORE_ITEM_ID, kind: 'more', group });
+      }
+    }
+    return items;
+  }
+
+  private findRow(id: string): AgentsRosterRow | undefined {
+    for (const group of this.props.groups) {
+      const hit = group.rows.find((r) => r.id === id);
+      if (hit !== undefined) return hit;
+    }
+    return undefined;
+  }
+
+  private syncSelectionFromProps(): void {
+    const items = this.deriveItems();
+    if (items.length === 0) {
+      this.selectedIndex = 0;
+      this.listScroll = 0;
+      return;
+    }
+    let idx = this.selectedIndex;
+    if (this.props.selectedId !== undefined) {
+      const found = items.findIndex((item) => item.id === this.props.selectedId);
+      if (found !== -1) idx = found;
+    }
+    if (idx >= items.length) idx = items.length - 1;
+    // A spacer is never a valid selection target — nudge onto the header
+    // that always follows it.
+    if (items[idx]?.kind === 'spacer') idx = Math.min(idx + 1, items.length - 1);
+    this.selectedIndex = idx;
+  }
+
+  // ── key routing ─────────────────────────────────────────────────────
+
+  handleInput(data: string): void {
+    const k = printableChar(data);
+
+    // Rename is a modal inline editor: all keys edit / submit / cancel.
+    if (this.rename === undefined && this.props.renameDraft !== undefined) {
+      // Same empty-start rule as `beginRename`: a remount mid-rename (the
+      // draft lives in view state, this component's local `rename` does
+      // not) still opens on a blank editor.
+      this.rename = {
+        id: this.props.renameDraft.sessionId,
+        original: this.findRow(this.props.renameDraft.sessionId)?.title ?? '',
+        text: '',
+      };
+    }
+    if (this.rename !== undefined) {
+      const rename = this.rename;
+      if (matchesKey(data, Key.enter)) {
+        this.rename = undefined;
+        this.props.onRenameSubmit(rename.id, rename.text);
+      } else if (matchesKey(data, Key.escape)) {
+        // Cancel = submit the original title; the controller no-ops it.
+        this.rename = undefined;
+        this.props.onRenameSubmit(rename.id, rename.original);
+      } else if (matchesKey(data, Key.backspace)) {
+        rename.text = Array.from(rename.text).slice(0, -1).join('');
+      } else if (isPrintableChar(k)) {
+        rename.text += k;
+      }
+      this.invalidate();
+      return;
+    }
+
+    // Dispatch editor focused: every key belongs to the editor EXCEPT the
+    // reply panel's own row-scoped shortcuts, intercepted below BEFORE the
+    // editor sees them (the editor has no notion of "this composer targets
+    // an existing row"). Esc still falls through to the editor's own
+    // onEscape (the controller wires it to close the panel); Enter-with-text
+    // is the editor's own submit.
+    if (this.props.dispatchFocused) {
+      // Ctrl+R has no meaning inside a text editor, so it always renames
+      // the selected roster row — even while the composer owns every other
+      // key. The rename modal branch above takes over from the next
+      // keypress on, so Esc/Enter semantics match a list-focused rename.
+      if (matchesKey(data, Key.ctrl('r'))) {
+        this.beginRename(this.deriveItems()[this.selectedIndex]);
+        return;
+      }
+      if (this.props.replyTargetId !== undefined && this.handleReplyPanelKey(data, k)) {
+        return;
+      }
+      this.props.dispatchEditor.handleInput(data);
+      this.invalidate();
+      return;
+    }
+
+    // Help page: only `?` / Esc leave it.
+    if (this.helpVisible) {
+      if (k === '?' || matchesKey(data, Key.escape)) {
+        this.helpVisible = false;
+        if (k === '?') this.props.onHelpToggle();
+        this.invalidate();
+      }
+      return;
+    }
+
+    if (matchesKey(data, Key.ctrl('x'))) {
+      if (this.props.confirmDeleteId !== undefined) {
+        this.props.onDeleteConfirm(this.props.confirmDeleteId);
+        return;
+      }
+      // B1: second Ctrl+X on an already-armed row — same confirm callback
+      // the group-header dialog above uses, just keyed by the armed row id
+      // instead of `confirmDeleteId`. Navigation/any other action disarms
+      // first (see the controller's `clearDeleteOverlays`), so by the time
+      // a second Ctrl+X can land here the selection is still on this row.
+      if (this.props.armedDeleteId !== undefined) {
+        this.props.onDeleteConfirm(this.props.armedDeleteId);
+        return;
+      }
+      const item = this.deriveItems()[this.selectedIndex];
+      if (item !== undefined && item.kind !== 'more') this.props.onDeleteRequest(item.id);
+      return;
+    }
+
+    // Ctrl+C: two-stage confirm-to-exit, independent of Esc/origin — see the
+    // class docstring. The arm/quit decision and the footer hint's own
+    // display are both the controller's job (`pendingExitArmed`/`onCtrlC`);
+    // this just reports the raw keypress.
+    if (matchesKey(data, Key.ctrl('c'))) {
+      this.props.onCtrlC();
+      return;
+    }
+
+    // Ctrl+S (A6): cycles the roster grouping mode. Global, like Ctrl+X/
+    // Ctrl+C above it — not gated on the current selection kind.
+    if (matchesKey(data, Key.ctrl('s'))) {
+      this.props.onGroupModeToggle();
+      return;
+    }
+
+    if (matchesKey(data, Key.escape)) {
+      // Esc never quits the view — it is far too easy to hit by accident.
+      // Leaving is Ctrl+C (two-stage, above) or the exit command only. Esc
+      // still cancels a pending delete arm/confirm: `onQuit` is the
+      // controller's shared cancel path for those (it clears the overlay
+      // instead of closing when one is set).
+      if (this.props.armedDeleteId !== undefined || this.props.confirmDeleteId !== undefined) {
+        this.props.onQuit();
+      }
+      return;
+    }
+
+    // Once the dispatch editor holds text, printable chars belong to it —
+    // the printable shortcut below (?) only acts on an empty editor.
+    if (this.props.dispatchEditor.getText().length > 0 && isPrintableChar(k)) {
+      this.routeToDispatch(data);
+      return;
+    }
+
+    if (k === '?') {
+      this.helpVisible = true;
+      this.props.onHelpToggle();
+      this.invalidate();
+      return;
+    }
+
+    // shift+↑↓: reorder a PINNED row within the pins array. No-op (but
+    // still consumed — never falls through to plain arrow navigation) on
+    // any other selection: non-pinned rows sort by recency/status, where
+    // manual reordering has no meaning.
+    if (matchesKey(data, Key.shift(Key.up)) || matchesKey(data, Key.shift(Key.down))) {
+      const delta = matchesKey(data, Key.shift(Key.up)) ? -1 : 1;
+      const item = this.deriveItems()[this.selectedIndex];
+      if (item !== undefined && item.kind === 'row' && item.row?.pinned === true) {
+        this.props.onReorderPinned(item.id, delta);
+      }
+      return;
+    }
+
+    // alt+1..9: open the Nth visible session row (same effect as Enter).
+    // Checked before plain navigation since it's a global shortcut, not
+    // gated by the current selection.
+    for (const digit of ALT_QUICK_OPEN_DIGITS) {
+      if (matchesKey(data, Key.alt(digit))) {
+        this.openNthRow(Number(digit));
+        return;
+      }
+    }
+
+    if (matchesKey(data, Key.up)) {
+      this.moveSelection(-1);
+      return;
+    }
+    if (matchesKey(data, Key.down)) {
+      this.moveSelection(1);
+      return;
+    }
+
+    // ← / → : a tree-navigation convention on group headers only — → expands
+    // a collapsed group, ← collapses an expanded one. A collapsed header is
+    // recognizable by its emptied rows (the controller zeroes them). On a
+    // row, → opens the session (same as Enter); ← is a no-op there.
+    if (matchesKey(data, Key.right)) {
+      const item = this.deriveItems()[this.selectedIndex];
+      if (item !== undefined) {
+        if (item.kind === 'row') this.props.onOpen(item.id);
+        else if (item.kind === 'header' && item.group.rows.length === 0) this.props.onOpen(item.id);
+      }
+      return;
+    }
+    if (matchesKey(data, Key.left)) {
+      const item = this.deriveItems()[this.selectedIndex];
+      if (item !== undefined && item.kind === 'header' && item.group.rows.length > 0) {
+        this.props.onOpen(item.id);
+      }
+      return;
+    }
+
+    const item = this.deriveItems()[this.selectedIndex];
+    if (item !== undefined) {
+      if (matchesKey(data, Key.enter)) {
+        // `more:completed` and `group:*` ids are interpreted by the
+        // controller (expand / collapse); a row id is an open request.
+        this.props.onOpen(item.id);
+        return;
+      }
+      if (matchesKey(data, Key.ctrl('r'))) {
+        this.beginRename(item);
+        return;
+      }
+      if (matchesKey(data, Key.ctrl('t'))) {
+        if (item.kind === 'row') this.props.onPinToggle(item.id);
+        return;
+      }
+      // space: reply to a selected ROW; on a group header it is deliberately
+      // NOT consumed here — falls through to the printable-dispatch
+      // fallback below, same as today (space types into the composer).
+      if ((matchesKey(data, Key.space) || k === ' ') && item.kind === 'row') {
+        this.props.onReplyRequest(item.id);
+        return;
+      }
+    }
+
+    // Empty editor, no shortcut matched: start typing a dispatch. The
+    // paste-image key isn't a printable char (it never matched any branch
+    // above either), so without this it would fall off the end here and
+    // never reach CustomEditor's own paste handling — it needs the same
+    // routeToDispatch path a printable char takes to focus the composer.
+    if (isPrintableChar(k) || matchesKey(data, pasteImageKey)) {
+      this.routeToDispatch(data);
+    }
+  }
+
+  /**
+   * A left click on a roster row: select it (the same `onSelect` notify
+   * `moveSelection` fires) then open it — the same `onOpen` call Enter/→
+   * already make, never a second open path. A click that doesn't land on
+   * any row's own line (header, footer, spacer, the composer) is a no-op —
+   * `clickableRows` simply has no entry for it, so `id` is `undefined`.
+   * Clicking an already-selected row is not special-cased into a no-op or a
+   * double-click trigger: it still just opens, every time (B/req 7).
+   *
+   * Respects the same modal states `handleInput` refuses to let anything
+   * else through while active — rename (a half-typed title must not be
+   * silently abandoned by a stray click), the help overlay (honours only
+   * `?`/Esc there too), and the reply panel — a click during any of them is
+   * a no-op, same as any other key.
+   *
+   * The reply panel gets the rename treatment rather than the plain
+   * dispatch composer's below, because its draft is bound to ONE row
+   * (`props.replyTargetId`), not "create a new session". Opening some
+   * other row out from under it would leave `replyTargetId` pointing at a
+   * row the user has navigated away from — the next printable char they
+   * type would misdirect into that stale reply instead of starting a new
+   * dispatch. There is also no keyboard way to open a different row
+   * without closing the panel first (Esc) — `dispatchFocused` sends every
+   * key to the composer while it's open — so the pointer must not invent
+   * one either. `onSelect` already runs `clearDeleteOverlays` (see
+   * `buildCallbacks`), so a click leaves no delete armed on a row the
+   * selection has moved away from, same as `moveSelection` guarantees —
+   * no separate call needed here.
+   *
+   * The PLAIN dispatch composer (`dispatchFocused` true, `replyTargetId`
+   * undefined) is NOT a no-op state, because its draft isn't bound to any
+   * row — navigating away leaves it sitting there harmlessly for the user
+   * to come back to. A click there is an explicit open request (refusing
+   * it would be the surprising choice), but the view must not come back
+   * with the composer still owning ↑/↓ — `onDispatchFocusChange(false)` is
+   * the same focus-change signal a printable char uses in reverse to focus
+   * the composer (see `routeToDispatch`); it only unfocuses, leaving the
+   * draft text untouched.
+   */
+  handleMouse(event: MouseClickEvent): void {
+    const id = this.clickableRows.get(event.row);
+    if (id === undefined) return;
+    if (this.rename !== undefined || this.helpVisible || this.props.replyTargetId !== undefined) return;
+    const idx = this.deriveItems().findIndex((candidate) => candidate.id === id);
+    if (idx !== -1) this.selectedIndex = idx;
+    this.props.onSelect(id);
+    this.props.onOpen(id);
+    if (this.props.dispatchFocused) this.props.onDispatchFocusChange(false);
+    this.invalidate();
+  }
+
+  private routeToDispatch(data: string): void {
+    this.props.dispatchEditor.handleInput(data);
+    this.props.onDispatchFocusChange(true);
+    this.invalidate();
+  }
+
+  /**
+   * Ctrl+R's single rename entry point, shared by the list-focused branch
+   * and the dispatch-focused intercept (the key means the same thing in
+   * both focus states). Only a `row` item can be renamed — anything else
+   * (header, `more`, nothing selected) just consumes the key.
+   */
+  private beginRename(item: ViewItem | undefined): void {
+    if (item === undefined || item.kind !== 'row' || item.row === undefined) return;
+    // The editor starts EMPTY: the user types the new name from scratch
+    // instead of editing a pre-filled copy of the old title (the original is
+    // kept only so Esc-cancel has something unchanged to resubmit).
+    this.rename = { id: item.id, original: item.row.title, text: '' };
+    this.props.onRenameBegin(item.id);
+    this.invalidate();
+  }
+
+  /**
+   * Reply panel's own row-scoped shortcuts, checked before a key focused on
+   * `dispatchEditor` reaches it (see `handleInput`). Returns `true` when the
+   * key was consumed here; `false` lets the caller fall through to the
+   * editor as ordinary text/editing input (Esc and a non-empty Enter always
+   * fall through this way — the editor's own `onEscape`/`onSubmit` handle
+   * those).
+   */
+  private handleReplyPanelKey(data: string, k: string): boolean {
+    const targetId = this.props.replyTargetId;
+    if (targetId === undefined) return false;
+    const empty = this.props.dispatchEditor.getText().length === 0;
+
+    // Symmetric toggle: space closes an EMPTY reply input, same as the space
+    // that opened the panel. A non-empty input's space is an ordinary
+    // character — falls through to the editor untouched.
+    if ((matchesKey(data, Key.space) || k === ' ') && empty) {
+      this.props.onReplyClose();
+      return true;
+    }
+    if (matchesKey(data, Key.ctrl('x'))) {
+      this.props.onReplyClose();
+      this.props.onDeleteRequest(targetId);
+      return true;
+    }
+    // Up/Down close the panel and move the roster selection — but ONLY when
+    // the shared editor isn't showing its own @-mention/slash autocomplete
+    // dropdown. `Editor.handleInput` (pi-tui) routes Up/Down to the
+    // dropdown's own navigation whenever one is open (same as plain
+    // dispatch already relies on); intercepting unconditionally here would
+    // steal that navigation and — since `exitReplyMode` clears the draft on
+    // every non-submit close — silently discard whatever the user had
+    // typed. Falling through leaves the keystroke for `dispatchEditor` below.
+    if (!this.props.dispatchEditor.isShowingAutocomplete()) {
+      if (matchesKey(data, Key.up)) {
+        this.props.onReplyClose();
+        this.moveSelection(-1);
+        return true;
+      }
+      if (matchesKey(data, Key.down)) {
+        this.props.onReplyClose();
+        this.moveSelection(1);
+        return true;
+      }
+    }
+    // Empty Enter closes the panel and attaches (same path as Enter on the
+    // row); a non-empty Enter is the editor's own submit — falls through to
+    // the send path unchanged.
+    if (matchesKey(data, Key.enter) && empty) {
+      this.props.onReplyClose();
+      this.props.onOpen(targetId);
+      return true;
+    }
+    return false;
+  }
+
+  private moveSelection(delta: number): void {
+    const items = this.deriveItems();
+    if (items.length === 0) return;
+    let next = Math.max(0, Math.min(items.length - 1, this.selectedIndex + delta));
+    // A spacer is never a valid stop — step over it in the same direction.
+    // It always sits strictly between two groups, so this cannot run off
+    // either end.
+    while (items[next]?.kind === 'spacer') {
+      next = Math.max(0, Math.min(items.length - 1, next + delta));
+    }
+    this.selectedIndex = next;
+    this.props.onSelect(items[this.selectedIndex]?.id ?? '');
+    this.invalidate();
+  }
+
+  /**
+   * alt+1..9: opens the Nth session ROW in the current visible-item order
+   * (group headers, spacers and the collapsed "more" row do not count).
+   * Same effect as Enter on that row (`onOpen`). `n` beyond the row count
+   * is a no-op — no number badges are rendered on the rows themselves.
+   */
+  private openNthRow(n: number): void {
+    let count = 0;
+    for (const item of this.deriveItems()) {
+      if (item.kind !== 'row') continue;
+      count += 1;
+      if (count === n) {
+        this.props.onOpen(item.id);
+        return;
+      }
+    }
+  }
+
+  // ── render ───────────────────────────────────────────────────────────
+
+  override render(width: number): string[] {
+    const rows = Math.max(1, this.terminal.rows);
+    // Cleared up front, unconditionally: the too-small branch below never
+    // repopulates it, and a stale entry from a wider frame must not survive
+    // into one where that line no longer holds the row it used to.
+    this.clickableRows.clear();
+    if (width < MIN_WIDTH || rows < MIN_HEIGHT) {
+      return this.renderTooSmall(width, rows);
+    }
+
+    // The `?` grid replaces the single-line footer with a 2-row one — the
+    // list's visible window shrinks by one row to make room; total screen
+    // rows stay fixed either way.
+    const footerLines = this.renderFooter(width);
+    const bodyHeight = rows - HEADER_HEIGHT - footerLines.length;
+    // The composer slot: the reply panel (bordered box: preview + age +
+    // the same editor) while a panel target is set, otherwise the plain
+    // dispatch editor box — same slot, same height accounting either way.
+    // The list keeps at least 3 rows.
+    const composerLines =
+      this.props.replyTargetId !== undefined
+        ? renderReplyPanel(this.findRow(this.props.replyTargetId), this.props.dispatchEditor, width)
+        : this.props.dispatchEditor.render(width);
+    const composerHeight = Math.min(composerLines.length, Math.max(3, bodyHeight - 3));
+    const listHeight = Math.max(1, bodyHeight - composerHeight);
+
+    // The roster stays visible and scrollable behind the `?` grid — it never
+    // gets swapped out for a full-body help screen.
+    return [
+      ...this.renderHeader(width),
+      ...this.renderList(width, listHeight),
+      ...composerLines.slice(0, composerHeight),
+      ...footerLines,
+    ];
+  }
+
+  /**
+   * 3 info lines (brand mark + version, model · cwd, status counts) + 1
+   * trailing blank line before the first group. The blank line is rendered
+   * HERE, not inserted into `deriveItems` as a leading spacer — a spacer at
+   * index 0 would break `moveSelection`'s "spacer never sits at the list's
+   * first stop" invariant and its step-over loop could spin forever.
+   */
+  private renderHeader(width: number): string[] {
+    const { awaiting, working, completed } = this.props.counts;
+    const logoWidth = Math.max(...LOGO.map((row) => visibleWidth(row)));
+    const gap = '  ';
+    const logoCol = (row: string): string =>
+      ' ' + currentTheme.fg('primary', row) + ' '.repeat(logoWidth - visibleWidth(row)) + gap;
+
+    const titleLine = logoCol(LOGO[0]) + currentTheme.boldFg('textStrong', `${PRODUCT_NAME} v${kimiVersion()}`);
+    const modelCwdLine =
+      logoCol(LOGO[1]) + currentTheme.fg('textMuted', `${this.props.modelLabel} · ${process.cwd()}`);
+    const countsLine =
+      ' ' +
+      ' '.repeat(logoWidth) +
+      gap +
+      currentTheme.fg(
+        'textDim',
+        `${String(awaiting)} awaiting input · ${String(working)} working · ${String(completed)} completed`,
+      );
+
+    return [
+      fitExactly(titleLine, width),
+      fitExactly(modelCwdLine, width),
+      fitExactly(countsLine, width),
+      ' '.repeat(width),
+    ];
+  }
+
+  private renderList(width: number, height: number): string[] {
+    const items = this.deriveItems();
+    const lines: string[] = [];
+    if (items.length === 0) {
+      lines.push(...this.renderEmptyGroups(width));
+    } else {
+      this.adjustScroll(height, items.length);
+      const window = items.slice(this.listScroll, this.listScroll + height);
+      for (const [vi, item] of window.entries()) {
+        const selected = this.listScroll + vi === this.selectedIndex;
+        lines.push(this.renderItem(item, selected, width));
+        // HEADER_HEIGHT + vi is this line's index in the FULL screen output
+        // render() returns (header block always comes first, always exactly
+        // HEADER_HEIGHT lines) — see handleMouse and the clickableRows doc.
+        if (item.kind === 'row') this.clickableRows.set(HEADER_HEIGHT + vi, item.id);
+      }
+    }
+    while (lines.length < height) lines.push(' '.repeat(width));
+    return lines.slice(0, height);
+  }
+
+  /**
+   * B10: cosmetic-only chrome for a totally empty roster (`items.length ===
+   * 0`, i.e. `groups` came back empty from both grouping strategies).
+   * Decorative only — never fed into `deriveItems`, so nothing rendered
+   * here is selectable or collapsible; `selectedIndex`/`moveSelection` and
+   * the footer's own `item === undefined` fallback all behave exactly as
+   * they already do for an empty `groups` array.
+   */
+  private renderEmptyGroups(width: number): string[] {
+    if (this.props.emptyGroupsDisplay === 'plain') {
+      return [fitExactly(currentTheme.fg('textMuted', EMPTY_DIRECTORY_MESSAGE), width)];
+    }
+    const lines: string[] = [];
+    for (const band of emptyStateSkeleton(this.props.sessionsSurviveExit)) {
+      lines.push(renderGroupHeader(band.label, undefined, false, width));
+      lines.push(renderSkeletonDescription(band.description, width));
+    }
+    return lines;
+  }
+
+  private renderItem(item: ViewItem, selected: boolean, width: number): string {
+    if (item.kind === 'spacer') {
+      return ' '.repeat(width);
+    }
+    if (item.kind === 'header') {
+      return renderGroupHeader(item.group.label, item.group.collapsedCount, selected, width);
+    }
+    if (item.kind === 'more') {
+      return renderMoreRow(this.hiddenCompletedCount(), selected, width);
+    }
+    const row = item.row!;
+    const draft = this.draftFor(row.id);
+    if (draft !== undefined) {
+      const line =
+        currentTheme.fg(selected ? 'primary' : 'textDim', selected ? '▸ ' : '  ') +
+        currentTheme.fg('accent', '✎ ') +
+        currentTheme.fg('text', draft) +
+        // Zero-width hardware-cursor marker right at the caret: without it
+        // the IME candidate window anchors to wherever the terminal cursor
+        // last rested (end of the painted line) instead of the edit point —
+        // the same CURSOR_MARKER contract pi-tui's own input component
+        // follows. Zero width, so fitExactly's width math is unaffected.
+        (this.focused ? CURSOR_MARKER : '') +
+        currentTheme.fg('textDim', '▌');
+      // Rename can only begin on the currently-selected row, so `selected`
+      // is always true for the duration of editing — same fill every other
+      // selectable stop gets, for visual consistency.
+      return withSelectedBg(fitExactly(line, width), selected);
+    }
+    const sendState = this.props.replyFailureIds.has(row.id)
+      ? 'failed'
+      : this.props.pendingReplyIds.has(row.id)
+        ? 'sending'
+        : undefined;
+    const deleteArm: RowDeleteArm | undefined =
+      this.props.armedDeleteId !== row.id ? undefined : this.props.armedDeleteStopped ? 'stopped' : 'arming';
+    return renderRosterRow(row, selected, row.id === this.props.originId, width, sendState, deleteArm);
+  }
+
+  private draftFor(id: string): string | undefined {
+    if (this.rename !== undefined && this.rename.id === id) return this.rename.text;
+    if (this.props.renameDraft !== undefined && this.props.renameDraft.sessionId === id) {
+      return this.props.renameDraft.text;
+    }
+    return undefined;
+  }
+
+  /**
+   * The `?` grid: 2 rows, column-aligned (each column padded to its widest
+   * cell across both rows). Replaces the single-line footer entirely while
+   * visible — the roster list underneath is untouched (see `render`).
+   */
+  private renderHelpGrid(width: number): string[] {
+    const columns = Math.max(...HELP_GRID.map((row) => row.length));
+    const colWidths = Array.from({ length: columns }, (_unused, c) =>
+      Math.max(
+        0,
+        ...HELP_GRID.map((row) => {
+          const cell = row[c];
+          return cell === undefined ? 0 : cell[0].length + 1 + cell[1].length;
+        }),
+      ),
+    );
+    return HELP_GRID.map((row) => {
+      const cells = row.map((cell, c) => {
+        const colWidth = colWidths[c] ?? 0;
+        if (cell === undefined) return ' '.repeat(colWidth);
+        const [cellKey, hint] = cell;
+        const plainWidth = cellKey.length + 1 + hint.length;
+        return (
+          currentTheme.boldFg('primary', cellKey) +
+          ' ' +
+          currentTheme.fg('textMuted', hint) +
+          ' '.repeat(Math.max(0, colWidth - plainWidth))
+        );
+      });
+      return fitExactly('  ' + cells.join('   '), width);
+    });
+  }
+
+  /**
+   * Terse, `" · "`-joined hints instead of an
+   * always-on verbose bar — rename/pin/quit live in the `?` grid instead of
+   * every row footer. Returns 2 lines while the `?` grid is open, 1
+   * otherwise (see `render`'s header/footer height accounting).
+   */
+  private renderFooter(width: number): string[] {
+    if (this.helpVisible) return this.renderHelpGrid(width);
+
+    const key = (text: string): string => currentTheme.boldFg('primary', text);
+    const dim = (text: string): string => currentTheme.fg('textMuted', text);
+    const hint = (k: string, rest: string): string => `${key(k)} ${dim(rest)}`;
+    const compose = (...parts: string[]): string => ` ${parts.join(dim(' · '))} `;
+
+    let left: string;
+    if (this.props.pendingExitArmed) {
+      // Ctrl+C armed: replaces the whole footer, same as the main REPL's
+      // transient exit hint — the two-stage confirm is the most urgent
+      // signal on screen while it's live. The keep-running count (B4) is
+      // both buckets with a turn actually in flight or waiting on the user
+      // (awaiting + working) — completed/idle rows never count.
+      //
+      // I6: "will keep running" is a survival promise only true when
+      // `sessionsSurviveExit` — embedded mode's sessions actually die with
+      // the CLI, so that mode gets a neutral "still running" instead.
+      const keepRunning = this.props.counts.awaiting + this.props.counts.working;
+      const agentNoun = `agent${keepRunning === 1 ? '' : 's'}`;
+      const runningVerb = this.props.sessionsSurviveExit ? 'will keep running' : 'still running';
+      const runningNote = keepRunning > 0 ? ` · ${String(keepRunning)} ${agentNoun} ${runningVerb}` : '';
+      left = compose(currentTheme.boldFg('warning', CTRL_C_ARM_HINT + runningNote));
+    } else if (this.draftFor(this.props.renameDraft?.sessionId ?? this.rename?.id ?? '') !== undefined) {
+      left = compose(hint('enter', 'to save'), hint('esc', 'to cancel'));
+    } else if (this.props.dispatchFocused) {
+      if (this.props.replyTargetId !== undefined) {
+        // Panel open: empty input still offers "enter to open" (attach) and
+        // "space to close" (symmetric toggle); once there's text, Enter
+        // sends and Esc/space both just close (space becomes an ordinary
+        // character the moment there's text to type it into).
+        left =
+          this.props.dispatchEditor.getText().length === 0
+            ? compose(hint('enter', 'to open'), hint('space', 'to close'), hint('ctrl+x', 'to delete'))
+            : compose(hint('enter', 'to send'), hint('esc', 'to close'), hint('ctrl+x', 'to delete'));
+      } else {
+        left = compose(hint('enter', 'to dispatch'), hint('esc', 'to back to list'));
+      }
+    } else if (this.props.confirmDeleteId !== undefined) {
+      left = compose(
+        currentTheme.boldFg('warning', this.deleteConfirmCopy(this.props.confirmDeleteId)),
+        hint('ctrl+x', 'to confirm'),
+        dim('any other key cancels'),
+      );
+    } else if (this.props.armedDeleteId !== undefined) {
+      // B1: the row itself already carries the arm text in its summary
+      // column (`ctrl+x again to delete` / `stopped · ...`, see
+      // `renderItem`'s `deleteArm`) — the footer just states the same two
+      // ways out, same register as every other hint row here.
+      left = compose(hint('ctrl+x', 'again to delete'), hint('esc', 'to keep'));
+    } else {
+      const item = this.deriveItems()[this.selectedIndex];
+      if (item === undefined) {
+        left = compose(hint('?', 'for shortcuts'));
+      } else if (item.kind === 'header') {
+        left = compose(hint('enter', 'to collapse'), hint('ctrl+x', 'to delete all'), hint('?', 'for shortcuts'));
+      } else if (item.kind === 'more') {
+        left = compose(hint('enter', 'to expand'), hint('?', 'for shortcuts'));
+      } else {
+        // B2: this process has never attached to the row vs. it has —
+        // "open" the first time, "return" every time after.
+        const openVerb = this.props.attachedIds.has(item.id) ? 'to return' : 'to open';
+        left = compose(
+          hint('enter', openVerb),
+          hint('space', 'to reply'),
+          hint('ctrl+x', 'to delete'),
+          hint('?', 'for shortcuts'),
+        );
+      }
+    }
+
+    const flash = this.props.flashMessage;
+    if (flash !== undefined && flash.length > 0) {
+      const flashStyled = currentTheme.fg('warning', ` ${flash} `);
+      const flashWidth = visibleWidth(flashStyled);
+      if (flashWidth < width) {
+        // The flash is transient and carries the action's outcome (dispatch
+        // errors!) — the static key hints truncate to make room instead of
+        // the flash being dropped on narrower terminals.
+        return [fitExactly(left, width - flashWidth) + flashStyled];
+      }
+      return [fitExactly(flashStyled, width)];
+    }
+    return [fitExactly(left, width)];
+  }
+
+  /**
+   * `confirmDeleteId` is GROUP-header-only now (B1 moved row deletes to the
+   * inline arm — see the class docstring), so `id` is always `group:<id>`
+   * here; no row-shaped fallback needed.
+   */
+  private deleteConfirmCopy(id: string): string {
+    const groupId = id.slice('group:'.length);
+    const group = this.props.groups.find((g) => g.id === groupId);
+    const label = group?.label ?? groupId;
+    const busyCount = group?.rows.filter((r) => r.busy).length ?? 0;
+    return (
+      `Archive all sessions in "${label}"?` + (busyCount > 0 ? ' Running turns will be cancelled first.' : '')
+    );
+  }
+
+  private adjustScroll(visibleRows: number, itemCount: number): void {
+    if (visibleRows <= 0) {
+      this.listScroll = 0;
+      return;
+    }
+    if (this.selectedIndex < this.listScroll) {
+      this.listScroll = this.selectedIndex;
+    } else if (this.selectedIndex >= this.listScroll + visibleRows) {
+      this.listScroll = this.selectedIndex - visibleRows + 1;
+    }
+    const maxScroll = Math.max(0, itemCount - visibleRows);
+    if (this.listScroll < 0) this.listScroll = 0;
+    if (this.listScroll > maxScroll) this.listScroll = maxScroll;
+  }
+
+  private renderTooSmall(width: number, rows: number): string[] {
+    const lines: string[] = [];
+    const msg = currentTheme.fg(
+      'error',
+      `Terminal too small (need ≥ ${String(MIN_WIDTH)} × ${String(MIN_HEIGHT)})`,
+    );
+    lines.push(fitExactly(msg, width));
+    for (let i = 1; i < rows; i++) lines.push(' '.repeat(width));
+    return lines;
+  }
+}

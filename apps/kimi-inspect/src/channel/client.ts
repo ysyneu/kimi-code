@@ -5,8 +5,8 @@
  * `makeProxy`-materialized typed proxy over a service-bound HTTP channel.
  *
  *   const client = createInspectClient({ url: 'http://127.0.0.1:58627' });
- *   await client.core(ISessionIndex).list({});
- *   await client.workspace('wd_1').service(IWorkspaceHandlerService).resume('s1');
+ *   await client.core(ISessionIndex).listRecent({});
+ *   await client.workspace('wd_1').service(ISessionLifecycleService).resume('s1');
  *   await client.session('s1').service(ISessionMetadata).read();
  *   await client.session('s1').agent('main').service(IAgentRPCService).cancel({});
  *

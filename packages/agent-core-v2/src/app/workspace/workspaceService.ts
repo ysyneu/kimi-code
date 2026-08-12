@@ -1,15 +1,13 @@
 /**
- * `workspace` domain (L2) — `IWorkspaceService` implementation.
+ * `workspace` domain — `IWorkspaceService` implementation.
  *
  * Process-wide catalog of known workspaces, durable in
- * `<homeDir>/workspaces.json` (the v1-compatible file shared with
- * agent-core). The service keeps NO in-memory write cache: every operation
- * is a fresh read-modify-write against the file, serialized through a
- * promise-chain mutex. This is required, not just tidy — the same file is
- * written concurrently by other processes (the v1 TUI registers session cwds
- * via `touchWorkspaceRegistry`, which also re-reads the file on every call),
- * so a write-through cache would clobber external additions and tombstones
- * with stale state. Atomic renames at the persistence layer plus fresh
+ * `<homeDir>/workspaces.json` (the v1-compatible file). The service keeps NO
+ * in-memory write cache: every operation is a fresh read-modify-write
+ * against the file, serialized through a promise-chain mutex. This is
+ * required, not just tidy — the same file is written concurrently by other
+ * processes, so a write-through cache would clobber external additions and
+ * tombstones with stale state. Atomic renames at the persistence layer plus fresh
  * read-modify-write on both engines shrink the lost-update window to a
  * single read-modify-write, and the next session-index merge heals anything
  * still lost there.
@@ -31,10 +29,9 @@
  * `createOrTouch` is the single choke point every workspace/session creation
  * funnels through, so it owns the root-existence contract: the root must be
  * an existing directory on the host filesystem, otherwise it throws
- * `fs.path_not_found` (mirrors v1's `WorkspaceRootNotFoundError`). The
- * directory probe follows symlinks (`IHostFileSystem.stat` is lstat-based, so
- * a symlink-form root is re-checked through `realpath`), while the workspace
- * identity stays lexical — v1 deliberately never realpaths the root either.
+ * `fs.path_not_found`. The directory probe follows symlinks
+ * (`IHostFileSystem.stat` is lstat-based, so a symlink-form root is
+ * re-checked through `realpath`), while the workspace identity stays lexical.
  * The rebuild and merge paths bypass the check on purpose — they catalog
  * where sessions *were*, not where new ones may open. Bound at App scope.
  *
@@ -50,20 +47,20 @@
  *
  * Legacy data may still be split: two registry entries (or a registry entry
  * plus session-index-only spellings) for one physical folder, with sessions
- * bucketed per id. The read-side counterpart to the write-path folding —
- * enumerating every id spelling of one directory so readers can query all
- * sibling buckets at once — lives in `IWorkspaceAliases` (`workspaceAliases`
- * domain), built on the shared `workspaceAlias` helpers. `delete` folds the
- * same alias set inside the op mutex so a sibling spelling cannot resurface
- * as this directory's representative on the next `list()`.
+ * bucketed per id. `delete` folds the same alias set inside the op mutex so a
+ * sibling spelling cannot resurface as this directory's representative on the
+ * next `list()`.
  */
 
 import { basename, isAbsolute } from 'pathe';
 
-import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
+import { LifecycleScope } from '#/app/scopes';
+import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
+import { parseIntegerEnv } from '#/_base/utils/env';
+import { raceTimeout } from '#/_base/utils/promise';
 import { encodeWorkDirKey, workspaceRootKey } from '#/_base/utils/workdir-slug';
 import { ErrorCodes, Error2, unwrapErrorCause } from '#/errors';
-import { IHostFileSystem } from '#/os/interface/hostFileSystem';
+import { IHostFileSystem, type HostFileStat } from '#/os/interface/hostFileSystem';
 import { IFileSystemStorageService } from '#/persistence/interface/storage';
 
 import { IWorkspaceService, type Workspace, type WorkspaceUpdate } from './workspace';
@@ -78,7 +75,6 @@ import { IWorkspacePersistence, type WorkspaceCatalog } from './workspacePersist
 export class WorkspaceService implements IWorkspaceService {
   declare readonly _serviceBrand: undefined;
 
-  /** Whether the once-per-process session-index sync already ran. */
   private merged = false;
   private opQueue: Promise<unknown> = Promise.resolve();
 
@@ -107,26 +103,7 @@ export class WorkspaceService implements IWorkspaceService {
 
   createOrTouch(root: string, name?: string): Promise<Workspace> {
     return this.runExclusive(async () => {
-      let stat;
-      try {
-        stat = await this.hostFs.stat(root);
-      } catch (error) {
-        const code = (unwrapErrorCause(error) as NodeJS.ErrnoException | undefined)?.code;
-        if (code === 'ENOENT' || code === 'ENOTDIR') {
-          throw new Error2(ErrorCodes.FS_PATH_NOT_FOUND, `workspace root ${root} does not exist`);
-        }
-        throw error;
-      }
-      if (!stat.isDirectory) {
-        try {
-          stat = await this.hostFs.stat(await this.hostFs.realpath(root));
-        } catch {
-          // Fall through to the not-a-directory error below.
-        }
-      }
-      if (!stat.isDirectory) {
-        throw new Error2(ErrorCodes.FS_PATH_NOT_FOUND, `workspace root ${root} is not a directory`);
-      }
+      await this.resolveRootIsDirectory(root);
       await this.ensureMerged();
       const catalog = await this.loadCatalog();
       const byId = new Map(catalog.workspaces.map((ws) => [ws.id, ws]));
@@ -134,11 +111,6 @@ export class WorkspaceService implements IWorkspaceService {
       const id = encodeWorkDirKey(root);
       let existing = byId.get(id);
       if (existing === undefined) {
-        // Fold identity-equivalent spellings (`workspaceRootKey`: Windows
-        // drive-letter/realpath casing, slash direction) onto the registered
-        // entry instead of minting a second id for the same folder. The first
-        // matching entry wins wholesale — its id, root, and name are kept;
-        // only `lastOpenedAt` advances.
         const rootKey = workspaceRootKey(root);
         for (const entry of byId.values()) {
           if (workspaceRootKey(entry.root) === rootKey) {
@@ -159,11 +131,60 @@ export class WorkspaceService implements IWorkspaceService {
               lastOpenedAt: now,
             };
       byId.set(ws.id, ws);
-      // An explicit add clears any prior deletion tombstone.
       deletedIds.delete(ws.id);
       await this.store.save({ workspaces: [...byId.values()], deletedIds: [...deletedIds] });
       return ws;
     });
+  }
+
+  /**
+   * Resolves whether `root` — an arbitrary, caller-supplied path, unlike
+   * every other read/write this service does (all of which stay under
+   * `homeDir`) — is a directory, throwing `FS_PATH_NOT_FOUND` if not. Bounded
+   * as a whole (both the initial `stat` and the symlink-resolution fallback)
+   * because `runExclusive`'s queue is process-wide and un-timed: a `root` on
+   * a stale/disconnected mount would otherwise stall this `stat` forever and,
+   * since the queue is (correctly, see the class doc comment) global,
+   * permanently wedge every OTHER workspace's queued operation behind it —
+   * the same hang class {@link raceTimeout}'s other call site guards against
+   * in `workspaceHandlerService.ts`. On timeout this op rejects with a clear
+   * error and the queue advances to whatever is next — it does not retry
+   * and does not touch or cancel the underlying `stat`/`realpath` calls.
+   */
+  private async resolveRootIsDirectory(root: string): Promise<void> {
+    const timeoutMs = parseIntegerEnv(process.env['KIMI_SNAPSHOT_TIMEOUT_MS'], DEFAULT_ROOT_STAT_TIMEOUT_MS, 100);
+    await raceTimeout(
+      this.resolveRootIsDirectoryUnbounded(root),
+      timeoutMs,
+      () =>
+        new Error2(
+          ErrorCodes.WORKSPACE_ROOT_TIMEOUT,
+          `workspace root ${root} did not respond within ${String(timeoutMs)}ms`,
+        ),
+    );
+  }
+
+  private async resolveRootIsDirectoryUnbounded(root: string): Promise<void> {
+    let stat: HostFileStat;
+    try {
+      stat = await this.hostFs.stat(root);
+    } catch (error) {
+      const code = (unwrapErrorCause(error) as NodeJS.ErrnoException | undefined)?.code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        throw new Error2(ErrorCodes.FS_PATH_NOT_FOUND, `workspace root ${root} does not exist`);
+      }
+      throw error;
+    }
+    if (!stat.isDirectory) {
+      try {
+        stat = await this.hostFs.stat(await this.hostFs.realpath(root));
+      } catch {
+        // Fall through to the not-a-directory error below.
+      }
+    }
+    if (!stat.isDirectory) {
+      throw new Error2(ErrorCodes.FS_PATH_NOT_FOUND, `workspace root ${root} is not a directory`);
+    }
   }
 
   update(id: string, patch: WorkspaceUpdate): Promise<Workspace | undefined> {
@@ -188,15 +209,8 @@ export class WorkspaceService implements IWorkspaceService {
     return this.runExclusive(async () => {
       await this.ensureMerged();
       const catalog = await this.loadCatalog();
-      // Soft delete: tombstone the id so the session-index merge cannot
-      // resurrect it, even if sessions still reference the workDir. Folded
-      // aliases must die with it — a sibling spelling left registered (or
-      // resurrectable from the session index) would resurface as this
-      // directory's representative on the next list().
       let root = catalog.workspaces.find((ws) => ws.id === id)?.root;
       if (root === undefined) {
-        // Derived/unknown id: recover its spelling from the session index so
-        // the whole alias set can still be tombstoned.
         root = (await readSessionIndexEntries(this.storage)).find(
           (line) => encodeWorkDirKey(line.workDir) === id,
         )?.workDir;
@@ -221,9 +235,6 @@ export class WorkspaceService implements IWorkspaceService {
     });
   }
 
-  /** Once-per-process startup sync with the legacy session index (see the
-   *  file header). Runs inside the op mutex, so it cannot interleave with a
-   *  mutation's read-modify-write. */
   private async ensureMerged(): Promise<void> {
     if (this.merged) return;
     const loaded = await this.store.load();
@@ -241,15 +252,10 @@ export class WorkspaceService implements IWorkspaceService {
     this.merged = true;
   }
 
-  /** Read the current catalog; a missing or malformed file is an empty
-   *  catalog (mirrors v1's tolerant read). */
   private async loadCatalog(): Promise<WorkspaceCatalog> {
     return (await this.store.load()) ?? { workspaces: [], deletedIds: [] };
   }
 
-  /** Add every distinct workDir from the legacy session index that the
-   *  catalog does not know about yet. Tombstoned ids are skipped, so a
-   *  soft-deleted workspace stays deleted. Returns whether anything changed. */
   private async mergeFromSessionIndex(
     byId: Map<string, Workspace>,
     deletedIds: ReadonlySet<string>,
@@ -274,9 +280,6 @@ export class WorkspaceService implements IWorkspaceService {
   private async rebuildFromSessionIndex(): Promise<Map<string, Workspace>> {
     const result = new Map<string, Workspace>();
     const now = Date.now();
-    // Dedupe by identity key, not by minted id: casing/slash variants of one
-    // directory (Windows) collapse here too. First seen wins — the id stays
-    // `encodeWorkDirKey` of that first-seen workDir string.
     const seenRootKeys = new Set<string>();
     for (const entry of await readSessionIndexEntries(this.storage)) {
       if (!isAbsolute(entry.workDir)) continue;
@@ -312,3 +315,13 @@ registerScopedService(
   ScopeActivation.OnScopeCreated,
   'workspace',
 );
+
+/**
+ * Fallback ceiling for {@link WorkspaceService.resolveRootIsDirectory} when
+ * `KIMI_SNAPSHOT_TIMEOUT_MS` is unset — same env var and default as the
+ * `materializeSession` MCP-ready bound (`workspaceHandlerService.ts`), so
+ * this is one operator knob for the whole class of "an external path/process
+ * this service has no control over never responds" hangs, not a second one
+ * for this call site.
+ */
+const DEFAULT_ROOT_STAT_TIMEOUT_MS = 4000;

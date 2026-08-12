@@ -1,7 +1,7 @@
 /**
- * `workspaceFs` domain (L3) — `IWorkspaceFsService` implementation.
+ * `workspaceFs` domain — `IWorkspaceFsService` implementation.
  *
- * Backs the fs REST surface (search / grep / git status / git diff) by
+ * Implements the fs operations (search / grep / git status / git diff) by
  * orchestrating the os `IHostFileSystem` (file IO, resolved against the
  * workspace root), the handler-shared `ISessionProcessRunner` (`rg`), and
  * `IWorkspaceGitService` (git status/diff bound to the handler root; this
@@ -9,11 +9,11 @@
  * calling it).
  *
  * Path confinement applies a lexical within-workspace check first (the
- * handler root plus the `workspaceDirs` additional-dir set, mirroring the
- * Session-scope `workspaceContext` view semantics), then re-verifies the
- * candidate through `IHostFileSystem.realpath` (resolving the longest
- * existing prefix, so not-yet-created paths still work): a symlink inside
- * the workspace must not steer fs actions to files outside it. The small
+ * handler root plus the `workspaceDirs` additional-dir set), then
+ * re-verifies the candidate through `IHostFileSystem.realpath` (resolving
+ * the longest existing prefix, so not-yet-created paths still work): a
+ * symlink inside the workspace must not steer fs actions to files outside
+ * it. The small
  * caches (`rgResolution`, `realRootsCache`) are plain per-handler fields.
  * Bound at Workspace scope — one instance per handler, shared by every
  * session of the workspace.
@@ -48,12 +48,6 @@ import {
   type FsStatResponse,
 } from './fs';
 
-/**
- * The v1 numeric wire codes this edge surface throws inside its
- * `{ code, msg }` wire errors (`toWireError`). Mirrors the envelope error
- * table owned by the transport (kap-server); kept as local literals because
- * they are part of this service's v1 edge contract.
- */
 const FsWireErrorCode = {
   FS_PATH_NOT_FOUND: 40409,
   FS_IS_DIRECTORY: 40906,
@@ -64,7 +58,9 @@ const FsWireErrorCode = {
 } as const;
 import ignore, { type Ignore } from 'ignore';
 
-import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
+import { LifecycleScope } from '#/app/scopes';
+import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
+import { decodeUtfText, detectTextEncoding, type UtfTextEncoding } from '#/_base/text/encoding';
 import {
   buildEtag,
   countLines,
@@ -82,8 +78,8 @@ import { IWorkspaceDirs } from '#/workspace/workspaceDirs/workspaceDirs';
 import { IWorkspaceGitService } from '#/workspace/workspaceGit/workspaceGit';
 
 import { type FsDownloadResolved, type FsPathResolved, IWorkspaceFsService } from './fs';
-import { readStream, runCommand } from './fsProcess';
-import { ensureRgPath, type RgProbe, type RgResolution } from './rgLocator';
+import { readStream, runCommand } from './internal/fsProcess';
+import { ensureRgPath, type RgProbe, type RgResolution } from './internal/rgLocator';
 import {
   compileGrepPattern,
   computeFuzzyScore,
@@ -93,7 +89,7 @@ import {
   rgPath,
   rgText,
   stripTrailingNewline,
-} from './fsSearch';
+} from './internal/fsSearch';
 
 const SEARCH_HARD_CAP = 500;
 const GREP_TIMEOUT_MS = 30_000;
@@ -261,7 +257,20 @@ export class WorkspaceFsService implements IWorkspaceFsService {
     const sampleSize = Math.min(FS_BINARY_SAMPLE_BYTES, st.size);
     const sample =
       sampleSize === 0 ? new Uint8Array() : await this.hostFs.readBytes(abs, sampleSize);
-    const isBinary = detectBinary(sample);
+    let isBinary = detectBinary(sample);
+
+    // Trust encoding detection over the binary heuristic: a binary-looking
+    // sample can still be UTF-16 LE/BE text, and a BOM-marked UTF-16 file
+    // may not look binary at all (CJK-only content carries no zero bytes).
+    // Both are transcoded to UTF-8 so text clients can display them.
+    let transcodeEncoding: UtfTextEncoding | undefined;
+    if (req.encoding !== 'base64') {
+      const detection = detectTextEncoding(sample);
+      if (!detection.seemsBinary && detection.encoding !== 'utf-8') {
+        transcodeEncoding = detection.encoding;
+        isBinary = false;
+      }
+    }
 
     if (isBinary && req.encoding === 'utf-8') {
       throw new Error2(ErrorCodes.FS_IS_BINARY, `file is binary: ${req.path}`, {
@@ -269,10 +278,24 @@ export class WorkspaceFsService implements IWorkspaceFsService {
       });
     }
 
-    const effectiveLength = Math.min(req.length, st.size - req.offset);
+    // When transcoding, the offset/length window applies to the decoded
+    // UTF-8 bytes — the representation the client actually paginates over.
+    let totalLength = st.size;
+    let decodedBytes: Uint8Array | undefined;
+    if (transcodeEncoding !== undefined) {
+      decodedBytes = Buffer.from(
+        decodeUtfText(await this.hostFs.readBytes(abs), transcodeEncoding),
+        'utf-8',
+      );
+      totalLength = decodedBytes.length;
+    }
+
+    const effectiveLength = Math.min(req.length, totalLength - req.offset);
     let bytes: Uint8Array;
     if (effectiveLength <= 0) {
       bytes = new Uint8Array();
+    } else if (decodedBytes !== undefined) {
+      bytes = decodedBytes.subarray(req.offset, req.offset + effectiveLength);
     } else {
       const window = await this.hostFs.readBytes(abs, req.offset + effectiveLength);
       bytes = window.subarray(req.offset, req.offset + effectiveLength);
@@ -284,7 +307,7 @@ export class WorkspaceFsService implements IWorkspaceFsService {
       encoding === 'utf-8'
         ? Buffer.from(bytes).toString('utf-8')
         : Buffer.from(bytes).toString('base64');
-    const truncated = req.offset + effectiveLength < st.size;
+    const truncated = req.offset + effectiveLength < totalLength;
 
     const out: FsReadResponse = {
       path: rel,
@@ -435,9 +458,6 @@ export class WorkspaceFsService implements IWorkspaceFsService {
   }
 
   async search(req: FsSearchRequest): Promise<FsSearchResponse> {
-    // Empty query: no fuzzy matching — list the workspace root's top-level
-    // entries (dirs first) so clients can show a starting set for @-mention
-    // style file pickers.
     if (req.query === '') {
       const listed = await this.list({
         path: '.',

@@ -1,5 +1,5 @@
 /**
- * `contextMemory` domain (L4) — rebuilds display history from the wire journal.
+ * `contextMemory` domain — rebuilds display history from the wire journal.
  *
  * Supplies transcript consumers with full pre-compaction history and folded
  * context length while preserving undo/clear semantics. Scope-agnostic.
@@ -166,28 +166,32 @@ export function createContextTranscriptReducer(): ContextTranscriptReducer {
 
   const applyUndo = (count: number): void => {
     if (count <= 0) return;
+    // Mirror the live `context.undo` op (`computeUndoCut` + slice): locate the
+    // oldest anchor turn to cut, then drop EVERYTHING from that point on —
+    // injections between/after anchors included. Splicing only non-injection
+    // entries leaves post-anchor injections behind (e.g. the interruption
+    // reminder appended when a turn is cancelled), which the live op slices
+    // away — the folded history would diverge from the live context.
+    let cutIndex = -1;
     let removedUserCount = 0;
     for (let i = transcript.length - 1; i >= clearFloor; i--) {
       const message = transcript[i]!.message;
       if (message.origin?.kind === 'injection') continue;
       if (message.origin?.kind === 'compaction_summary') break;
-      transcript.splice(i, 1);
-      foldedLength = Math.max(0, foldedLength - 1);
-      if (isUndoAnchor(message)) {
-        removedUserCount++;
-        if (removedUserCount >= count) {
-          while (
-            i > clearFloor &&
-            isPromptOwnedInjection(transcript[i - 1]!.message, message)
-          ) {
-            transcript.splice(i - 1, 1);
-            i--;
-            foldedLength = Math.max(0, foldedLength - 1);
-          }
-          break;
-        }
+      if (!isUndoAnchor(message)) continue;
+      removedUserCount++;
+      cutIndex = i;
+      while (
+        cutIndex > clearFloor &&
+        isPromptOwnedInjection(transcript[cutIndex - 1]!.message, message)
+      ) {
+        cutIndex--;
       }
+      if (removedUserCount >= count) break;
     }
+    if (cutIndex < 0) return;
+    foldedLength = Math.max(0, foldedLength - (transcript.length - cutIndex));
+    transcript.splice(cutIndex);
     resetOpenState();
   };
 

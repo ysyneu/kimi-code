@@ -7,9 +7,24 @@
  * `Disposable` owner and cleaned up for free. One instance is reused across
  * start/stop cycles instead of juggling raw `ReturnType<typeof setInterval>`
  * values. Mirrors VS Code's `IntervalTimer`.
+ *
+ * `setClampedTimeout` is a `setTimeout` whose delay is clamped to
+ * `MAX_TIMER_DELAY_MS`, the largest delay the host timer accepts: beyond it
+ * the delay overflows into an immediate (~1ms) fire, so huge ("effectively
+ * unbounded") timeouts would fire at once instead of waiting. Callers that
+ * outlive the clamp (~24.8 days) re-arm.
  */
 
 import type { IDisposable } from '#/_base/di/lifecycle';
+
+export const MAX_TIMER_DELAY_MS = 0x7fffffff;
+
+export function setClampedTimeout(
+  callback: () => void,
+  timeoutMs: number,
+): ReturnType<typeof setTimeout> {
+  return setTimeout(callback, Math.min(timeoutMs, MAX_TIMER_DELAY_MS));
+}
 
 export interface IntervalTimerOptions {
   readonly unref?: boolean;
@@ -50,14 +65,6 @@ export class IntervalTimer implements IDisposable {
   }
 }
 
-/**
- * One-shot debounce primitive — a disposable `setTimeout` wrapper.
- *
- * `TimeoutTimer` owns a single `setTimeout` handle: every `cancelAndSet`
- * cancels the pending run and re-arms, so a burst of triggers collapses into
- * one deferred run (watch-event debounce). `dispose` guarantees the handle is
- * cleared. Mirrors VS Code's `TimeoutTimer`.
- */
 export class TimeoutTimer implements IDisposable {
   private handle: ReturnType<typeof setTimeout> | undefined;
 

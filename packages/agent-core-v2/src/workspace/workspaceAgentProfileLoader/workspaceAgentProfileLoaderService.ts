@@ -1,17 +1,19 @@
 /**
- * `workspaceAgentProfileLoader` domain (L3) — `IWorkspaceAgentProfileLoader` implementation.
+ * `workspaceAgentProfileLoader` domain — `IWorkspaceAgentProfileLoader` implementation.
  *
  * Discovers the workspace's agent files (`.kimi-code/agents`, `.agents/agents`
  * under the project root, resolved through `workspaceContext` and `hostFs`)
- * and registers them via the shared loader skeleton. `${base_prompt}` is
+ * and contributes them via the shared loader skeleton. `${base_prompt}` is
  * backed by the user loader's effective default profile. Watches the project
  * agent-root candidates through `hostFsWatch` (watched whether or not they
  * exist yet) and reloads debounced, so a project agent-file change
- * re-registers this contribution only. Bound at Workspace scope: the scan is
- * per handler and the registration dies with it.
+ * re-contributes this record only. Bound at Workspace scope: the scan is
+ * per handler and the record dies with it.
  */
 
-import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
+import { LifecycleScope } from '#/app/scopes';
+
+import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { ILogService } from '#/_base/log/log';
 import { TimeoutTimer } from '#/_base/utils/timer';
 import { subtreeWatchFilter } from '#/_base/utils/paths';
@@ -24,7 +26,6 @@ import {
 import { profilesFromDiscovery } from './internal/agentProfileFromFile';
 import { projectAgentRootCandidates, projectAgentRoots } from '#/workspace/workspaceAgentProfileLoader/internal/agentRoots';
 import { IUserAgentProfileLoader } from '#/workspace/workspaceAgentProfileLoader/userAgentProfileLoader';
-import { IAgentProfileRegistry } from '#/app/agentProfileCatalog/agentProfileRegistry';
 import { IHostFileSystem } from '#/os/interface/hostFileSystem';
 import { IHostFsWatchService } from '#/os/interface/hostFsWatch';
 import { IWorkspaceContext } from '#/workspace/workspaceContext/workspaceContext';
@@ -51,9 +52,8 @@ export class WorkspaceAgentProfileLoaderService
     @ILogService log: ILogService,
     @IUserAgentProfileLoader private readonly user: IUserAgentProfileLoader,
     @IHostFsWatchService private readonly fsWatch: IHostFsWatchService,
-    @IAgentProfileRegistry registry: IAgentProfileRegistry,
   ) {
-    super(registry, log);
+    super(log);
     this.watchReady = this.watchProjectAgentRoots();
     this.start();
   }
@@ -63,22 +63,17 @@ export class WorkspaceAgentProfileLoaderService
   }
 
   protected async load(): Promise<AgentProfileContribution> {
-    // The watch attaches before the first scan returns, so a change landing
-    // right after the scan cannot slip between the two.
     await this.watchReady;
     const roots = await projectAgentRoots(this.fs, this.workspace.cwd, (message, error) => {
       this.log.warn(message, error);
     });
     return profilesFromDiscovery(
       await discoverAgentFiles(this.fs, roots, (message) => this.log.warn(message)),
-      (context) => this.user.getDefaultProfile().systemPrompt(context),
+      (context) => this.user.getDefaultProfile().renderSystemPrompt(context),
     );
   }
 
   private async watchProjectAgentRoots(): Promise<void> {
-    // Watch the project root recursively, pruned to the agent-root
-    // candidates: watching a candidate directory directly never fires when
-    // its parent (`.kimi-code` / `.agents`) does not exist yet either.
     const { projectRoot, candidates } = await projectAgentRootCandidates(
       this.fs,
       this.workspace.cwd,

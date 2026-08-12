@@ -8,6 +8,7 @@ import {
   MOON_SPINNER_INTERVAL_MS,
 } from '#/tui/constant/rendering';
 import { currentTheme } from '#/tui/theme';
+import { formatTurnElapsedSuffix } from '#/tui/utils/turn-elapsed';
 
 export type SpinnerStyle = 'moon' | 'braille';
 
@@ -28,6 +29,11 @@ export class MoonLoader extends Text {
   private inlineText = '';
   private tip: string = '';
   private availableWidth = 0;
+  // Origin timestamp for the "how long has this been running" suffix. Unset
+  // (undefined) means no elapsed suffix is shown — the default for spinners
+  // that never represent a turn (MCP connect, login progress, ...).
+  private elapsedOriginMs: number | undefined;
+  private elapsedApprox = false;
 
   constructor(
     ui: TUI,
@@ -78,6 +84,21 @@ export class MoonLoader extends Text {
     this.updateDisplay();
   }
 
+  /**
+   * Sets (or clears, with `undefined`) the turn-start timestamp this loader
+   * measures elapsed time from. Recomputed from the timestamp on every
+   * spinner tick (never an incremented counter), so the displayed seconds
+   * stay correct without a second timer. `approximate` renders a trailing
+   * `+` ("at least this long") for a clock seeded at attach time rather than
+   * the turn's real start.
+   */
+  setElapsedOrigin(originMs: number | undefined, approximate = false): void {
+    if (this.elapsedOriginMs === originMs && this.elapsedApprox === approximate) return;
+    this.elapsedOriginMs = originMs;
+    this.elapsedApprox = approximate;
+    this.updateDisplay();
+  }
+
   setAvailableWidth(width: number): void {
     if (this.availableWidth === width) return;
     this.availableWidth = width;
@@ -91,7 +112,11 @@ export class MoonLoader extends Text {
   private updateDisplay(): void {
     const frame = this.frames[this.currentFrame]!;
     const coloredFrame = this.colorFn ? this.colorFn(frame) : frame;
-    const baseText = this.label ? `${coloredFrame} ${this.label}` : coloredFrame;
+    const elapsedSuffix =
+      this.elapsedOriginMs === undefined
+        ? ''
+        : formatTurnElapsedSuffix(Date.now() - this.elapsedOriginMs, this.elapsedApprox);
+    const baseText = (this.label ? `${coloredFrame} ${this.label}` : coloredFrame) + elapsedSuffix;
     this.inlineText = baseText;
     let text = baseText;
     if (this.tip) {

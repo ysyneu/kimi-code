@@ -122,7 +122,6 @@ describe('KimiHarness.createSession transport link', () => {
         id: 'ses_session_started',
         workDir,
       });
-      await harness.resumeSession({ id: session.id });
 
       expect(records).toContainEqual({
         event: 'session_started',
@@ -142,9 +141,12 @@ describe('KimiHarness.createSession transport link', () => {
         properties: undefined,
       });
 
-      await session.close();
-      await harness.resumeSession({ id: session.id });
-
+      // A cached Session that has never actually completed a resume (just
+      // created, never yet resumed — e.g. agents-view dispatch attached
+      // moments later) must still perform a real resume and be attributed
+      // as such, not silently short-circuit as a no-op.
+      const resumedWhileCached = await harness.resumeSession({ id: session.id });
+      expect(resumedWhileCached).toBe(session);
       expect(records.filter((record) => record.event === 'session_started')).toHaveLength(2);
       expect(records).toContainEqual({
         event: 'session_started',
@@ -161,6 +163,29 @@ describe('KimiHarness.createSession transport link', () => {
         event: 'session_resume',
         sessionId: session.id,
         properties: undefined,
+      });
+
+      // Now that resume state is actually populated, a further resume of
+      // the same still-open session IS the legitimate cache-hit shortcut:
+      // same object, no further telemetry.
+      const resumedAgainWhileCached = await harness.resumeSession({ id: session.id });
+      expect(resumedAgainWhileCached).toBe(session);
+      expect(records.filter((record) => record.event === 'session_started')).toHaveLength(2);
+
+      await session.close();
+      await harness.resumeSession({ id: session.id });
+
+      expect(records.filter((record) => record.event === 'session_started')).toHaveLength(3);
+      expect(records).toContainEqual({
+        event: 'session_started',
+        sessionId: session.id,
+        properties: {
+          client_id: null,
+          client_name: 'kimi-code-cli',
+          client_version: '0.0.0-test',
+          ui_mode: 'shell',
+          resumed: true,
+        },
       });
     } finally {
       await harness.close();

@@ -44,6 +44,9 @@ export interface ColorPalette {
   border: string;
   /** Focus / attention border — currently only the approval panel. */
   borderFocus: string;
+  /** Full-row background fill for the selected row in the agents view list —
+   *  a soft, non-bold highlight independent of the "came from" bold marker. */
+  surfaceSelected: string;
 
   // ── State ──
   /** Success: ✓ marks, "enabled", completed states. */
@@ -90,6 +93,7 @@ export const darkColors: ColorPalette = {
 
   border: '#5A5A5A',
   borderFocus: '#E8A838',
+  surfaceSelected: '#333333',
 
   success: '#4EC87E',
   warning: '#E8A838',
@@ -117,6 +121,7 @@ export const lightColors: ColorPalette = {
 
   border: '#737373',
   borderFocus: '#92660A',
+  surfaceSelected: '#F0F0F0',
 
   success: '#0E7A38',
   warning: '#92660A',

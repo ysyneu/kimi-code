@@ -31,6 +31,11 @@ export interface AppState {
   sessionId: string;
   permissionMode: PermissionMode;
   planMode: boolean;
+  /** Resolved profile name from --agent/--agent-file, carried to the
+   * lazy-created first session when the TUI starts session-less. */
+  agentProfile?: string;
+  /** Raw --agent-file paths, passed to session creation alongside `agentProfile`. */
+  agentFiles?: readonly string[];
   /** 'bash' when the editor is in `!` shell-command mode. */
   inputMode: 'prompt' | 'bash';
   swarmMode: boolean;
@@ -38,18 +43,42 @@ export interface AppState {
    * mirrors the runtime. The single source of truth for the thinking state in
    * the TUI. */
   thinkingEffort: ThinkingEffort;
+  /**
+   * The current `defaultPlanMode` value from config (false when absent),
+   * refreshed by `hydrateLazyConfigDefaults`. Used to tell a config-driven
+   * plan-mode entry apart from an explicit CLI `--plan` when lazy-creating
+   * the first session (the engine applies the config default itself).
+   */
+  configDefaultPlanMode?: boolean;
+  /**
+   * Session-only thinking effort chosen (e.g. via the model picker's Alt+S)
+   * while no session exists yet on the v2 engine. Applied to the first
+   * lazy-created session and cleared once it exists; the engine's config
+   * default is used instead when unset.
+   */
+  lazySessionThinking?: ThinkingEffort;
   contextUsage: number;
   contextTokens: number;
   maxContextTokens: number;
   isCompacting: boolean;
   isReplaying: boolean;
   streamingPhase: 'idle' | 'waiting' | 'thinking' | 'composing' | 'shell';
+  /** Wall-clock start of the CURRENT TURN (not the current phase) — set once
+   * when the turn begins and held constant across waiting/thinking/composing/
+   * tool, so the live elapsed-time display has one clock per turn. */
   streamingStartTime: number;
+  /** True when `streamingStartTime` is an attach-time approximation: this
+   * client did not observe the turn's real start (e.g. attaching to a
+   * session whose turn was already in flight), so the value is a lower
+   * bound, not the true origin. The elapsed display renders a trailing `+`. */
+  streamingStartApprox?: boolean;
   theme: ThemeName;
   version: string;
   editorCommand: string | null;
   /** Mirrors the TUI config toggle; defaults to false when absent from older fixtures. */
   disablePasteBurst?: boolean;
+  /** Mirrors the TUI config toggle; defaults to true when absent from older fixtures. */
+  cacheExpiryHint?: boolean;
   notifications: NotificationsConfig;
   upgrade: UpgradePreferences;
   /** Footer status line customization from tui.toml; absent means the default layout. */
@@ -109,6 +138,10 @@ export interface BackgroundAgentMetadata {
   readonly parentToolCallId: string;
   readonly agentName?: string;
   readonly description?: string;
+  /** Display name of the model the agent is bound to (resolved at spawn). */
+  readonly model?: string;
+  /** Thinking effort, set only for concrete levels (boolean on/off hidden). */
+  readonly effort?: string;
 }
 
 export type BackgroundAgentStatusPhase = 'started' | 'completed' | 'failed';
@@ -249,9 +282,11 @@ export interface TUIStartupOptions {
   /** Raw --agent-file paths, passed to session creation alongside `agentProfile`. */
   readonly agentFiles?: readonly string[];
   readonly startupNotice?: string;
+  /** `kimi agents`: boot straight into the agents view — no startup session. */
+  readonly agentsView?: boolean;
 }
 
-export type TUIStartupState = 'pending' | 'ready' | 'picker';
+export type TUIStartupState = 'pending' | 'ready' | 'picker' | 'agents-view';
 
 export interface KimiTUIOptions {
   initialAppState: AppState;

@@ -53,6 +53,58 @@ describe('ThinkingComponent', () => {
     vi.useRealTimers();
   });
 
+  it('renders elapsed time since the turn start, not since construction', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    const component = new ThinkingComponent('working it out', true, 'live', undefined, 4_000);
+
+    expect(strip(component.render(80).join('\n'))).toContain('⠋ thinking... 6s');
+    vi.useRealTimers();
+  });
+
+  it('recomputes elapsed from the timestamp on the existing spinner tick, never a counter', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const requestRender = vi.fn();
+    const component = new ThinkingComponent('step', true, 'live', { requestRender } as unknown as TUI, 0);
+
+    vi.setSystemTime(3_000);
+    vi.advanceTimersByTime(80);
+    expect(strip(component.render(80).join('\n'))).toContain('thinking... 3s');
+
+    vi.setSystemTime(65_000);
+    vi.advanceTimersByTime(80);
+    expect(strip(component.render(80).join('\n'))).toContain('thinking... 1m5s');
+    vi.useRealTimers();
+  });
+
+  it('appends a trailing + for an approximate (attach-time) origin', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(9_000);
+    const component = new ThinkingComponent('working it out', true, 'live', undefined, 1_000, true);
+
+    expect(strip(component.render(80).join('\n'))).toContain('⠋ thinking... 8s+');
+    vi.useRealTimers();
+  });
+
+  it('renders no elapsed suffix when constructed without a turn clock', () => {
+    const component = new ThinkingComponent('working it out', true, 'live');
+    const out = strip(component.render(80).join('\n'));
+
+    expect(out).toContain('⠋ thinking...');
+    expect(out).not.toMatch(/thinking\.\.\. \d/);
+  });
+
+  it('never shows the elapsed suffix once finalized', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(20_000);
+    const component = new ThinkingComponent('working it out', true, 'live', undefined, 1_000);
+    component.finalize();
+
+    expect(strip(component.render(80).join('\n'))).not.toMatch(/\d+s/);
+    vi.useRealTimers();
+  });
+
   it('finalizes in place into a collapsed preview', () => {
     const component = new ThinkingComponent(longThinking, true, 'live');
 
