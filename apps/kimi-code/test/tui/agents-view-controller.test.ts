@@ -3983,7 +3983,15 @@ describe('AgentsViewController — workspace trust', () => {
           });
         }),
     });
-    for (let i = 0; i < 100 && pending.length === 0; i++) await flush();
+    // Condition-based, time-bounded wait: the boot chain does real fs I/O
+    // (loadAgentsViewState), so a fixed iteration count is meaningless on a
+    // loaded CI box — 100 setImmediate spins can elapse before the fs read
+    // completes, and the first worker's RPC must not be mistaken for the
+    // full fan-out either (the loop used to stop at pending.length > 0).
+    const fanOutDeadline = Date.now() + 10_000;
+    while (pending.length < LOAD_TRUST_CONCURRENCY && Date.now() < fanOutDeadline) {
+      await flush();
+    }
     // Every worker's first RPC is already in flight — the bound holds from
     // the very first tick, not just "eventually" after some backlog drains.
     expect(pending.length).toBe(LOAD_TRUST_CONCURRENCY);
